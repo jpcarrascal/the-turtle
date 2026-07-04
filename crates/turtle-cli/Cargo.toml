@@ -1,0 +1,13 @@
+[package]
+name = "turtle-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The `turtle` CLI: a thin client for the turtled control socket (spec §10)."
+
+[[bin]]
+name = "turtle"
+path = "src/main.rs"
+
+[dependencies]
+turtle-core = { workspace = true }

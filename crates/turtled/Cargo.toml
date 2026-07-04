@@ -1,0 +1,10 @@
+[package]
+name = "turtled"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Turtle daemon: audio RT + MIDI scheduler + control threads (spec §3)."
+
+[dependencies]
+turtle-core = { workspace = true }
+turtle-dsp = { workspace = true }

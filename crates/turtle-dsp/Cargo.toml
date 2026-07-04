@@ -1,0 +1,8 @@
+[package]
+name = "turtle-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Alloc-free per-pair DSP primitives (biquad, gain, delay, limiter) for the Turtle audio engine."
+
+[dependencies]
