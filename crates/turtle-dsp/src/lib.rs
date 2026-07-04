@@ -8,7 +8,12 @@
 #![forbid(unsafe_code)]
 
 mod biquad;
+mod delay;
 mod gain;
+mod limiter;
+mod util;
 
 pub use biquad::{Biquad, FilterType};
+pub use delay::Delay;
 pub use gain::Gain;
+pub use limiter::Limiter;

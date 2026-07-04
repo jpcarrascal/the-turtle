@@ -1,6 +1,8 @@
 //! Per-pair gain + mute (§6), with a one-pole smoother so live CC moves don't
 //! click. Alloc-free and `Copy`.
 
+use crate::util::one_pole_coeff;
+
 /// A smoothed linear gain with a hard mute. `target` is set from CC; `current`
 /// ramps toward it one sample at a time.
 #[derive(Debug, Clone, Copy)]
@@ -42,15 +44,6 @@ impl Gain {
         self.current += (goal - self.current) * self.coeff;
         x * self.current
     }
-}
-
-/// One-pole smoothing coefficient for a given time constant.
-fn one_pole_coeff(smooth_ms: f32, sample_rate: f32) -> f32 {
-    if smooth_ms <= 0.0 {
-        return 1.0;
-    }
-    let samples = smooth_ms * 0.001 * sample_rate;
-    (1.0 / samples).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
