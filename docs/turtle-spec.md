@@ -1,6 +1,6 @@
 # The Turtle — System Specification
 
-**Status:** v0.3 (draft, in active co-design)
+**Status:** v0.4 (draft, in active co-design)
 **Last updated:** 2026-07-04
 
 The Turtle is a headless, MIDI-controlled backing-track and MIDI-automation player
@@ -181,8 +181,7 @@ start   = { type = "note", note = 60 }
 stop    = { type = "note", note = 61 }
 next    = { type = "note", note = 62 }
 prev    = { type = "note", note = 63 }
-restart = { type = "note", note = 64 }
-panic   = { type = "note", note = 65 }
+panic   = { type = "note", note = 65 }   # note 64 free (Restart removed; Start restarts)
 mute    = { type = "note", notes = [72, 73, 74, 75] }   # per-pair toggle
 dsp_cutoff = { type = "cc", cc = 20 }
 dsp_delay_mix = { type = "cc", cc = 21 }
@@ -226,21 +225,32 @@ playback arms the next without interrupting the current song. v1 = manual per-so
 with `auto_advance = true`, `ENDED` immediately starts the armed next song (gapless, no
 crossfade — crossfade is future).
 
-**Stop behavior:** on **Stop**, the song (and MIDI) pointer resets to sample 0 by
-default — the song re-arms at the top rather than pausing in place. This is governed by
-`rewind_on_stop` in `show.toml` (default `true`); setting it `false` restores
-pause-in-place semantics, where **Start** after **Stop** continues from the stopped
-position instead of restarting.
+**Stop behavior (Ableton-style).** A first **Stop** from `PLAYING` cleanly releases any
+currently-sounding MIDI — the scheduler dispatches note-offs for exactly the notes it has
+sounded (tracked in a preallocated per-port active-note table), the way Live releases its
+own notes on stop — and resets the song/MIDI pointer to sample 0. It does **not** send a
+full panic or reset controllers. Because rewind-to-0 is the default, the next **Start**
+always plays from the top; this is why there is **no separate Restart command** (Start
+*is* the restart).
+
+A second **Stop** while already `STOPPED` (double-tap) sends a full **MIDI panic**
+(all-notes-off + reset-all-controllers on every port, §5) — a safety gesture in addition
+to the dedicated panic command (Note 65) and the GPIO panic button. Otherwise, Stop while
+already `STOPPED` is a no-op.
+
+Rewind-on-stop is governed by `rewind_on_stop` in `show.toml` (default `true`). Set it
+`false` for pause-in-place: **Start** after **Stop** continues from the stopped position
+(the active-note release still happens on Stop); rewind by re-selecting the song, since
+arming reloads it at 0.
 
 Default command map (all remappable, see §7.1):
 
 | Function | Default |
 |---|---|
 | Select song | Program Change on `select_channel` |
-| Start / Continue | Note 60 |
-| Stop | Note 61 |
+| Start / Continue / Restart | Note 60 |
+| Stop (rewind; 2× = panic) | Note 61 |
 | Next / Prev (arm) | Note 62 / 63 |
-| Restart song | Note 64 |
 | MIDI panic | Note 65 |
 | Per-pair mute toggle | Notes 72–75 |
 | DSP live params | CC 20, 21, ... |
