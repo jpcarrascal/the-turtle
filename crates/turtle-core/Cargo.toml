@@ -9,3 +9,4 @@ description = "Data model, bundle load/validate, and sample-time math for the Tu
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+midly = "0.5"

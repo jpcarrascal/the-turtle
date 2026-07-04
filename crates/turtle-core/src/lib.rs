@@ -8,7 +8,9 @@
 
 pub mod error;
 pub mod model;
+pub mod timeline;
 pub mod timing;
 
 pub use error::Error;
 pub use model::{Show, Song};
+pub use timeline::{RawMidi, Timeline, TimedEvent};

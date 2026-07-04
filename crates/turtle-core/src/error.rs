@@ -13,6 +13,9 @@ pub enum Error {
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
 
+    #[error("MIDI/SMF error: {0}")]
+    Midi(String),
+
     /// One or more validation checks failed. Messages are joined with "; ".
     #[error("validation failed: {0}")]
     Validate(String),
