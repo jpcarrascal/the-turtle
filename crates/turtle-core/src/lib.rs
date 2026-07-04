@@ -10,7 +10,9 @@ pub mod error;
 pub mod model;
 pub mod timeline;
 pub mod timing;
+pub mod transport;
 
 pub use error::Error;
 pub use model::{Show, Song};
 pub use timeline::{RawMidi, Timeline, TimedEvent};
+pub use transport::{Action, Command, State, Transport};
