@@ -1,39 +1,73 @@
 //! `turtled` — the Turtle daemon (spec §3).
 //!
-//! Scaffolding only. The real implementation is three long-lived threads (audio
-//! RT, MIDI scheduler, control) plus a background loader, communicating over
-//! lock-free SPSC queues. None of that exists yet; this binary currently just
-//! loads and validates a show bundle so the data model is exercised end-to-end.
+//! This skeleton contains the platform-independent core of the daemon: the
+//! decoupled transport clock (§3.1), the per-port MIDI scheduler (§5), active-
+//! note tracking for clean Stop (§8), foot-controller decoding (§8), and the
+//! control-thread engine that wires the transport state machine to a lock-free
+//! RT command queue (§3) and a MIDI sink.
+//!
+//! What is **not** here yet: the ALSA PCM loop and rawmidi I/O, thread spawning
+//! with `SCHED_FIFO`, and the background stem loader. Those are Linux/ALSA-only
+//! (§2) and cannot be built or run on this host, so the concrete backends are
+//! left behind the `backend` traits. `main` currently loads + validates a show
+//! and constructs the engine to prove the wiring compiles end to end.
+
+// The RT modules below (clock, scheduler, engine, ...) are unit-tested but not
+// yet driven by `main`: their consumer is the ALSA RT loop, which is Linux-only
+// and not part of this skeleton. Allow dead code until that loop is written so
+// the intentionally-ahead API surface doesn't warn.
+#![allow(dead_code)]
+
+mod backend;
+mod clock;
+mod control_map;
+mod engine;
+mod notes;
+mod scheduler;
 
 use std::process::ExitCode;
 
+use backend::{AudioBackend, NullAudio, NullMidi};
+
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let Some(show_path) = args.next() else {
+    let Some(show_path) = std::env::args().nth(1) else {
         eprintln!("usage: turtled <path/to/show.toml>");
-        eprintln!("(daemon threads not yet implemented — this only loads + validates)");
+        eprintln!("(RT audio/MIDI runtime is Linux/ALSA-only; this loads + validates)");
         return ExitCode::FAILURE;
     };
 
-    match turtle_core::Show::load(&show_path) {
-        Ok(show) => match show.validate() {
-            Ok(()) => {
-                println!(
-                    "loaded show {:?}: {} destination(s), {} song(s) in setlist",
-                    show.show.name,
-                    show.destinations.len(),
-                    show.setlist.len()
-                );
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("show {show_path} is invalid: {e}");
-                ExitCode::FAILURE
-            }
-        },
+    let show = match turtle_core::Show::load(&show_path) {
+        Ok(show) => show,
         Err(e) => {
             eprintln!("could not load {show_path}: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    if let Err(e) = show.validate() {
+        eprintln!("show {show_path} is invalid: {e}");
+        return ExitCode::FAILURE;
     }
+
+    // Non-RT host: wire the engine to no-op backends. On a Pi, these become the
+    // ALSA PCM device and the CME rawmidi fan-out.
+    let audio = NullAudio {
+        sample_rate: show.show.playback_rate,
+        buffer_frames: show.audio.buffer_frames as usize,
+    };
+    let mut eng = engine::Engine::new(&show, NullMidi);
+    let (_rt_tx, _rt_rx) = engine::rt_channel(256);
+
+    println!(
+        "loaded {:?}: {} destination(s), {} song(s); audio {} Hz / {} frames; state {:?}",
+        show.show.name,
+        show.destinations.len(),
+        show.setlist.len(),
+        audio.sample_rate(),
+        audio.buffer_frames(),
+        eng.state(),
+    );
+    println!("RT runtime not started (requires Linux/ALSA). Engine wiring OK.");
+    // Touch the engine so the pending-preload path is exercised in the skeleton.
+    let _ = eng.take_pending_preload();
+    ExitCode::SUCCESS
 }

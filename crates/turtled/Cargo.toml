@@ -8,3 +8,7 @@ description = "The Turtle daemon: audio RT + MIDI scheduler + control threads (s
 [dependencies]
 turtle-core = { workspace = true }
 turtle-dsp = { workspace = true }
+rtrb = "0.3"
+
+[dev-dependencies]
+midly = "0.5"
