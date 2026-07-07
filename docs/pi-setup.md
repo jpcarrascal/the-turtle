@@ -50,9 +50,56 @@ cargo build --release -p turtled
 
 A clean native build on a Pi 4 (4 GB) takes a few minutes. `cargo test` being
 green on `aarch64` revalidates the entire host-independent core (`turtle-core`,
-`turtle-dsp`, and the `turtled` RT logic) on real hardware.
+`turtle-dsp`, and the `turtled` RT logic) on real hardware — this is the first
+time any of it runs on the real target arch/OS rather than a dev Mac.
 
-## 3. What runs where
+## 3. Smoke test with a minimal bundle
+
+No bundle is checked into the repo yet, so create a throwaway one directly on
+the Pi to exercise `turtle-cli` and `turtled`'s load/validate path:
+
+```bash
+mkdir -p ~/smoke && cat > ~/smoke/show.toml <<'EOF'
+[show]
+name = "Pi Smoke Test"
+playback_rate = 48000
+
+[audio]
+device = "hw:CARD=HXStomp"
+
+[[destinations]]
+name = "lights"
+port = "CME:1"
+
+[control]
+input_port = "CME:in"
+select_channel = 1
+start = { type = "note", note = 60 }
+stop  = { type = "note", note = 61 }
+next  = { type = "note", note = 62 }
+prev  = { type = "note", note = 63 }
+panic = { type = "note", note = 65 }
+mute  = { type = "note", notes = [72, 73, 74, 75] }
+EOF
+
+./target/release/turtle-cli validate ~/smoke/show.toml
+./target/release/turtled ~/smoke/show.toml
+```
+
+Expect:
+
+```
+~/smoke/show.toml: ok
+loaded "Pi Smoke Test": 1 destination(s), 0 song(s); audio 48000 Hz / 1024 frames; state Idle
+RT runtime not started (requires Linux/ALSA). Engine wiring OK.
+```
+
+This proves the model, validation, timeline compilation, transport state
+machine, and the engine's lock-free wiring all work on real hardware. It does
+**not** touch audio or MIDI I/O — `turtled` runs against `NullAudio`/`NullMidi`
+stubs until the ALSA backend lands (below), so no sound or lights yet.
+
+## 4. What runs where
 
 - **The Pi** runs `turtled` and consumes finished `.turtle` bundles. No network
   is required at showtime (§12).
