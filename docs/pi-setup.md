@@ -6,7 +6,8 @@ of `turtle-spec.md`) is not written yet — see [When we add ALSA](#when-we-add-
 
 ## 1. Flash the OS
 
-Use **Raspberry Pi OS Lite, 64-bit (Bookworm)** — headless, no desktop.
+Use **Raspberry Pi OS Lite, 64-bit** (current Debian release, e.g. Trixie) —
+headless, no desktop.
 
 - Debian + `systemd` + `apt` match the appliance model (spec §12), and the
   `alsa` crate's `libasound` dependency is a one-line `apt install`.
