@@ -19,6 +19,11 @@
 #![allow(dead_code)]
 
 mod backend;
+// Linux-only concrete backends (ALSA PCM + rawmidi). Compiled on the Pi; on the
+// dev Mac this is skipped so the portable core still builds. Not yet driven by
+// `main` — the RT loop that consumes it is the next step (hence `dead_code`).
+#[cfg(target_os = "linux")]
+mod alsa_backend;
 mod clock;
 mod control_map;
 mod engine;
