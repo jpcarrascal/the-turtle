@@ -9,6 +9,9 @@ description = "The Turtle daemon: audio RT + MIDI scheduler + control threads (s
 turtle-core = { workspace = true }
 turtle-dsp = { workspace = true }
 rtrb = "0.3"
+# WAV stem decoding (§4). Pure Rust, no C deps — builds/tests on the dev Mac too.
+hound = "3"
+thiserror = { workspace = true }
 
 # ALSA is Linux-only (`libasound`). Gating the dep to Linux targets keeps the
 # host-independent core building + testing on the dev Mac; the `alsa` crate is
