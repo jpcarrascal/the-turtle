@@ -27,7 +27,9 @@ mod alsa_backend;
 mod clock;
 mod control_map;
 mod engine;
+mod mixer;
 mod notes;
+mod rt;
 mod scheduler;
 mod stems;
 
