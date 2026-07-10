@@ -29,6 +29,7 @@ mod control_map;
 mod engine;
 mod notes;
 mod scheduler;
+mod stems;
 
 use std::process::ExitCode;
 
