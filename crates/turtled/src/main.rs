@@ -6,15 +6,17 @@
 //! control-thread engine that wires the transport state machine to a lock-free
 //! RT command queue (§3) and a MIDI sink.
 //!
-//! It now also has the offline audio path: the stem loader ([`stems`]), the RT
-//! mixer ([`mixer`]), and the audio RT loop ([`rt`]) driving the ALSA backend.
-//! `turtled play <bundle>` wires those together to play a song to the device on
-//! Linux; the default `turtled <show.toml>` still just loads + validates.
+//! It now also has the offline audio path and live control: the stem loader
+//! ([`stems`]), the RT mixer ([`mixer`]), the audio RT loop ([`rt`]) driving the
+//! ALSA backend, and MIDI-input transport control ([`control`]).
+//! `turtled play <bundle>` plays a song to the device; `turtled control <bundle>`
+//! drives its transport from a live MIDI controller. The default
+//! `turtled <show.toml>` still just loads + validates.
 //!
-//! What is **not** here yet: rawmidi *input* + the MIDI scheduler thread, the
-//! control socket, GPIO, `SCHED_FIFO` thread priorities (v1 uses a normal thread
-//! with big xrun-proof buffers, §3.1), and resolving logical MIDI port labels to
-//! ALSA device names.
+//! What is **not** here yet: the MIDI scheduler thread (§5, timed output to
+//! destinations), clean-release / panic MIDI *output*, the control socket, GPIO,
+//! `SCHED_FIFO` thread priorities (v1 uses a normal thread with big xrun-proof
+//! buffers, §3.1), and resolving logical MIDI port labels to ALSA device names.
 
 // The RT modules below (clock, scheduler, engine, ...) are unit-tested but not
 // yet driven by `main`: their consumer is the ALSA RT loop, which is Linux-only
@@ -29,6 +31,7 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod alsa_backend;
 mod clock;
+mod control;
 mod control_map;
 mod engine;
 mod mixer;
@@ -48,12 +51,38 @@ fn main() -> ExitCode {
         // `play` runs the real audio path (Linux/ALSA). Everything else is
         // treated as a show path and takes the unchanged load+validate path.
         Some("play") => play_command(args.next(), args.next()),
+        Some("control") => control_command(args.next(), args.next()),
         Some(show_path) => run_show(show_path),
         None => {
-            eprintln!("usage: turtled <path/to/show.toml>    load + validate a show");
-            eprintln!("       turtled play <bundle> [song]   play a song to the device (Linux)");
+            eprintln!("usage: turtled <path/to/show.toml>     load + validate a show");
+            eprintln!("       turtled play <bundle> [song]    play a song to the device (Linux)");
+            eprintln!("       turtled control <bundle> [song] drive playback from MIDI (Linux)");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `turtled control <bundle> [song]`: drive a song's transport from live MIDI.
+fn control_command(bundle: Option<String>, song: Option<String>) -> ExitCode {
+    let Some(bundle) = bundle else {
+        eprintln!("usage: turtled control <bundle-dir> [song]");
+        return ExitCode::FAILURE;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        match control::run(std::path::Path::new(&bundle), song.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("control: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&bundle, &song);
+        eprintln!("control requires Linux/ALSA (this host is {})", std::env::consts::OS);
+        ExitCode::FAILURE
     }
 }
 
