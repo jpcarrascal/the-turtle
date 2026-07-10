@@ -44,8 +44,9 @@ git clone https://github.com/jpcarrascal/the-turtle.git
 cd the-turtle
 cargo test
 
-# Build and run the daemon skeleton (loads + validates a show bundle)
-cargo build --release -p turtled
+# Build the daemon + the CLI. Build both: the §3 smoke test uses turtle-cli too,
+# and `-p turtled` alone does not produce the turtle-cli binary.
+cargo build --release -p turtled -p turtle-cli
 ./target/release/turtled path/to/MyShow.turtle/show.toml
 ```
 
