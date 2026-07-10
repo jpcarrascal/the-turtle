@@ -93,7 +93,18 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
     // before they drop. NOTE: v1 uses a normal-priority thread; the design's big
     // xrun-proof buffers (§3.1) make this fine. SCHED_FIFO is a later hardening.
     std::thread::scope(|s| {
-        s.spawn(|| rt::run_audio(&audio, &mut mixer, &clock, &mut rx, epoch, &running));
+        // `AlsaAudio` wraps a raw ALSA handle: it is `Send` (safe to hand to one
+        // other thread) but `!Sync` (a `&` to it can't be shared across threads).
+        // So MOVE `audio`/`mixer`/`rx` into the audio thread and borrow them
+        // locally inside it. `clock` and `running` are atomic-backed (`Sync`), so
+        // those we share by reference — the control thread flips `running` to
+        // stop the loop, and a future MIDI thread will read `clock`. References
+        // are `Copy`, so the `move` closure copies them and we keep ours.
+        let clock = &clock;
+        let running = &running;
+        s.spawn(move || {
+            rt::run_audio(&audio, &mut mixer, clock, &mut rx, epoch, running);
+        });
 
         // Kick off playback, wait out the song, then signal the loop to stop.
         let _ = tx.push(RtCommand::Start);
