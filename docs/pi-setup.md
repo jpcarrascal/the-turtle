@@ -31,8 +31,9 @@ RT-patched kernel if you actually observe xruns.
 SSH into the Pi, then:
 
 ```bash
-# Build tooling + git (libasound2-dev comes later, with the ALSA backend)
-sudo apt update && sudo apt install -y build-essential pkg-config git
+# Build tooling + git + ALSA headers. libasound2-dev is now required: the
+# Linux-only ALSA backend (alsa_backend.rs) compiles as part of turtled.
+sudo apt update && sudo apt install -y build-essential pkg-config git libasound2-dev
 
 # Rust — rustup picks aarch64 stable; rust-toolchain.toml pins the rest
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -52,6 +53,14 @@ A clean native build on a Pi 4 (4 GB) takes a few minutes. `cargo test` being
 green on `aarch64` revalidates the entire host-independent core (`turtle-core`,
 `turtle-dsp`, and the `turtled` RT logic) on real hardware — this is the first
 time any of it runs on the real target arch/OS rather than a dev Mac.
+
+**The `cargo build -p turtled` step is itself a new check.** The ALSA backend
+(`crates/turtled/src/alsa_backend.rs`) is gated behind `#[cfg(target_os =
+"linux")]` and the `alsa` crate is a Linux-only dependency, so it is *never*
+compiled on the dev Mac — `cargo build`/`cargo test` there validate only the
+portable core. This build is the first time that code is compiled at all, so a
+clean build (no ALSA errors) is the smoke test for the hardware layer until it
+is wired into a runnable path.
 
 ## 3. Smoke test with a minimal bundle
 
@@ -96,8 +105,10 @@ RT runtime not started (requires Linux/ALSA). Engine wiring OK.
 
 This proves the model, validation, timeline compilation, transport state
 machine, and the engine's lock-free wiring all work on real hardware. It does
-**not** touch audio or MIDI I/O — `turtled` runs against `NullAudio`/`NullMidi`
-stubs until the ALSA backend lands (below), so no sound or lights yet.
+**not** touch audio or MIDI I/O — `turtled`'s `main` still runs against
+`NullAudio`/`NullMidi` stubs until the ALSA backend is wired into a runnable
+path (below), so this output is unchanged even though the ALSA code now
+compiles, and there's no sound or lights yet.
 
 ## 4. What runs where
 
@@ -106,15 +117,23 @@ stubs until the ALSA backend lands (below), so no sound or lights yet.
 - **Your laptop** runs the Python converter (`tools/converter`) to turn Ableton
   projects into bundles. You do **not** need Python on the Pi.
 
-## When we add ALSA
+## ALSA backend
 
 The audio PCM loop and MIDI rawmidi I/O (spec §2/§3) are Linux-only and sit
-behind the `backend` traits in `turtled`. When that lands, the only extra setup
-step is the ALSA development headers:
+behind the `backend` traits in `turtled`. The **first slice has landed**:
+`alsa_backend.rs` opens/configures the PCM device (`AlsaAudio`) and fans MIDI
+out over rawmidi (`AlsaMidi`). It builds only on the Pi (see §2) — its extra
+requirement is the ALSA development headers, now folded into the §2 apt install:
 
 ```bash
 sudo apt install -y libasound2-dev
 ```
+
+Still to come before it produces sound/lights: the RT audio loop that mixes
+stems and fills the PCM buffers, `SCHED_FIFO` thread spawning, rawmidi *input*
+for the control thread, and resolving logical port labels (`"CME:1"`) to ALSA
+`hw:` device names. Until `main` opens these backends, the §3 smoke test output
+is unchanged.
 
 ## Faster iteration (later)
 

@@ -10,5 +10,11 @@ turtle-core = { workspace = true }
 turtle-dsp = { workspace = true }
 rtrb = "0.3"
 
+# ALSA is Linux-only (`libasound`). Gating the dep to Linux targets keeps the
+# host-independent core building + testing on the dev Mac; the `alsa` crate is
+# only compiled when building for the Pi. See `src/alsa_backend.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
 [dev-dependencies]
 midly = "0.5"
