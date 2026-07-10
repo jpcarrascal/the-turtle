@@ -44,8 +44,10 @@ git clone https://github.com/jpcarrascal/the-turtle.git
 cd the-turtle
 cargo test
 
-# Build the daemon + the CLI. Build both: the §3 smoke test uses turtle-cli too,
-# and `-p turtled` alone does not produce the turtle-cli binary.
+# Build the daemon + the CLI. Build both: the §3 smoke test uses the CLI too.
+# NB: the `turtle-cli` *package* builds a binary named `turtle` (see its
+# [[bin]] name) — so it is `-p turtle-cli` to cargo but `./target/release/turtle`
+# to run.
 cargo build --release -p turtled -p turtle-cli
 ./target/release/turtled path/to/MyShow.turtle/show.toml
 ```
@@ -66,7 +68,7 @@ is wired into a runnable path.
 ## 3. Smoke test with a minimal bundle
 
 No bundle is checked into the repo yet, so create a throwaway one directly on
-the Pi to exercise `turtle-cli` and `turtled`'s load/validate path:
+the Pi to exercise the `turtle` CLI and `turtled`'s load/validate path:
 
 ```bash
 mkdir -p ~/smoke && cat > ~/smoke/show.toml <<'EOF'
@@ -92,7 +94,7 @@ panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [72, 73, 74, 75] }
 EOF
 
-./target/release/turtle-cli validate ~/smoke/show.toml
+./target/release/turtle validate ~/smoke/show.toml
 ./target/release/turtled ~/smoke/show.toml
 ```
 
