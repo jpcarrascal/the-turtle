@@ -5,19 +5,22 @@
 //! unit-tested on the dev Mac; [`run`] is the **`cfg(linux)`** part that opens
 //! ALSA, spawns the audio thread, and actually makes sound.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use turtle_core::{Show, Song};
+use turtle_core::{Show, Song, Timeline};
 
 use crate::mixer::Mixer;
+use crate::scheduler::PortScheduler;
 use crate::stems;
 
 /// Everything needed to start playback: the parsed show (for device/rate), the
-/// mixer primed with the song's stems, and the song length in frames.
+/// mixer primed with the song's stems, the song length in frames, and the song
+/// directory (so the MIDI scheduler can find the per-destination SMFs).
 pub struct Playable {
     pub show: Show,
     pub mixer: Mixer,
     pub frames: u64,
+    pub song_dir: PathBuf,
 }
 
 /// Load a bundle and prepare one song for playback.
@@ -54,7 +57,29 @@ pub fn load_playable(bundle: &Path, song: Option<&str>) -> Result<Playable, Stri
     let frames = preloaded.frames as u64;
     let mixer = Mixer::new(preloaded, rate);
 
-    Ok(Playable { show, mixer, frames })
+    Ok(Playable { show, mixer, frames, song_dir })
+}
+
+/// Build one [`PortScheduler`] per destination from its SMF (spec §5).
+///
+/// Each destination `d` reads `<song_dir>/midi/<d.name>.mid` (the bundle layout
+/// in §7). A missing file — or one that fails to compile — yields an empty
+/// scheduler, so a destination without MIDI is simply silent rather than fatal.
+/// The returned Vec is indexed by destination order, matching the MIDI sink's
+/// port numbering.
+pub fn load_schedulers(show: &Show, song_dir: &Path, rate: u32) -> Vec<PortScheduler> {
+    show.destinations
+        .iter()
+        .map(|dest| {
+            let path = song_dir.join("midi").join(format!("{}.mid", dest.name));
+            let events = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| Timeline::compile_smf(&bytes, rate).ok())
+                .map(|tl| tl.events)
+                .unwrap_or_default();
+            PortScheduler::new(events)
+        })
+        .collect()
 }
 
 /// Open the device, spawn the audio RT thread, play the song, and stop. Linux
@@ -64,15 +89,27 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use crate::alsa_backend::AlsaAudio;
+    use crate::alsa_backend::{AlsaAudio, AlsaMidi};
+    use crate::backend::MidiSink;
     use crate::clock::TransportClock;
     use crate::engine::{rt_channel, RtCommand};
 
-    let Playable { show, mut mixer, frames } = load_playable(bundle, song)?;
+    let Playable { show, mut mixer, frames, song_dir } = load_playable(bundle, song)?;
     let rate = show.show.playback_rate;
 
     let audio = AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize)
         .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
+
+    // MIDI output, best-effort: destinations whose port can't be opened are just
+    // logged, so a bad/placeholder MIDI port never blocks audio playback.
+    let midi_names: Vec<String> = show.destinations.iter().map(|d| d.port.clone()).collect();
+    let (mut midi, failed) = AlsaMidi::open(&midi_names);
+    for name in &failed {
+        eprintln!("warning: MIDI out '{name}' unavailable; its events will be logged only");
+    }
+    // One scheduler per destination, compiled from the song's per-destination SMF.
+    let mut schedulers = load_schedulers(&show, &song_dir, rate);
+
     let clock = TransportClock::new(rate);
     // Small SPSC command queue to the audio thread (§3). Producer stays here.
     let (mut tx, mut rx) = rt_channel(64);
@@ -106,9 +143,23 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
             rt::run_audio(&audio, &mut mixer, clock, &mut rx, epoch, running);
         });
 
-        // Kick off playback, wait out the song, then signal the loop to stop.
+        // Kick off playback, then run the MIDI scheduler on this thread (§5):
+        // every ~1 ms, interpolate the transport position from the clock the
+        // audio thread publishes, and dispatch each destination's due events.
         let _ = tx.push(RtCommand::Start);
-        std::thread::sleep(Duration::from_secs_f64(secs));
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs_f64(secs) {
+            let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
+            for (port, sched) in schedulers.iter_mut().enumerate() {
+                for ev in sched.drain_due(pos) {
+                    let bytes = ev.message.as_bytes();
+                    midi.send(port, bytes);
+                    println!("  midi t={:.3}s port{port} {bytes:02X?}", pos as f64 / rate as f64);
+                }
+            }
+            // ~1 ms tick: fine MIDI granularity, decoupled from the audio buffer.
+            std::thread::sleep(Duration::from_millis(1));
+        }
         running.store(false, Ordering::Release);
         // Leaving the scope joins the audio thread.
     });
@@ -193,6 +244,55 @@ mod tests {
             Ok(_) => panic!("expected an error for a missing song"),
         };
         assert!(err.contains("nope"), "error should name the song: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Write a one-note SMF at `<dir>/songs/opener/midi/<dest>.mid`.
+    fn write_midi(dir: &std::path::Path, dest: &str) {
+        use midly::num::{u15, u28, u4, u7};
+        use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+        let midi_dir = dir.join("songs/opener/midi");
+        std::fs::create_dir_all(&midi_dir).unwrap();
+        let track = vec![
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::new(0),
+                    message: MidiMessage::NoteOn { key: u7::new(36), vel: u7::new(100) },
+                },
+            },
+            TrackEvent { delta: u28::new(0), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) },
+        ];
+        let smf = Smf {
+            header: Header { format: Format::SingleTrack, timing: Timing::Metrical(u15::new(480)) },
+            tracks: vec![track],
+        };
+        let mut buf = Vec::new();
+        smf.write_std(&mut buf).unwrap();
+        std::fs::write(midi_dir.join(format!("{dest}.mid")), buf).unwrap();
+    }
+
+    #[test]
+    fn load_schedulers_reads_destination_midi() {
+        let dir = write_bundle(64);
+        write_midi(&dir, "lights"); // matches the "lights" destination
+        let show = load_playable(&dir, None).unwrap().show;
+
+        let mut scheds = load_schedulers(&show, &dir.join("songs/opener"), 48_000);
+        assert_eq!(scheds.len(), 1, "one scheduler per destination");
+        // The single note-on at sample 0 is due immediately.
+        assert_eq!(scheds[0].drain_due(0).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_schedulers_is_empty_when_no_midi_file() {
+        let dir = write_bundle(64);
+        let show = load_playable(&dir, None).unwrap().show;
+        // No midi/ dir written: the destination gets an empty (silent) scheduler.
+        let scheds = load_schedulers(&show, &dir.join("songs/opener"), 48_000);
+        assert_eq!(scheds.len(), 1);
+        assert!(scheds[0].is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
