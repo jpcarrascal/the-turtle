@@ -7,9 +7,33 @@
 
 use std::process::ExitCode;
 
+mod gen;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("gen-tone") => match args.next() {
+            Some(out) => {
+                // Optional positional args: seconds (default 5), Hz (default 440).
+                // `unwrap_or` supplies the default when the arg is absent or unparsable.
+                let seconds = args.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+                let hz = args.next().and_then(|s| s.parse().ok()).unwrap_or(440.0);
+                match gen::gen_tone(std::path::Path::new(&out), seconds, hz) {
+                    Ok(()) => {
+                        println!("wrote tone bundle to {out} ({seconds}s @ {hz} Hz)");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("gen-tone {out}: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            None => {
+                eprintln!("usage: turtle gen-tone <out-dir> [seconds] [hz]");
+                ExitCode::FAILURE
+            }
+        },
         Some("validate") => match args.next() {
             Some(path) => match turtle_core::Show::load(&path).and_then(|s| s.validate()) {
                 Ok(()) => {
@@ -28,7 +52,8 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!("turtle <command>");
-            eprintln!("  validate <show.toml>   offline bundle validation (no daemon)");
+            eprintln!("  validate <show.toml>          offline bundle validation (no daemon)");
+            eprintln!("  gen-tone <out-dir> [s] [hz]   write a playable test bundle (sine tone)");
             eprintln!("(control-socket commands not yet implemented)");
             ExitCode::FAILURE
         }

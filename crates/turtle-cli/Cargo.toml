@@ -11,3 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 turtle-core = { workspace = true }
+# WAV writing for the `gen-tone` bundle generator. Pure Rust, no C deps.
+hound = "3"
