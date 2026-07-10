@@ -109,37 +109,45 @@ impl AudioBackend for AlsaAudio {
     }
 }
 
-/// MIDI output fan-out over ALSA rawmidi (§5): one open port per destination.
+/// MIDI output fan-out over ALSA rawmidi (§5): one port per destination.
 pub struct AlsaMidi {
-    // Indexed by the logical port number the scheduler/engine use. `Vec` owns
-    // the handles; each `Rawmidi` closes on drop.
-    ports: Vec<Rawmidi>,
+    // Indexed by the logical port number the scheduler/engine use. A `None` slot
+    // is a port that failed to open — its events are dropped rather than being a
+    // hard error, so a bad MIDI destination never stops the audio from playing.
+    ports: Vec<Option<Rawmidi>>,
 }
 
 impl AlsaMidi {
-    /// Open one rawmidi playback handle per name, in order.
+    /// Open one rawmidi playback handle per name, best-effort. Returns the sink
+    /// plus the names that failed to open (for the caller to warn about).
     ///
     /// NOTE: `names` must be **resolved ALSA rawmidi device names** (e.g.
     /// `hw:1,0,0`), not the logical labels from `show.toml` (`"CME:1"`).
     /// Translating a label to the CME card's `hw:` address is a bring-up step
     /// that belongs above this layer — a follow-up (spec §5 name resolution).
-    pub fn open(names: &[String]) -> Result<Self, alsa::Error> {
-        // Pre-size the Vec so pushing the handles does not reallocate.
+    pub fn open(names: &[String]) -> (Self, Vec<String>) {
         let mut ports = Vec::with_capacity(names.len());
+        let mut failed = Vec::new();
         for name in names {
             // `&str` from `&String` via deref coercion; `false` = blocking write.
-            ports.push(Rawmidi::new(name, Direction::Playback, false)?);
+            match Rawmidi::new(name, Direction::Playback, false) {
+                Ok(handle) => ports.push(Some(handle)),
+                Err(_) => {
+                    ports.push(None);
+                    failed.push(name.clone());
+                }
+            }
         }
-        Ok(AlsaMidi { ports })
+        (AlsaMidi { ports }, failed)
     }
 }
 
 impl MidiSink for AlsaMidi {
     fn send(&mut self, port: usize, bytes: &[u8]) {
-        // The trait signature returns `()`, and this runs on the MIDI scheduler
-        // thread, so we can't propagate an error with `?`. `.get()` returns an
-        // `Option`, so an out-of-range port is a no-op rather than a panic.
-        if let Some(rmidi) = self.ports.get(port) {
+        // The trait returns `()` and this runs on the MIDI scheduler thread, so
+        // we can't propagate an error with `?`. An out-of-range or unopened port
+        // (`get` → `None`, or the slot itself `None`) is a no-op, not a panic.
+        if let Some(Some(rmidi)) = self.ports.get(port) {
             // `io()` gives a `std::io::Write` over the port (same per-call,
             // borrow-avoiding pattern as the PCM view above). rawmidi writes are
             // syscalls — allowed on the MIDI thread, unlike the audio RT thread.

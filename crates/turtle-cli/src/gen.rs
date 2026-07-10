@@ -25,6 +25,8 @@ use std::path::Path;
 const SAMPLE_RATE: u32 = 48_000;
 /// Keep the tone well below full scale — easy on the ears and the limiter.
 const AMPLITUDE: f64 = 0.3;
+/// The song's nominal tempo; the test MIDI track pulses one note per beat.
+const BPM: f64 = 120.0;
 
 /// Generate the bundle at `out`. `seconds` sets the song length; `hz` the pitch.
 ///
@@ -36,13 +38,64 @@ pub fn gen_tone(out: &Path, seconds: f64, hz: f64) -> Result<(), Box<dyn Error>>
 
     let song_dir = out.join("songs").join("tone");
     let stems_dir = song_dir.join("stems");
+    let midi_dir = song_dir.join("midi");
     // `create_dir_all` makes every missing parent, like `mkdir -p`.
     std::fs::create_dir_all(&stems_dir)?;
+    std::fs::create_dir_all(&midi_dir)?;
 
     write_sine(&stems_dir.join("pair1.wav"), frames, hz)?;
+    // One MIDI note per beat, for the `lights` destination in show.toml. This is
+    // what the §5 scheduler dispatches in sync with the audio.
+    let beats = (seconds * BPM / 60.0) as u32;
+    write_test_smf(&midi_dir.join("lights.mid"), beats)?;
+
     std::fs::write(out.join("show.toml"), SHOW_TOML)?;
     std::fs::write(song_dir.join("song.toml"), song_toml(frames))?;
 
+    Ok(())
+}
+
+/// Write a Standard MIDI File that pulses note 36 once per beat: note-on at the
+/// beat, note-off half a beat later. Used as a per-destination test track.
+fn write_test_smf(path: &Path, beats: u32) -> Result<(), Box<dyn Error>> {
+    use midly::num::{u15, u24, u28, u4, u7};
+    use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+
+    // Pulses-per-quarter-note: the tick resolution. Half a beat = PPQ/2 ticks.
+    const PPQ: u16 = 480;
+    let note_off = |key, vel| MidiMessage::NoteOff { key: u7::new(key), vel: u7::new(vel) };
+
+    let mut track = Vec::new();
+    // Set 120 BPM so the compiler's tick→sample math matches BPM above.
+    track.push(TrackEvent {
+        delta: u28::new(0),
+        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(500_000))), // µs per quarter
+    });
+    for beat in 0..beats {
+        // First note-on lands at tick 0; each subsequent one PPQ/2 after the
+        // previous note-off, i.e. one full beat apart.
+        let on_delta = if beat == 0 { 0 } else { PPQ as u32 / 2 };
+        track.push(TrackEvent {
+            delta: u28::new(on_delta),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOn { key: u7::new(36), vel: u7::new(100) },
+            },
+        });
+        track.push(TrackEvent {
+            delta: u28::new(PPQ as u32 / 2),
+            kind: TrackEventKind::Midi { channel: u4::new(0), message: note_off(36, 0) },
+        });
+    }
+    track.push(TrackEvent { delta: u28::new(0), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) });
+
+    let smf = Smf {
+        header: Header { format: Format::SingleTrack, timing: Timing::Metrical(u15::new(PPQ)) },
+        tracks: vec![track],
+    };
+    let mut buf = Vec::new();
+    smf.write_std(&mut buf)?;
+    std::fs::write(path, buf)?;
     Ok(())
 }
 
@@ -153,6 +206,23 @@ mod tests {
         assert_eq!(spec.bits_per_sample, 24);
         assert_eq!(reader.len(), 24_000 * 2, "frames * channels");
 
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn generates_a_dispatchable_midi_track() {
+        let out = temp_dir("midi");
+        gen_tone(&out, 2.0, 440.0).unwrap(); // 2 s @ 120 BPM = 4 beats
+
+        // The generated SMF must compile via the same timeline the daemon uses.
+        let bytes = std::fs::read(out.join("songs/tone/midi/lights.mid")).unwrap();
+        let tl = turtle_core::Timeline::compile_smf(&bytes, 48_000).unwrap();
+
+        // 4 beats * (note-on + note-off) = 8 events, sorted by sample time.
+        assert_eq!(tl.events.len(), 8);
+        assert_eq!(tl.events[0].sample_time, 0); // first note-on at the top
+        assert_eq!(tl.events[1].sample_time, 12_000); // note-off 0.25 s later
+        assert_eq!(tl.events[2].sample_time, 24_000); // next beat at 0.5 s
         std::fs::remove_dir_all(&out).ok();
     }
 
