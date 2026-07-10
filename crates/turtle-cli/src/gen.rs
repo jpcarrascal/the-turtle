@@ -126,11 +126,12 @@ fn write_sine(path: &Path, frames: u64, hz: f64) -> Result<(), hound::Error> {
 /// A minimal valid `show.toml`: one destination, a full control map, and a
 /// setlist entry (PC 0) pointing at the `tone` song directory.
 ///
-/// The `[audio] device` and `[control] input_port` here are the **dev rig's**
-/// ALSA names (`hw:L6` USB interface, `hw:4,0,0` MIDI controller) and the
-/// controller's actual `start`/`stop` note numbers, so `gen-tone` output is
-/// playable on that Pi without editing. Change these for a different setup —
-/// `aplay -l` lists audio cards, `amidi -l` lists MIDI ports.
+/// The `[audio] device`, `[control] input_port`, and the `lights` destination
+/// `port` here are the **dev rig's** ALSA names (`hw:L6` USB audio, `hw:4,0,0`
+/// MIDI controller in, `hw:5,0,0` CME MIDI out) plus the controller's actual
+/// `start`/`stop` note numbers, so `gen-tone` output plays, responds to control,
+/// and emits MIDI on that Pi without editing. Change these for a different setup
+/// — `aplay -l` lists audio cards, `amidi -l` lists MIDI ports.
 const SHOW_TOML: &str = r#"[show]
 name = "Tone Test"
 playback_rate = 48000
@@ -141,7 +142,7 @@ buffer_frames = 1024
 
 [[destinations]]
 name = "lights"
-port = "CME:1"
+port = "hw:5,0,0"
 
 [control]
 input_port = "hw:4,0,0"
