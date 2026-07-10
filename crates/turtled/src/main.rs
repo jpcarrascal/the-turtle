@@ -6,11 +6,15 @@
 //! control-thread engine that wires the transport state machine to a lock-free
 //! RT command queue (§3) and a MIDI sink.
 //!
-//! What is **not** here yet: the ALSA PCM loop and rawmidi I/O, thread spawning
-//! with `SCHED_FIFO`, and the background stem loader. Those are Linux/ALSA-only
-//! (§2) and cannot be built or run on this host, so the concrete backends are
-//! left behind the `backend` traits. `main` currently loads + validates a show
-//! and constructs the engine to prove the wiring compiles end to end.
+//! It now also has the offline audio path: the stem loader ([`stems`]), the RT
+//! mixer ([`mixer`]), and the audio RT loop ([`rt`]) driving the ALSA backend.
+//! `turtled play <bundle>` wires those together to play a song to the device on
+//! Linux; the default `turtled <show.toml>` still just loads + validates.
+//!
+//! What is **not** here yet: rawmidi *input* + the MIDI scheduler thread, the
+//! control socket, GPIO, `SCHED_FIFO` thread priorities (v1 uses a normal thread
+//! with big xrun-proof buffers, §3.1), and resolving logical MIDI port labels to
+//! ALSA device names.
 
 // The RT modules below (clock, scheduler, engine, ...) are unit-tested but not
 // yet driven by `main`: their consumer is the ALSA RT loop, which is Linux-only
@@ -29,6 +33,7 @@ mod control_map;
 mod engine;
 mod mixer;
 mod notes;
+mod play;
 mod rt;
 mod scheduler;
 mod stems;
@@ -38,13 +43,49 @@ use std::process::ExitCode;
 use backend::{AudioBackend, NullAudio, NullMidi};
 
 fn main() -> ExitCode {
-    let Some(show_path) = std::env::args().nth(1) else {
-        eprintln!("usage: turtled <path/to/show.toml>");
-        eprintln!("(RT audio/MIDI runtime is Linux/ALSA-only; this loads + validates)");
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        // `play` runs the real audio path (Linux/ALSA). Everything else is
+        // treated as a show path and takes the unchanged load+validate path.
+        Some("play") => play_command(args.next(), args.next()),
+        Some(show_path) => run_show(show_path),
+        None => {
+            eprintln!("usage: turtled <path/to/show.toml>    load + validate a show");
+            eprintln!("       turtled play <bundle> [song]   play a song to the device (Linux)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `turtled play <bundle> [song]`: play a bundle's song to the audio device.
+fn play_command(bundle: Option<String>, song: Option<String>) -> ExitCode {
+    let Some(bundle) = bundle else {
+        eprintln!("usage: turtled play <bundle-dir> [song]");
         return ExitCode::FAILURE;
     };
+    #[cfg(target_os = "linux")]
+    {
+        match play::run(std::path::Path::new(&bundle), song.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("play: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // The audio runtime is Linux-only; keep the args "used" so the dev-Mac
+        // build stays warning-free.
+        let _ = (&bundle, &song);
+        eprintln!("play requires Linux/ALSA (this host is {})", std::env::consts::OS);
+        ExitCode::FAILURE
+    }
+}
 
-    let show = match turtle_core::Show::load(&show_path) {
+/// The original load + validate + wiring path (unchanged, drives the smoke test).
+fn run_show(show_path: &str) -> ExitCode {
+    let show = match turtle_core::Show::load(show_path) {
         Ok(show) => show,
         Err(e) => {
             eprintln!("could not load {show_path}: {e}");
