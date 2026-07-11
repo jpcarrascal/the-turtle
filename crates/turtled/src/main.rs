@@ -50,27 +50,57 @@ fn main() -> ExitCode {
     match args.next().as_deref() {
         // `play` runs the real audio path (Linux/ALSA). Everything else is
         // treated as a show path and takes the unchanged load+validate path.
-        Some("play") => play_command(args.next(), args.next()),
-        Some("control") => control_command(args.next(), args.next()),
+        Some("play") => {
+            let opts = CmdOpts::parse(args);
+            play_command(opts)
+        }
+        Some("control") => {
+            let opts = CmdOpts::parse(args);
+            control_command(opts)
+        }
         Some(show_path) => run_show(show_path),
         None => {
-            eprintln!("usage: turtled <path/to/show.toml>     load + validate a show");
-            eprintln!("       turtled play <bundle> [song]    play a song to the device (Linux)");
-            eprintln!("       turtled control <bundle> [song] drive playback from MIDI (Linux)");
+            eprintln!("usage: turtled <path/to/show.toml>          load + validate a show");
+            eprintln!("       turtled play <bundle> [song] [-v]    play a song to the device (Linux)");
+            eprintln!("       turtled control <bundle> [song] [-v] drive playback from MIDI (Linux)");
+            eprintln!("  -v, --verbose   log each dispatched MIDI event (bring-up diagnostics)");
             ExitCode::FAILURE
         }
     }
 }
 
+/// Parsed args for the `play` / `control` subcommands: two positionals (bundle,
+/// song) plus a `-v`/`--verbose` flag accepted in any position.
+struct CmdOpts {
+    bundle: Option<String>,
+    song: Option<String>,
+    verbose: bool,
+}
+
+impl CmdOpts {
+    fn parse(args: impl Iterator<Item = String>) -> Self {
+        let mut positionals = Vec::new();
+        let mut verbose = false;
+        for arg in args {
+            match arg.as_str() {
+                "-v" | "--verbose" => verbose = true,
+                _ => positionals.push(arg),
+            }
+        }
+        let mut it = positionals.into_iter();
+        CmdOpts { bundle: it.next(), song: it.next(), verbose }
+    }
+}
+
 /// `turtled control <bundle> [song]`: drive a song's transport from live MIDI.
-fn control_command(bundle: Option<String>, song: Option<String>) -> ExitCode {
-    let Some(bundle) = bundle else {
-        eprintln!("usage: turtled control <bundle-dir> [song]");
+fn control_command(opts: CmdOpts) -> ExitCode {
+    let Some(bundle) = opts.bundle else {
+        eprintln!("usage: turtled control <bundle-dir> [song] [-v]");
         return ExitCode::FAILURE;
     };
     #[cfg(target_os = "linux")]
     {
-        match control::run(std::path::Path::new(&bundle), song.as_deref()) {
+        match control::run(std::path::Path::new(&bundle), opts.song.as_deref(), opts.verbose) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("control: {e}");
@@ -80,21 +110,21 @@ fn control_command(bundle: Option<String>, song: Option<String>) -> ExitCode {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&bundle, &song);
+        let _ = (&bundle, &opts.song, opts.verbose);
         eprintln!("control requires Linux/ALSA (this host is {})", std::env::consts::OS);
         ExitCode::FAILURE
     }
 }
 
 /// `turtled play <bundle> [song]`: play a bundle's song to the audio device.
-fn play_command(bundle: Option<String>, song: Option<String>) -> ExitCode {
-    let Some(bundle) = bundle else {
-        eprintln!("usage: turtled play <bundle-dir> [song]");
+fn play_command(opts: CmdOpts) -> ExitCode {
+    let Some(bundle) = opts.bundle else {
+        eprintln!("usage: turtled play <bundle-dir> [song] [-v]");
         return ExitCode::FAILURE;
     };
     #[cfg(target_os = "linux")]
     {
-        match play::run(std::path::Path::new(&bundle), song.as_deref()) {
+        match play::run(std::path::Path::new(&bundle), opts.song.as_deref(), opts.verbose) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("play: {e}");
@@ -106,7 +136,7 @@ fn play_command(bundle: Option<String>, song: Option<String>) -> ExitCode {
     {
         // The audio runtime is Linux-only; keep the args "used" so the dev-Mac
         // build stays warning-free.
-        let _ = (&bundle, &song);
+        let _ = (&bundle, &opts.song, opts.verbose);
         eprintln!("play requires Linux/ALSA (this host is {})", std::env::consts::OS);
         ExitCode::FAILURE
     }

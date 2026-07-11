@@ -82,19 +82,25 @@ pub fn load_schedulers(show: &Show, song_dir: &Path, rate: u32) -> Vec<PortSched
         .collect()
 }
 
-/// Shift the transport position by a destination's latency offset for dispatch
-/// (spec §5). A **negative** `offset_ms` makes events fire *earlier* (to lead a
-/// destination with downstream latency); a positive one *later*. Clamped at 0 so
-/// dispatch never reads before the song start.
-fn adjusted_pos(pos: u64, offset_ms: f64, rate: u32) -> u64 {
+/// The offset-adjusted position to dispatch a destination against (spec §5/§9):
+/// events fire when `pos >= sample_time + offset`. A **negative** `offset_ms`
+/// makes events fire *earlier* (to lead a destination with downstream latency); a
+/// positive one *later*.
+///
+/// Returns `None` when the adjusted position is still before the song start —
+/// i.e. we're within a positive offset of `pos = 0`, so nothing is due yet. That
+/// is what correctly delays even the `t = 0` event by the offset instead of
+/// firing it immediately (which clamping to 0 would, e.g. on restart).
+pub fn dispatch_pos(pos: u64, offset_ms: f64, rate: u32) -> Option<u64> {
     let offset_samples = (offset_ms / 1000.0 * rate as f64).round() as i64;
-    (pos as i64 - offset_samples).max(0) as u64
+    let adjusted = pos as i64 - offset_samples;
+    (adjusted >= 0).then_some(adjusted as u64)
 }
 
 /// Open the device, spawn the audio RT thread, play the song, and stop. Linux
 /// only (drives `AlsaAudio`).
 #[cfg(target_os = "linux")]
-pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
+pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -168,17 +174,21 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
             let wall_s = epoch.elapsed().as_secs_f64();
             let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
             for (port, sched) in schedulers.iter_mut().enumerate() {
-                // Each destination dispatches against its own offset-adjusted pos.
-                let pos_adj = adjusted_pos(pos, dest_offsets[port], rate);
+                // Each destination dispatches against its own offset-adjusted pos;
+                // `None` = still within the offset of the start, nothing due yet.
+                let Some(pos_adj) = dispatch_pos(pos, dest_offsets[port], rate) else { continue };
                 for ev in sched.drain_due(pos_adj) {
                     let bytes = ev.message.as_bytes();
                     midi.send(port, bytes);
                     // `wall` is the actual elapsed time since playback armed — used
                     // to diagnose startup timing (compare against the beat grid).
-                    println!(
-                        "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
-                        pos_adj as f64 / rate as f64
-                    );
+                    // Gated: one line per event floods stdout in a dense show.
+                    if verbose {
+                        println!(
+                            "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
+                            pos_adj as f64 / rate as f64
+                        );
+                    }
                 }
             }
             // ~1 ms tick: fine MIDI granularity, decoupled from the audio buffer.
@@ -312,11 +322,14 @@ mod tests {
     #[test]
     fn offset_shifts_dispatch_position() {
         // -8 ms @ 48k = 384 samples earlier; +8 ms = 384 later.
-        assert_eq!(adjusted_pos(10_000, -8.0, 48_000), 10_384);
-        assert_eq!(adjusted_pos(10_000, 8.0, 48_000), 9_616);
-        assert_eq!(adjusted_pos(5_000, 0.0, 48_000), 5_000);
-        // A positive offset larger than the position clamps to the song start.
-        assert_eq!(adjusted_pos(100, 100.0, 48_000), 0);
+        assert_eq!(dispatch_pos(10_000, -8.0, 48_000), Some(10_384));
+        assert_eq!(dispatch_pos(10_000, 8.0, 48_000), Some(9_616));
+        assert_eq!(dispatch_pos(5_000, 0.0, 48_000), Some(5_000));
+        // Within a positive offset of the start, nothing is due yet — the t=0
+        // event is delayed by the offset, not fired immediately.
+        assert_eq!(dispatch_pos(100, 100.0, 48_000), None);
+        // Exactly at the offset boundary: the start becomes due.
+        assert_eq!(dispatch_pos(4_800, 100.0, 48_000), Some(0));
     }
 
     #[test]
