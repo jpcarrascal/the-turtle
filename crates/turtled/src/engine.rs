@@ -33,21 +33,19 @@ pub fn rt_channel(capacity: usize) -> (RtProducer, RtConsumer) {
     RingBuffer::new(capacity)
 }
 
-pub struct Engine<M: MidiSink> {
+pub struct Engine {
     transport: Transport,
     control: turtle_core::model::Control,
-    midi: M,
     active_notes: ActiveNotes,
     num_ports: usize,
     pending_preload: Option<String>,
 }
 
-impl<M: MidiSink> Engine<M> {
-    pub fn new(show: &Show, midi: M) -> Self {
+impl Engine {
+    pub fn new(show: &Show) -> Self {
         Engine {
             transport: Transport::from_show(show),
             control: show.control.clone(),
-            midi,
             active_notes: ActiveNotes::new(),
             num_ports: show.destinations.len().max(1),
             pending_preload: None,
@@ -70,16 +68,25 @@ impl<M: MidiSink> Engine<M> {
         }
     }
 
-    /// Decode + apply an incoming foot-controller message.
-    pub fn handle_midi(&mut self, status: u8, d1: u8, d2: u8) -> Vec<RtCommand> {
+    /// Decode + apply an incoming foot-controller message. MIDI output (clean
+    /// release / panic) is written to the borrowed `midi` sink, which the caller
+    /// also uses for the scheduler — so a single `AlsaMidi` serves both without
+    /// the engine owning it.
+    pub fn handle_midi(
+        &mut self,
+        status: u8,
+        d1: u8,
+        d2: u8,
+        midi: &mut impl MidiSink,
+    ) -> Vec<RtCommand> {
         match control_map::decode(&self.control, status, d1, d2) {
-            Some(cmd) => self.handle(cmd),
+            Some(cmd) => self.handle(cmd, midi),
             None => Vec::new(),
         }
     }
 
     /// Apply a transport command, returning the RT commands to forward.
-    pub fn handle(&mut self, cmd: Command) -> Vec<RtCommand> {
+    pub fn handle(&mut self, cmd: Command, midi: &mut impl MidiSink) -> Vec<RtCommand> {
         let mut rt = Vec::new();
         for action in self.transport.apply(cmd) {
             match action {
@@ -87,26 +94,26 @@ impl<M: MidiSink> Engine<M> {
                 Action::StartPlayback => rt.push(RtCommand::Start),
                 Action::StopPlayback => rt.push(RtCommand::Stop),
                 Action::SeekToZero => rt.push(RtCommand::Seek(0)),
-                Action::ReleaseNotes => self.emit_release(),
-                Action::Panic => self.emit_panic(),
+                Action::ReleaseNotes => self.emit_release(midi),
+                Action::Panic => self.emit_panic(midi),
             }
         }
         rt
     }
 
     /// Send note-offs for currently-sounding notes (clean release, §8).
-    fn emit_release(&mut self) {
+    fn emit_release(&mut self, midi: &mut impl MidiSink) {
         for (port, bytes) in self.active_notes.release_all() {
-            self.midi.send(port, &bytes);
+            midi.send(port, &bytes);
         }
     }
 
     /// All-notes-off + reset-all-controllers on every port/channel (§5).
-    fn emit_panic(&mut self) {
+    fn emit_panic(&mut self, midi: &mut impl MidiSink) {
         for port in 0..self.num_ports {
             for ch in 0u8..16 {
-                self.midi.send(port, &[0xB0 | ch, 123, 0]); // all notes off
-                self.midi.send(port, &[0xB0 | ch, 121, 0]); // reset all controllers
+                midi.send(port, &[0xB0 | ch, 123, 0]); // all notes off
+                midi.send(port, &[0xB0 | ch, 121, 0]); // reset all controllers
             }
         }
         self.active_notes.clear();
@@ -156,55 +163,57 @@ pc = 0
 song = "01-opener"
 "#;
 
-    fn engine() -> Engine<RecordingMidi> {
-        let show = Show::from_toml_str(SHOW).unwrap();
-        Engine::new(&show, RecordingMidi::default())
+    fn engine() -> Engine {
+        Engine::new(&Show::from_toml_str(SHOW).unwrap())
     }
 
     #[test]
     fn select_then_start_forwards_rt_commands() {
         let mut e = engine();
+        let mut midi = RecordingMidi::default();
         // Program Change 0 arms the opener.
-        assert!(e.handle_midi(0xC0, 0, 0).is_empty());
+        assert!(e.handle_midi(0xC0, 0, 0, &mut midi).is_empty());
         assert_eq!(e.take_pending_preload().as_deref(), Some("01-opener"));
 
-        e.handle(Command::Loaded);
+        e.handle(Command::Loaded, &mut midi);
         assert_eq!(e.state(), State::Armed);
 
         // Note 60 = Start -> RtCommand::Start.
-        assert_eq!(e.handle_midi(0x90, 60, 100), vec![RtCommand::Start]);
+        assert_eq!(e.handle_midi(0x90, 60, 100, &mut midi), vec![RtCommand::Start]);
         assert_eq!(e.state(), State::Playing);
     }
 
     #[test]
     fn stop_releases_sounding_notes_then_rewinds() {
         let mut e = engine();
-        e.handle(Command::Select(0));
-        e.handle(Command::Loaded);
-        e.handle(Command::Start);
+        let mut midi = RecordingMidi::default();
+        e.handle(Command::Select(0), &mut midi);
+        e.handle(Command::Loaded, &mut midi);
+        e.handle(Command::Start, &mut midi);
 
         // The scheduler dispatched a note-on on port 0; the engine observes it.
         e.observe_output(0, &[0x90, 60, 100]);
 
         // Note 61 = Stop -> clean release (note-off) + Stop + Seek(0).
-        let rt = e.handle_midi(0x90, 61, 100);
+        let rt = e.handle_midi(0x90, 61, 100, &mut midi);
         assert_eq!(rt, vec![RtCommand::Stop, RtCommand::Seek(0)]);
-        assert_eq!(e.midi.sent, vec![(0, vec![0x80, 60, 0])]);
+        assert_eq!(midi.sent, vec![(0, vec![0x80, 60, 0])]);
     }
 
     #[test]
     fn double_stop_emits_panic_on_all_ports() {
         let mut e = engine();
-        e.handle(Command::Select(0));
-        e.handle(Command::Loaded);
-        e.handle(Command::Start);
-        e.handle(Command::Stop); // first stop
-        e.midi.sent.clear();
+        let mut midi = RecordingMidi::default();
+        e.handle(Command::Select(0), &mut midi);
+        e.handle(Command::Loaded, &mut midi);
+        e.handle(Command::Start, &mut midi);
+        e.handle(Command::Stop, &mut midi); // first stop
+        midi.sent.clear();
 
-        e.handle(Command::Stop); // second stop -> panic
+        e.handle(Command::Stop, &mut midi); // second stop -> panic
         // 2 destinations x 16 channels x 2 messages = 64 messages.
-        assert_eq!(e.midi.sent.len(), 64);
-        assert!(e.midi.sent.iter().any(|(p, b)| *p == 1 && b == &[0xB0, 123, 0]));
+        assert_eq!(midi.sent.len(), 64);
+        assert!(midi.sent.iter().any(|(p, b)| *p == 1 && b == &[0xB0, 123, 0]));
     }
 
     #[test]

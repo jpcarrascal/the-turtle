@@ -104,7 +104,7 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
     use turtle_core::Command;
 
     use crate::alsa_backend::{AlsaAudio, AlsaMidi};
-    use crate::backend::{MidiSink, NullMidi};
+    use crate::backend::MidiSink;
     use crate::clock::TransportClock;
     use crate::engine::{rt_channel, Engine, RtCommand};
     use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
@@ -140,9 +140,9 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
     let running = AtomicBool::new(true);
     let epoch = Instant::now();
 
-    // The transport engine. NullMidi for now: clean-release / panic MIDI output
-    // to destinations is a later step; here we only care about transport control.
-    let mut eng = Engine::new(&show, NullMidi);
+    // The transport engine. It shares `midi_out` with the scheduler: on Stop it
+    // emits clean-release note-offs, on double-Stop/Panic all-notes-off (§5/§8).
+    let mut eng = Engine::new(&show);
     // The song is already preloaded, so arm it up front: Select its setlist PC,
     // then feed the loader's "Loaded" so the state machine reaches ARMED.
     let pc = show.setlist.first().map(|e| e.pc).ok_or("empty setlist")?;
@@ -178,7 +178,8 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
             if let Ok(n) = io.read(&mut buf) {
                 for &byte in &buf[..n] {
                     let Some((status, d1, d2)) = parser.push(byte) else { continue };
-                    for cmd in eng.handle_midi(status, d1, d2) {
+                    // The engine may emit clean-release/panic MIDI to `midi_out`.
+                    for cmd in eng.handle_midi(status, d1, d2, &mut midi_out) {
                         match cmd {
                             RtCommand::Start => {
                                 playing = true;
@@ -213,6 +214,8 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                     for ev in sched.drain_due(pos_adj) {
                         let bytes = ev.message.as_bytes();
                         midi_out.send(port, bytes);
+                        // Track sounding notes so a later Stop cleanly releases them.
+                        eng.observe_output(port, bytes);
                         if verbose {
                             println!(
                                 "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
