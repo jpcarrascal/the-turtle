@@ -146,8 +146,9 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
     // The song is already preloaded, so arm it up front: Select its setlist PC,
     // then feed the loader's "Loaded" so the state machine reaches ARMED.
     let pc = show.setlist.first().map(|e| e.pc).ok_or("empty setlist")?;
-    eng.handle(Command::Select(pc));
-    eng.handle(Command::Loaded);
+    // Arming emits no MIDI, but `handle` needs a sink; pass the shared one.
+    eng.handle(Command::Select(pc), &mut midi_out);
+    eng.handle(Command::Loaded, &mut midi_out);
 
     println!(
         "armed \"{}\" on {}; drive it from {} (Ctrl-C to quit)",
