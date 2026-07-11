@@ -86,7 +86,7 @@ pub fn load_schedulers(show: &Show, song_dir: &Path, rate: u32) -> Vec<PortSched
 /// (spec §5). A **negative** `offset_ms` makes events fire *earlier* (to lead a
 /// destination with downstream latency); a positive one *later*. Clamped at 0 so
 /// dispatch never reads before the song start.
-fn adjusted_pos(pos: u64, offset_ms: f64, rate: u32) -> u64 {
+pub fn adjusted_pos(pos: u64, offset_ms: f64, rate: u32) -> u64 {
     let offset_samples = (offset_ms / 1000.0 * rate as f64).round() as i64;
     (pos as i64 - offset_samples).max(0) as u64
 }

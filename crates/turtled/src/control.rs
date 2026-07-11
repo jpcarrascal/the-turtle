@@ -95,32 +95,45 @@ fn data_bytes_for(status: u8) -> usize {
 #[cfg(target_os = "linux")]
 pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
     use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     use alsa::rawmidi::Rawmidi;
     use alsa::Direction;
 
     use turtle_core::Command;
 
-    use crate::alsa_backend::AlsaAudio;
-    use crate::backend::NullMidi;
+    use crate::alsa_backend::{AlsaAudio, AlsaMidi};
+    use crate::backend::{MidiSink, NullMidi};
     use crate::clock::TransportClock;
-    use crate::engine::{rt_channel, Engine};
-    use crate::play::{load_playable, Playable};
+    use crate::engine::{rt_channel, Engine, RtCommand};
+    use crate::play::{adjusted_pos, load_playable, load_schedulers, Playable};
     use crate::rt;
 
     // Reuse the play path's loader: preload the chosen (or first) song's stems.
-    let Playable { show, mut mixer, .. } = load_playable(bundle, song)?;
+    let Playable { show, mut mixer, song_dir, .. } = load_playable(bundle, song)?;
     let rate = show.show.playback_rate;
 
     let audio = AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize)
         .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
-    // Blocking rawmidi input. NOTE: `input_port` must be a real ALSA name (e.g.
-    // `hw:1,0,0` from `amidi -l`); resolving logical labels like "CME:in" is a
-    // later step — set it in show.toml for now, as with the audio device.
-    let midi_in = Rawmidi::new(&show.control.input_port, Direction::Capture, false)
+    // Non-blocking rawmidi input (the `true`): the one control loop polls input
+    // *and* dispatches timed MIDI output, so a blocking read would starve the
+    // scheduler. `input_port` must be a real ALSA name (`amidi -l`).
+    let midi_in = Rawmidi::new(&show.control.input_port, Direction::Capture, true)
         .map_err(|e| format!("open midi in '{}': {e}", show.control.input_port))?;
+
+    // MIDI output for the scheduler (best-effort, like the play path).
+    let midi_names: Vec<String> = show.destinations.iter().map(|d| d.port.clone()).collect();
+    let (mut midi_out, failed) = AlsaMidi::open(&midi_names);
+    for name in &failed {
+        eprintln!("warning: MIDI out '{name}' unavailable; its events will be logged only");
+    }
+    let mut schedulers = load_schedulers(&show, &song_dir, rate);
+    let dest_offsets: Vec<f64> = show
+        .destinations
+        .iter()
+        .map(|d| show.audio.output_latency_ms + d.offset_ms)
+        .collect();
 
     let clock = TransportClock::new(rate);
     let (mut tx, mut rx) = rt_channel(64);
@@ -148,30 +161,56 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
         let running = &running;
         s.spawn(move || rt::run_audio(&audio, &mut mixer, clock, &mut rx, epoch, running));
 
-        // Control loop: read MIDI, decode to transport commands, forward RT
-        // commands to the audio thread. Blocking reads; Ctrl-C ends the process.
+        // The control + MIDI-scheduler loop (one thread for v1). Each ~1 ms it:
+        //  1. polls MIDI input (non-blocking) -> transport commands -> RT queue;
+        //  2. dispatches due MIDI output while playing.
         let mut parser = MidiParser::new();
         let mut io = midi_in.io();
         let mut buf = [0u8; 64];
+        // Track play state locally so the scheduler only fires while running —
+        // when stopped, the interpolated clock would otherwise drift and emit.
+        let mut playing = false;
+
         loop {
-            match io.read(&mut buf) {
-                Ok(0) => break, // input closed
-                Ok(n) => {
-                    for &byte in &buf[..n] {
-                        if let Some((status, d1, d2)) = parser.push(byte) {
-                            for cmd in eng.handle_midi(status, d1, d2) {
-                                let _ = tx.push(cmd);
+            // Non-blocking read: `Ok(n)` gives pending bytes; an `Err` means no
+            // data right now (WouldBlock/EAGAIN) — or a transient device hiccup —
+            // so we simply keep polling. Ctrl-C is the exit.
+            if let Ok(n) = io.read(&mut buf) {
+                for &byte in &buf[..n] {
+                    let Some((status, d1, d2)) = parser.push(byte) else { continue };
+                    for cmd in eng.handle_midi(status, d1, d2) {
+                        match cmd {
+                            RtCommand::Start => playing = true,
+                            RtCommand::Stop => playing = false,
+                            // Rewind: realign the output cursors with the audio.
+                            RtCommand::Seek(pos) => {
+                                for sched in schedulers.iter_mut() {
+                                    sched.seek(pos);
+                                }
                             }
                         }
+                        let _ = tx.push(cmd);
                     }
                 }
-                Err(_) => break, // device error — stop cleanly
             }
+
+            if playing {
+                let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
+                for (port, sched) in schedulers.iter_mut().enumerate() {
+                    let pos_adj = adjusted_pos(pos, dest_offsets[port], rate);
+                    for ev in sched.drain_due(pos_adj) {
+                        midi_out.send(port, ev.message.as_bytes());
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
         }
-        // Only reached on read error/EOF (Ctrl-C kills the process directly).
-        running.store(false, Ordering::Release);
+        // The loop runs until the process is signalled (Ctrl-C); there is no
+        // clean-exit path yet, so the audio thread's `running` flag stays set.
     });
 
+    #[allow(unreachable_code)]
     Ok(())
 }
 
