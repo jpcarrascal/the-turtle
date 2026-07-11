@@ -118,8 +118,13 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
     }
     // One scheduler per destination, compiled from the song's per-destination SMF.
     let mut schedulers = load_schedulers(&show, &song_dir, rate);
-    // Per-destination latency offsets (§5), indexed like the schedulers.
-    let dest_offsets: Vec<f64> = show.destinations.iter().map(|d| d.offset_ms).collect();
+    // Total dispatch offset per destination (§9): the global audio-output latency
+    // plus this destination's own trim, indexed like the schedulers.
+    let dest_offsets: Vec<f64> = show
+        .destinations
+        .iter()
+        .map(|d| show.audio.output_latency_ms + d.offset_ms)
+        .collect();
 
     let clock = TransportClock::new(rate);
     // Small SPSC command queue to the audio thread (§3). Producer stays here.
@@ -160,6 +165,7 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
         let _ = tx.push(RtCommand::Start);
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs_f64(secs) {
+            let wall_s = epoch.elapsed().as_secs_f64();
             let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
             for (port, sched) in schedulers.iter_mut().enumerate() {
                 // Each destination dispatches against its own offset-adjusted pos.
@@ -167,7 +173,12 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
                 for ev in sched.drain_due(pos_adj) {
                     let bytes = ev.message.as_bytes();
                     midi.send(port, bytes);
-                    println!("  midi t={:.3}s port{port} {bytes:02X?}", pos_adj as f64 / rate as f64);
+                    // `wall` is the actual elapsed time since playback armed — used
+                    // to diagnose startup timing (compare against the beat grid).
+                    println!(
+                        "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
+                        pos_adj as f64 / rate as f64
+                    );
                 }
             }
             // ~1 ms tick: fine MIDI granularity, decoupled from the audio buffer.
