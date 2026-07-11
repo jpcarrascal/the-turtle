@@ -36,6 +36,7 @@ impl RtAudio {
             RtCommand::Start => self.playing = true,
             RtCommand::Stop => self.playing = false,
             RtCommand::Seek(pos) => mixer.seek(pos),
+            RtCommand::ToggleMute(pair) => mixer.toggle_pair_mute(pair),
         }
     }
 
@@ -162,6 +163,21 @@ mod tests {
         assert_eq!(pos, 1);
         assert_eq!(out, [0, 0]);
         assert_eq!(m.position(), 1, "no advance while stopped");
+    }
+
+    #[test]
+    fn toggle_mute_forwards_to_the_mixer() {
+        let mut m = mixer();
+        let mut rt = RtAudio::new();
+        rt.apply(&mut m, RtCommand::Start);
+        rt.apply(&mut m, RtCommand::ToggleMute(0));
+        let mut out = [0i32; 2];
+        rt.step(&mut m, &mut out);
+        // Mute starts ramping toward silence immediately (0 ms elapsed isn't
+        // enough to reach it exactly, but the sample must already be reduced
+        // below the unmuted 0.5-gain full-scale value).
+        let unmuted_half = (i32::MAX as f32 * 0.5) as i32;
+        assert!(out[0] < unmuted_half, "expected {} < {}", out[0], unmuted_half);
     }
 
     #[test]
