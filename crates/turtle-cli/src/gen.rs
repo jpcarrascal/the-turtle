@@ -164,9 +164,10 @@ playback_rate = 48000
 [audio]
 device = "hw:L6"
 buffer_frames = 1024
-# Global MIDI-vs-audio latency compensation in ms (§9): raise to delay all MIDI
-# so cues line up with the audible audio (buffer + DAC lag). Tune live; 0 = off.
-output_latency_ms = 0.0
+# Global MIDI-vs-audio latency compensation in ms (§9): delays all MIDI so cues
+# line up with the audible audio (buffer + DAC lag). 29 ms was measured on the dev
+# rig (1024-frame buffer + hw:L6); re-measure if the buffer/device changes.
+output_latency_ms = 29.0
 
 [[destinations]]
 name = "lights"
