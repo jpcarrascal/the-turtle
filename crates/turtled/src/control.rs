@@ -107,7 +107,7 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
     use crate::backend::{MidiSink, NullMidi};
     use crate::clock::TransportClock;
     use crate::engine::{rt_channel, Engine, RtCommand};
-    use crate::play::{adjusted_pos, load_playable, load_schedulers, Playable};
+    use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
     use crate::rt;
 
     // Reuse the play path's loader: preload the chosen (or first) song's stems.
@@ -197,7 +197,8 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
             if playing {
                 let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
                 for (port, sched) in schedulers.iter_mut().enumerate() {
-                    let pos_adj = adjusted_pos(pos, dest_offsets[port], rate);
+                    // `None` = within the offset of the start; nothing due yet.
+                    let Some(pos_adj) = dispatch_pos(pos, dest_offsets[port], rate) else { continue };
                     for ev in sched.drain_due(pos_adj) {
                         midi_out.send(port, ev.message.as_bytes());
                     }
