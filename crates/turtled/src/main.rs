@@ -43,7 +43,7 @@ mod stems;
 
 use std::process::ExitCode;
 
-use backend::{AudioBackend, NullAudio, NullMidi};
+use backend::{AudioBackend, NullAudio};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -162,7 +162,7 @@ fn run_show(show_path: &str) -> ExitCode {
         sample_rate: show.show.playback_rate,
         buffer_frames: show.audio.buffer_frames as usize,
     };
-    let mut eng = engine::Engine::new(&show, NullMidi);
+    let mut eng = engine::Engine::new(&show);
     let (_rt_tx, _rt_rx) = engine::rt_channel(256);
 
     println!(
