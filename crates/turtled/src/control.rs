@@ -93,7 +93,7 @@ fn data_bytes_for(status: u8) -> usize {
 /// Open the audio device + MIDI input, arm the song, and let the controller
 /// drive the transport until Ctrl-C. Linux only (ALSA).
 #[cfg(target_os = "linux")]
-pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
+pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -179,15 +179,18 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
                 for &byte in &buf[..n] {
                     let Some((status, d1, d2)) = parser.push(byte) else { continue };
                     for cmd in eng.handle_midi(status, d1, d2) {
-                        let wall = epoch.elapsed().as_secs_f64();
                         match cmd {
                             RtCommand::Start => {
                                 playing = true;
-                                println!("[start] wall={wall:.3}s");
+                                if verbose {
+                                    println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
+                                }
                             }
                             RtCommand::Stop => {
                                 playing = false;
-                                println!("[stop] wall={wall:.3}s");
+                                if verbose {
+                                    println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
+                                }
                             }
                             // Rewind: realign the output cursors with the audio.
                             RtCommand::Seek(pos) => {
@@ -210,10 +213,12 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
                     for ev in sched.drain_due(pos_adj) {
                         let bytes = ev.message.as_bytes();
                         midi_out.send(port, bytes);
-                        println!(
-                            "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
-                            pos_adj as f64 / rate as f64
-                        );
+                        if verbose {
+                            println!(
+                                "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
+                                pos_adj as f64 / rate as f64
+                            );
+                        }
                     }
                 }
             }

@@ -100,7 +100,7 @@ pub fn dispatch_pos(pos: u64, offset_ms: f64, rate: u32) -> Option<u64> {
 /// Open the device, spawn the audio RT thread, play the song, and stop. Linux
 /// only (drives `AlsaAudio`).
 #[cfg(target_os = "linux")]
-pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
+pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -182,10 +182,13 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
                     midi.send(port, bytes);
                     // `wall` is the actual elapsed time since playback armed — used
                     // to diagnose startup timing (compare against the beat grid).
-                    println!(
-                        "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
-                        pos_adj as f64 / rate as f64
-                    );
+                    // Gated: one line per event floods stdout in a dense show.
+                    if verbose {
+                        println!(
+                            "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
+                            pos_adj as f64 / rate as f64
+                        );
+                    }
                 }
             }
             // ~1 ms tick: fine MIDI granularity, decoupled from the audio buffer.
