@@ -91,6 +91,10 @@ pub struct Transport {
     armed_next: Option<usize>,
     /// Whether the `armed_next` preload has completed.
     armed_next_ready: bool,
+    /// Whether a double-Stop panic has already fired in the current stop (so
+    /// further Stops are no-ops rather than re-spamming the panic burst — §5 DIN
+    /// budget). Cleared on the next Play or fresh Stop.
+    panicked: bool,
 }
 
 impl Transport {
@@ -102,6 +106,7 @@ impl Transport {
             current: None,
             armed_next: None,
             armed_next_ready: false,
+            panicked: false,
         }
     }
 
@@ -199,6 +204,8 @@ impl Transport {
     }
 
     fn start(&mut self) -> Vec<Action> {
+        // Playing again makes the double-Stop panic available for the next stop.
+        self.panicked = false;
         match self.state {
             // Fresh arm, or resume from a stop (position already 0 if rewound,
             // else continue in place). Either way, just run.
@@ -222,16 +229,24 @@ impl Transport {
         match self.state {
             State::Playing => {
                 self.state = State::Stopped;
+                // Fresh stop: the next Stop is a panic (not yet fired).
+                self.panicked = false;
                 let mut actions = vec![Action::ReleaseNotes, Action::StopPlayback];
                 if self.cfg.rewind_on_stop {
                     actions.push(Action::SeekToZero);
                 }
                 actions
             }
-            // Second Stop (double-tap) sends a full panic (§8).
+            // Second Stop (double-tap) sends a full panic — but only once (§8);
+            // further Stops are no-ops until the next Play, to spare the DIN bus.
             State::Stopped | State::Ended => {
                 self.state = State::Stopped;
-                vec![Action::Panic]
+                if self.panicked {
+                    vec![]
+                } else {
+                    self.panicked = true;
+                    vec![Action::Panic]
+                }
             }
             // Nothing playing.
             State::Idle | State::Loading | State::Armed => vec![],
@@ -305,15 +320,24 @@ mod tests {
     }
 
     #[test]
-    fn second_stop_panics() {
+    fn second_stop_panics_but_only_once() {
         let mut t = transport(false, true);
         t.apply(Command::Select(0));
         t.apply(Command::Loaded);
         t.apply(Command::Start);
-        t.apply(Command::Stop);
+        t.apply(Command::Stop); // first: clean release
 
+        // Second Stop panics.
         assert_eq!(t.apply(Command::Stop), vec![Action::Panic]);
         assert_eq!(t.state(), State::Stopped);
+        // Third+ Stop is a no-op — no re-spamming the panic burst.
+        assert_eq!(t.apply(Command::Stop), vec![]);
+        assert_eq!(t.apply(Command::Stop), vec![]);
+
+        // Play, then the double-Stop panic is available again.
+        assert_eq!(t.apply(Command::Start), vec![Action::StartPlayback]);
+        t.apply(Command::Stop); // clean release
+        assert_eq!(t.apply(Command::Stop), vec![Action::Panic]);
     }
 
     #[test]
