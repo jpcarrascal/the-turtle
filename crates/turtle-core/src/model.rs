@@ -47,6 +47,12 @@ pub struct Audio {
     /// Large buffers are xrun-proof; latency is irrelevant (no monitoring path).
     #[serde(default = "default_buffer_frames")]
     pub buffer_frames: u32,
+    /// Global audio-output latency (§9): how far the audio path lags the transport
+    /// clock (buffer + DAC). Added to every destination's MIDI dispatch so cues
+    /// line up with the *audible* audio; per-destination `offset_ms` trims from
+    /// here. Tunable live.
+    #[serde(default)]
+    pub output_latency_ms: f64,
 }
 
 /// A logical MIDI destination -> physical port + latency offset (§5).

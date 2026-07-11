@@ -82,6 +82,15 @@ pub fn load_schedulers(show: &Show, song_dir: &Path, rate: u32) -> Vec<PortSched
         .collect()
 }
 
+/// Shift the transport position by a destination's latency offset for dispatch
+/// (spec §5). A **negative** `offset_ms` makes events fire *earlier* (to lead a
+/// destination with downstream latency); a positive one *later*. Clamped at 0 so
+/// dispatch never reads before the song start.
+fn adjusted_pos(pos: u64, offset_ms: f64, rate: u32) -> u64 {
+    let offset_samples = (offset_ms / 1000.0 * rate as f64).round() as i64;
+    (pos as i64 - offset_samples).max(0) as u64
+}
+
 /// Open the device, spawn the audio RT thread, play the song, and stop. Linux
 /// only (drives `AlsaAudio`).
 #[cfg(target_os = "linux")]
@@ -109,6 +118,13 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
     }
     // One scheduler per destination, compiled from the song's per-destination SMF.
     let mut schedulers = load_schedulers(&show, &song_dir, rate);
+    // Total dispatch offset per destination (§9): the global audio-output latency
+    // plus this destination's own trim, indexed like the schedulers.
+    let dest_offsets: Vec<f64> = show
+        .destinations
+        .iter()
+        .map(|d| show.audio.output_latency_ms + d.offset_ms)
+        .collect();
 
     let clock = TransportClock::new(rate);
     // Small SPSC command queue to the audio thread (§3). Producer stays here.
@@ -149,12 +165,20 @@ pub fn run(bundle: &Path, song: Option<&str>) -> Result<(), String> {
         let _ = tx.push(RtCommand::Start);
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs_f64(secs) {
+            let wall_s = epoch.elapsed().as_secs_f64();
             let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
             for (port, sched) in schedulers.iter_mut().enumerate() {
-                for ev in sched.drain_due(pos) {
+                // Each destination dispatches against its own offset-adjusted pos.
+                let pos_adj = adjusted_pos(pos, dest_offsets[port], rate);
+                for ev in sched.drain_due(pos_adj) {
                     let bytes = ev.message.as_bytes();
                     midi.send(port, bytes);
-                    println!("  midi t={:.3}s port{port} {bytes:02X?}", pos as f64 / rate as f64);
+                    // `wall` is the actual elapsed time since playback armed — used
+                    // to diagnose startup timing (compare against the beat grid).
+                    println!(
+                        "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
+                        pos_adj as f64 / rate as f64
+                    );
                 }
             }
             // ~1 ms tick: fine MIDI granularity, decoupled from the audio buffer.
@@ -283,6 +307,16 @@ mod tests {
         // The single note-on at sample 0 is due immediately.
         assert_eq!(scheds[0].drain_due(0).len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offset_shifts_dispatch_position() {
+        // -8 ms @ 48k = 384 samples earlier; +8 ms = 384 later.
+        assert_eq!(adjusted_pos(10_000, -8.0, 48_000), 10_384);
+        assert_eq!(adjusted_pos(10_000, 8.0, 48_000), 9_616);
+        assert_eq!(adjusted_pos(5_000, 0.0, 48_000), 5_000);
+        // A positive offset larger than the position clamps to the song start.
+        assert_eq!(adjusted_pos(100, 100.0, 48_000), 0);
     }
 
     #[test]

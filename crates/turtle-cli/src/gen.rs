@@ -27,6 +27,14 @@ const SAMPLE_RATE: u32 = 48_000;
 const AMPLITUDE: f64 = 0.3;
 /// The song's nominal tempo; the test MIDI track pulses one note per beat.
 const BPM: f64 = 120.0;
+/// A short percussive "tick" superimposed on the tone at each beat, at the same
+/// nominal sample time as that beat's MIDI note — an audio landmark so MIDI/audio
+/// alignment can be judged by ear or by recording. Two octaves above the tone.
+const CLICK_HZ: f64 = 1760.0;
+const CLICK_AMP: f64 = 0.6;
+/// Click duration and exponential decay (in samples): a ~15 ms transient.
+const CLICK_LEN: u64 = 720;
+const CLICK_DECAY: f64 = 300.0;
 
 /// Generate the bundle at `out`. `seconds` sets the song length; `hz` the pitch.
 ///
@@ -43,9 +51,13 @@ pub fn gen_tone(out: &Path, seconds: f64, hz: f64) -> Result<(), Box<dyn Error>>
     std::fs::create_dir_all(&stems_dir)?;
     std::fs::create_dir_all(&midi_dir)?;
 
-    write_sine(&stems_dir.join("pair1.wav"), frames, hz)?;
+    // One beat = this many samples; the audio click and the MIDI note both land
+    // on these boundaries so their timing can be compared. `max(1)` avoids a
+    // divide-by-zero for absurd tempos.
+    let beat_samples = ((SAMPLE_RATE as f64 * 60.0 / BPM) as u64).max(1);
+    write_tone(&stems_dir.join("pair1.wav"), frames, hz, beat_samples)?;
     // One MIDI note per beat, for the `lights` destination in show.toml. This is
-    // what the §5 scheduler dispatches in sync with the audio.
+    // what the §5 scheduler dispatches — coincident with the audio clicks.
     let beats = (seconds * BPM / 60.0) as u32;
     write_test_smf(&midi_dir.join("lights.mid"), beats)?;
 
@@ -99,8 +111,9 @@ fn write_test_smf(path: &Path, beats: u32) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Write a stereo int24 WAV of a sine wave.
-fn write_sine(path: &Path, frames: u64, hz: f64) -> Result<(), hound::Error> {
+/// Write a stereo int24 WAV: a steady `hz` sine with a short click at the start
+/// of every `beat_samples`-long beat (the audio landmark for MIDI alignment).
+fn write_tone(path: &Path, frames: u64, hz: f64, beat_samples: u64) -> Result<(), hound::Error> {
     let spec = hound::WavSpec {
         channels: 2,
         sample_rate: SAMPLE_RATE,
@@ -114,7 +127,19 @@ fn write_sine(path: &Path, frames: u64, hz: f64) -> Result<(), hound::Error> {
         // Compute the phase in f64 to avoid the drift a running f32 accumulator
         // would pick up over hundreds of thousands of samples.
         let t = i as f64 / SAMPLE_RATE as f64;
-        let sample = (AMPLITUDE * (TAU * hz * t).sin() * full_scale) as i32;
+        let mut v = AMPLITUDE * (TAU * hz * t).sin();
+
+        // Superimpose a decaying tick at the beat onset. `cos` starts at its peak
+        // so the transient is sharp exactly at the beat boundary (i % beat == 0),
+        // where the MIDI note-on is timed too.
+        let beat_pos = i % beat_samples;
+        if beat_pos < CLICK_LEN {
+            let env = (-(beat_pos as f64) / CLICK_DECAY).exp();
+            v += CLICK_AMP * env * (TAU * CLICK_HZ * t).cos();
+        }
+
+        // Sum can exceed full scale at the onset; clamp before quantising.
+        let sample = (v.clamp(-1.0, 1.0) * full_scale) as i32;
         // Same signal to both channels (centre-panned mono).
         w.write_sample(sample)?; // L
         w.write_sample(sample)?; // R
@@ -139,6 +164,10 @@ playback_rate = 48000
 [audio]
 device = "hw:L6"
 buffer_frames = 1024
+# Global MIDI-vs-audio latency compensation in ms (§9): delays all MIDI so cues
+# line up with the audible audio (buffer + DAC lag). 29 ms was measured on the dev
+# rig (1024-frame buffer + hw:L6); re-measure if the buffer/device changes.
+output_latency_ms = 29.0
 
 [[destinations]]
 name = "lights"
@@ -224,6 +253,26 @@ mod tests {
         assert_eq!(tl.events[0].sample_time, 0); // first note-on at the top
         assert_eq!(tl.events[1].sample_time, 12_000); // note-off 0.25 s later
         assert_eq!(tl.events[2].sample_time, 24_000); // next beat at 0.5 s
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn beat_onset_is_louder_than_mid_beat() {
+        // 1 s @ 120 BPM = beats at 0 and 24000 samples. The click window at a beat
+        // onset should peak higher than a quiet window mid-beat.
+        let out = temp_dir("click");
+        gen_tone(&out, 1.0, 440.0).unwrap();
+        let mut reader = hound::WavReader::open(out.join("songs/tone/stems/pair1.wav")).unwrap();
+        // Left channel only (every other interleaved sample).
+        let left: Vec<i32> = reader.samples::<i32>().map(|s| s.unwrap()).step_by(2).collect();
+
+        let peak = |range: std::ops::Range<usize>| range.map(|i| left[i].abs()).max().unwrap();
+        let onset_peak = peak(0..500); // includes the beat-0 click
+        let mid_peak = peak(12_000..12_500); // mid-beat, tone only
+        assert!(
+            onset_peak > mid_peak * 2,
+            "beat onset ({onset_peak}) should clearly exceed mid-beat ({mid_peak})"
+        );
         std::fs::remove_dir_all(&out).ok();
     }
 
