@@ -179,9 +179,16 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
                 for &byte in &buf[..n] {
                     let Some((status, d1, d2)) = parser.push(byte) else { continue };
                     for cmd in eng.handle_midi(status, d1, d2) {
+                        let wall = epoch.elapsed().as_secs_f64();
                         match cmd {
-                            RtCommand::Start => playing = true,
-                            RtCommand::Stop => playing = false,
+                            RtCommand::Start => {
+                                playing = true;
+                                println!("[start] wall={wall:.3}s");
+                            }
+                            RtCommand::Stop => {
+                                playing = false;
+                                println!("[stop] wall={wall:.3}s");
+                            }
                             // Rewind: realign the output cursors with the audio.
                             RtCommand::Seek(pos) => {
                                 for sched in schedulers.iter_mut() {
@@ -195,12 +202,18 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>) -> Result<(), String> {
             }
 
             if playing {
+                let wall_s = epoch.elapsed().as_secs_f64();
                 let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
                 for (port, sched) in schedulers.iter_mut().enumerate() {
                     // `None` = within the offset of the start; nothing due yet.
                     let Some(pos_adj) = dispatch_pos(pos, dest_offsets[port], rate) else { continue };
                     for ev in sched.drain_due(pos_adj) {
-                        midi_out.send(port, ev.message.as_bytes());
+                        let bytes = ev.message.as_bytes();
+                        midi_out.send(port, bytes);
+                        println!(
+                            "  midi transport={:.3}s wall={wall_s:.3}s port{port} {bytes:02X?}",
+                            pos_adj as f64 / rate as f64
+                        );
                     }
                 }
             }
