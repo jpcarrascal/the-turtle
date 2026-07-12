@@ -7,8 +7,11 @@
 //! transport state, so they decode separately rather than through a
 //! `Command`.
 //!
-//! `[control] transport_channel`/`dsp_channel` optionally gate note and CC
-//! decoding to one MIDI channel each — useful when transport and DSP CC come
+//! `[control] transport_channel`/`dsp_channel` optionally gate decoding to
+//! one MIDI channel each, split by role rather than by message type:
+//! `transport_channel` covers only start/stop/next/prev/panic; `dsp_channel`
+//! covers mute *and* the `dsp_*` CCs, since both are live mixing controls
+//! rather than transport commands. Useful when transport and mixing come
 //! from different physical controllers merged onto one MIDI cable/port, so a
 //! stray message from one can't land on a binding meant for the other.
 //! `None` (the default) matches any channel, same as before these existed.
@@ -81,12 +84,15 @@ fn note_matches(binding: &Binding, note: u8) -> bool {
 /// Decode a note-on against the `mute` binding, returning the pair index
 /// (the note's position in `mute.notes`) if it matches. A tap toggles that
 /// pair's mute directly on the mixer — this bypasses the transport state
-/// machine entirely, so it is decoded separately from [`decode`].
+/// machine entirely, so it is decoded separately from [`decode`]. Gated by
+/// `dsp_channel`, not `transport_channel`: mute is a live mixing control
+/// (like the DSP CCs), not a transport command — `transport_channel` is
+/// reserved for start/stop/next/prev/panic only.
 pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usize> {
     if status & 0xF0 != 0x90 || d2 == 0 {
         return None;
     }
-    if !channel_matches(control.transport_channel, midi_channel(status)) {
+    if !channel_matches(control.dsp_channel, midi_channel(status)) {
         return None;
     }
     if control.mute.kind != BindingKind::Note {
@@ -293,18 +299,19 @@ dsp_pair0_cutoff = { type = "cc", cc = 20 }
     }
 
     #[test]
-    fn transport_channel_gates_notes_and_mute() {
+    fn transport_channel_gates_transport_notes_only() {
         let c = channel_gated_control();
         // 0x91 = note-on channel 2 (the configured transport_channel).
         assert_eq!(decode(&c, 0x91, 60, 100), Some(Command::Start));
-        assert_eq!(decode_mute(&c, 0x91, 72, 100), Some(0));
         // 0x90 = note-on channel 1: same note, wrong channel, ignored.
         assert_eq!(decode(&c, 0x90, 60, 100), None);
-        assert_eq!(decode_mute(&c, 0x90, 72, 100), None);
+        // Mute is NOT gated by transport_channel — it's a mixing control, not
+        // a transport command, so it doesn't fire on the transport channel...
+        assert_eq!(decode_mute(&c, 0x91, 72, 100), None);
     }
 
     #[test]
-    fn dsp_channel_gates_cc_but_select_channel_is_independent() {
+    fn dsp_channel_gates_mute_and_cc_but_select_channel_is_independent() {
         let c = channel_gated_control();
         // 0xB2 = CC channel 3 (the configured dsp_channel).
         assert_eq!(
@@ -313,6 +320,11 @@ dsp_pair0_cutoff = { type = "cc", cc = 20 }
         );
         // 0xB0 = CC channel 1: same CC number, wrong channel, ignored.
         assert!(decode_dsp(&c, 0xB0, 20, 64).is_empty());
+        // Mute shares dsp_channel (channel 3), not transport_channel: it's a
+        // live mixing control alongside the DSP CCs. 0x92 = channel 3.
+        assert_eq!(decode_mute(&c, 0x92, 72, 100), Some(0));
+        // 0x91 = channel 2 (transport_channel, not dsp_channel): wrong.
+        assert_eq!(decode_mute(&c, 0x91, 72, 100), None);
         // select_channel (song select, PC) is unaffected by either gate: PC
         // still only checks its own channel, 1 here.
         assert_eq!(decode(&c, 0xC0, 2, 0), Some(Command::Select(2)));

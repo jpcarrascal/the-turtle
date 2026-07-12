@@ -74,15 +74,16 @@ pub struct Control {
     pub input_port: String,
     /// MIDI channel (1..=16) on which Program Change selects a song.
     pub select_channel: u8,
-    /// Optional MIDI channel gate (1..=16) for the note bindings below
-    /// (start/stop/next/prev/panic/mute). `None` = any channel (default,
-    /// matches pre-existing behavior). Set this — together with
-    /// `dsp_channel` — when transport and DSP CC come from different
-    /// physical controllers merged onto one MIDI cable/port, so a stray
-    /// message from one can't be misread as the other's.
+    /// Optional MIDI channel gate (1..=16) for the transport note bindings
+    /// below (start/stop/next/prev/panic only — not `mute`). `None` = any
+    /// channel (default, matches pre-existing behavior). Set this —
+    /// together with `dsp_channel` — when transport and mixing come from
+    /// different physical controllers merged onto one MIDI cable/port, so a
+    /// stray message from one can't be misread as the other's.
     #[serde(default)]
     pub transport_channel: Option<u8>,
-    /// Optional MIDI channel gate (1..=16) for every `dsp_*` CC binding.
+    /// Optional MIDI channel gate (1..=16) for `mute` and every `dsp_*` CC
+    /// binding — both are live mixing controls, not transport commands.
     /// `None` = any channel (default).
     #[serde(default)]
     pub dsp_channel: Option<u8>,
