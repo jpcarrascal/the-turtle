@@ -77,20 +77,27 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
 }
 
 /// Decode an incoming CC against every `[control]` `dsp_*` binding, returning
-/// the `(pair, param, raw 0..=127 value)` it drives if one matches. Live DSP
-/// is CC-only (§6) and, like mute, bypasses the transport state machine
-/// entirely — a knob move is valid in any state.
-pub fn decode_dsp(control: &Control, status: u8, d1: u8, d2: u8) -> Option<(usize, DspParam, u8)> {
+/// every `(pair, param, raw 0..=127 value)` it drives. More than one binding
+/// can share a CC number — e.g. mapping the same pedal to `dsp_pair0_delay_time`
+/// through `dsp_pair3_delay_time` fans one move out to all four pairs — so
+/// this returns *all* matches, not just the first. Live DSP is CC-only (§6)
+/// and, like mute, bypasses the transport state machine entirely — a knob
+/// move is valid in any state.
+pub fn decode_dsp(control: &Control, status: u8, d1: u8, d2: u8) -> Vec<(usize, DspParam, u8)> {
     if status & 0xF0 != 0xB0 {
-        return None;
+        return Vec::new();
     }
-    control.dsp.iter().find_map(|(key, binding)| {
-        if binding.kind == BindingKind::Cc && binding.cc == Some(d1) {
-            parse_dsp_key(key).map(|(pair, param)| (pair, param, d2))
-        } else {
-            None
-        }
-    })
+    control
+        .dsp
+        .iter()
+        .filter_map(|(key, binding)| {
+            if binding.kind == BindingKind::Cc && binding.cc == Some(d1) {
+                parse_dsp_key(key).map(|(pair, param)| (pair, param, d2))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Parse a `dsp_*` control-map key into the pair index and parameter it
@@ -143,6 +150,9 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
 dsp_pair0_cutoff = { type = "cc", cc = 20 }
 dsp_pair0_delay_mix = { type = "cc", cc = 21 }
 dsp_pair1_resonance = { type = "cc", cc = 22 }
+dsp_pair0_delay_time = { type = "cc", cc = 30 }
+dsp_pair1_delay_time = { type = "cc", cc = 30 }
+dsp_pair2_delay_time = { type = "cc", cc = 30 }
 "#;
 
     fn control() -> Control {
@@ -198,23 +208,38 @@ dsp_pair1_resonance = { type = "cc", cc = 22 }
         let c = control();
         assert_eq!(
             decode_dsp(&c, 0xB0, 20, 64),
-            Some((0, DspParam::Cutoff, 64))
+            vec![(0, DspParam::Cutoff, 64)]
         );
         assert_eq!(
             decode_dsp(&c, 0xB0, 21, 100),
-            Some((0, DspParam::DelayMix, 100))
+            vec![(0, DspParam::DelayMix, 100)]
         );
         assert_eq!(
             decode_dsp(&c, 0xB0, 22, 10),
-            Some((1, DspParam::Resonance, 10))
+            vec![(1, DspParam::Resonance, 10)]
+        );
+    }
+
+    #[test]
+    fn fans_one_cc_out_to_every_binding_that_shares_it() {
+        // CC 30 drives dsp_pair{0,1,2}_delay_time — one pedal move should
+        // update all three pairs, not just the lexicographically-first key.
+        let c = control();
+        assert_eq!(
+            decode_dsp(&c, 0xB0, 30, 50),
+            vec![
+                (0, DspParam::DelayTime, 50),
+                (1, DspParam::DelayTime, 50),
+                (2, DspParam::DelayTime, 50),
+            ]
         );
     }
 
     #[test]
     fn ignores_unmapped_cc_and_non_cc_status() {
         let c = control();
-        assert_eq!(decode_dsp(&c, 0xB0, 99, 64), None); // unmapped CC number
-        assert_eq!(decode_dsp(&c, 0x90, 20, 64), None); // note-on, not a CC status
+        assert!(decode_dsp(&c, 0xB0, 99, 64).is_empty()); // unmapped CC number
+        assert!(decode_dsp(&c, 0x90, 20, 64).is_empty()); // note-on, not a CC status
         assert_eq!(decode(&c, 0xB0, 20, 64), None); // dsp CCs aren't transport Commands
     }
 
