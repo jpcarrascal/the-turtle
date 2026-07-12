@@ -7,7 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
+use turtle_core::model::FilterKind;
 use turtle_core::{Show, Song, Timeline};
+use turtle_dsp::FilterType;
 
 use crate::mixer::Mixer;
 use crate::scheduler::PortScheduler;
@@ -55,9 +57,36 @@ pub fn load_playable(bundle: &Path, song: Option<&str>) -> Result<Playable, Stri
     let preloaded =
         stems::load_song(&song, &song_dir, rate).map_err(|e| format!("stems: {e}"))?;
     let frames = preloaded.frames as u64;
-    let mixer = Mixer::new(preloaded, rate);
+    let mut mixer = Mixer::new(preloaded, rate);
+
+    // Apply each pair's fixed filter topology from song.toml's `[dsp.pairN]`
+    // (§6); live CC then drives cutoff/resonance within that topology. Keys
+    // that don't match `pair{N}` (or name a filter-less/absent entry) are
+    // left at the mixer's default (transparent lowpass).
+    for (key, pair_dsp) in &song.dsp {
+        let Some(idx) = key
+            .strip_prefix("pair")
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if let Some(filter) = pair_dsp.filter {
+            mixer.set_filter_type(idx, to_dsp_filter(filter));
+        }
+    }
 
     Ok(Playable { show, mixer, frames, song_dir })
+}
+
+/// `turtle_core::model::FilterKind` (song.toml's `filter = "lp"`) ->
+/// `turtle_dsp::FilterType` (the mixer's live-DSP currency). Two enums,
+/// kept distinct so `turtle-dsp` stays free of the show/song data model.
+fn to_dsp_filter(kind: FilterKind) -> FilterType {
+    match kind {
+        FilterKind::Lp => FilterType::Lowpass,
+        FilterKind::Hp => FilterType::Highpass,
+        FilterKind::Bp => FilterType::Bandpass,
+    }
 }
 
 /// Build one [`PortScheduler`] per destination from its SMF (spec §5).
@@ -278,6 +307,38 @@ mod tests {
             Ok(_) => panic!("expected an error for a missing song"),
         };
         assert!(err.contains("nope"), "error should name the song: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn song_toml_filter_topology_reaches_the_mixer() {
+        use crate::control_map::DspParam;
+
+        let frames = 10_000;
+        let dir = write_bundle(frames);
+        // Override the song with a `[dsp.pair0] filter = "hp"` topology.
+        std::fs::write(
+            dir.join("songs/opener/song.toml"),
+            format!(
+                "[song]\nname = \"O\"\nbpm = 120.0\nlength_samples = {frames}\n\
+                 [[pairs]]\nindex = 0\nfile = \"stems/pair1.wav\"\n\
+                 [dsp.pair0]\nfilter = \"hp\"\n"
+            ),
+        )
+        .unwrap();
+
+        let mut p = load_playable(&dir, None).unwrap();
+        // Grab the cutoff knob; if song.toml's "hp" topology reached the
+        // mixer (rather than the default lowpass), the sustained stem should
+        // decay toward silence once the biquad settles.
+        p.mixer.set_dsp_param(0, DspParam::Cutoff, 64);
+        let mut out = vec![0i32; frames as usize * 2];
+        p.mixer.render(&mut out);
+        let last = out[out.len() - 2] as f32 / i32::MAX as f32;
+        assert!(
+            last.abs() < 1e-2,
+            "expected the hp topology to block DC, got {last}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

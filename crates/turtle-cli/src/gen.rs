@@ -154,9 +154,12 @@ fn write_tone(path: &Path, frames: u64, hz: f64, beat_samples: u64) -> Result<()
 /// The `[audio] device`, `[control] input_port`, and the `lights` destination
 /// `port` here are the **dev rig's** ALSA names (`hw:L6` USB audio, `hw:4,0,0`
 /// MIDI controller in, `hw:5,0,0` CME MIDI out) plus the controller's actual
-/// `start`/`stop` note numbers, so `gen-tone` output plays, responds to control,
-/// and emits MIDI on that Pi without editing. Change these for a different setup
-/// — `aplay -l` lists audio cards, `amidi -l` lists MIDI ports.
+/// `start`/`stop`/mute note numbers, so `gen-tone` output plays, responds to
+/// control, and emits MIDI on that Pi without editing. Change these for a
+/// different setup — `aplay -l` lists audio cards, `amidi -l` lists MIDI
+/// ports. The `dsp_pair0_*` CCs (20-25) are placeholder pedal/expression CC
+/// numbers for exercising live DSP control (§6) on pair 0, the bundle's only
+/// pair — remap to whatever CCs the dev rig's controller actually sends.
 const SHOW_TOML: &str = r#"[show]
 name = "Tone Test"
 playback_rate = 48000
@@ -182,6 +185,12 @@ next  = { type = "note", note = 62 }
 prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [12, 11, 13, 75] }
+dsp_pair0_gain = { type = "cc", cc = 20 }
+dsp_pair0_cutoff = { type = "cc", cc = 21 }
+dsp_pair0_resonance = { type = "cc", cc = 22 }
+dsp_pair0_delay_time = { type = "cc", cc = 23 }
+dsp_pair0_delay_feedback = { type = "cc", cc = 24 }
+dsp_pair0_delay_mix = { type = "cc", cc = 25 }
 
 [[setlist]]
 pc = 0

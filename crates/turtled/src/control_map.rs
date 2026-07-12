@@ -3,12 +3,24 @@
 //! Uses the show's `[control]` map (§7.1). Program Change (song select) and
 //! the note bindings for start/stop/next/prev/panic decode to a [`Command`]
 //! and go through the transport state machine ([`decode`]). Per-pair mute
-//! ([`decode_mute`]) is independent of transport state, so it decodes
-//! separately to a pair index rather than a `Command`. DSP CC is handled
-//! elsewhere.
+//! ([`decode_mute`]) and live DSP CC ([`decode_dsp`]) are independent of
+//! transport state, so they decode separately rather than through a
+//! `Command`.
 
 use turtle_core::model::{Binding, BindingKind, Control};
 use turtle_core::Command;
+
+/// A live-CC-driven DSP parameter (§6), scoped to one pair by a
+/// `dsp_pair{N}_{param}` control-map key (e.g. `dsp_pair0_cutoff`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DspParam {
+    Gain,
+    Cutoff,
+    Resonance,
+    DelayTime,
+    DelayFeedback,
+    DelayMix,
+}
 
 /// Decode a 3-byte-ish channel message into a transport command, if it maps.
 pub fn decode(control: &Control, status: u8, d1: u8, d2: u8) -> Option<Command> {
@@ -64,6 +76,47 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
     control.mute.notes.as_ref()?.iter().position(|&n| n == d1)
 }
 
+/// Decode an incoming CC against every `[control]` `dsp_*` binding, returning
+/// the `(pair, param, raw 0..=127 value)` it drives if one matches. Live DSP
+/// is CC-only (§6) and, like mute, bypasses the transport state machine
+/// entirely — a knob move is valid in any state.
+pub fn decode_dsp(control: &Control, status: u8, d1: u8, d2: u8) -> Option<(usize, DspParam, u8)> {
+    if status & 0xF0 != 0xB0 {
+        return None;
+    }
+    control.dsp.iter().find_map(|(key, binding)| {
+        if binding.kind == BindingKind::Cc && binding.cc == Some(d1) {
+            parse_dsp_key(key).map(|(pair, param)| (pair, param, d2))
+        } else {
+            None
+        }
+    })
+}
+
+/// Parse a `dsp_*` control-map key into the pair index and parameter it
+/// drives. Convention: `dsp_pair{0..=3}_{param}`, e.g. `dsp_pair0_cutoff`.
+/// Anything else (typos, out-of-range pair, unknown param) doesn't match and
+/// is silently ignored by [`decode_dsp`] — consistent with how [`decode`]
+/// already ignores unmapped notes/CCs rather than erroring at runtime.
+fn parse_dsp_key(key: &str) -> Option<(usize, DspParam)> {
+    let rest = key.strip_prefix("dsp_pair")?;
+    let (pair_str, param_str) = rest.split_once('_')?;
+    let pair: usize = pair_str.parse().ok()?;
+    if pair > 3 {
+        return None;
+    }
+    let param = match param_str {
+        "gain" => DspParam::Gain,
+        "cutoff" => DspParam::Cutoff,
+        "resonance" => DspParam::Resonance,
+        "delay_time" => DspParam::DelayTime,
+        "delay_feedback" => DspParam::DelayFeedback,
+        "delay_mix" => DspParam::DelayMix,
+        _ => return None,
+    };
+    Some((pair, param))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +140,9 @@ next  = { type = "note", note = 62 }
 prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [72, 73, 74, 75] }
+dsp_pair0_cutoff = { type = "cc", cc = 20 }
+dsp_pair0_delay_mix = { type = "cc", cc = 21 }
+dsp_pair1_resonance = { type = "cc", cc = 22 }
 "#;
 
     fn control() -> Control {
@@ -135,5 +191,46 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert_eq!(decode_mute(&c, 0x90, 72, 0), None); // note-on vel 0
         assert_eq!(decode_mute(&c, 0x80, 72, 0), None); // note-off
         assert_eq!(decode(&c, 0x90, 72, 100), None); // mute notes aren't transport Commands
+    }
+
+    #[test]
+    fn decodes_dsp_cc_to_pair_and_param() {
+        let c = control();
+        assert_eq!(
+            decode_dsp(&c, 0xB0, 20, 64),
+            Some((0, DspParam::Cutoff, 64))
+        );
+        assert_eq!(
+            decode_dsp(&c, 0xB0, 21, 100),
+            Some((0, DspParam::DelayMix, 100))
+        );
+        assert_eq!(
+            decode_dsp(&c, 0xB0, 22, 10),
+            Some((1, DspParam::Resonance, 10))
+        );
+    }
+
+    #[test]
+    fn ignores_unmapped_cc_and_non_cc_status() {
+        let c = control();
+        assert_eq!(decode_dsp(&c, 0xB0, 99, 64), None); // unmapped CC number
+        assert_eq!(decode_dsp(&c, 0x90, 20, 64), None); // note-on, not a CC status
+        assert_eq!(decode(&c, 0xB0, 20, 64), None); // dsp CCs aren't transport Commands
+    }
+
+    #[test]
+    fn parses_dsp_key_convention() {
+        assert_eq!(parse_dsp_key("dsp_pair0_gain"), Some((0, DspParam::Gain)));
+        assert_eq!(
+            parse_dsp_key("dsp_pair3_delay_time"),
+            Some((3, DspParam::DelayTime))
+        );
+        assert_eq!(
+            parse_dsp_key("dsp_pair2_delay_feedback"),
+            Some((2, DspParam::DelayFeedback))
+        );
+        assert_eq!(parse_dsp_key("dsp_pair4_gain"), None); // pair out of 0..=3 range
+        assert_eq!(parse_dsp_key("dsp_pair0_unknown"), None); // unknown param
+        assert_eq!(parse_dsp_key("dsp_cutoff"), None); // old global-style key, no pair
     }
 }

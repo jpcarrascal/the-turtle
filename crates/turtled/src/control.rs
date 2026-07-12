@@ -2,7 +2,7 @@
 //!
 //! Any MIDI controller on the show's `[control] input_port` works: Program
 //! Change selects a song, the mapped notes trigger start/stop/next/prev/panic
-//! (spec §8), and the mute notes toggle per-pair mute directly on the mixer
+//! (spec §8), and the mute notes / `dsp_*` CCs act directly on the mixer
 //! regardless of transport state. The decode + transport logic already lives
 //! in [`crate::control_map`] and [`crate::engine`] (both unit-tested); this
 //! module adds the two missing pieces:
@@ -205,6 +205,14 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                                 if verbose {
                                     println!(
                                         "[mute] pair {pair} wall={:.3}s",
+                                        epoch.elapsed().as_secs_f64()
+                                    );
+                                }
+                            }
+                            RtCommand::SetDsp(pair, param, value) => {
+                                if verbose {
+                                    println!(
+                                        "[dsp] pair {pair} {param:?}={value} wall={:.3}s",
                                         epoch.elapsed().as_secs_f64()
                                     );
                                 }

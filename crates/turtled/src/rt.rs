@@ -37,6 +37,7 @@ impl RtAudio {
             RtCommand::Stop => self.playing = false,
             RtCommand::Seek(pos) => mixer.seek(pos),
             RtCommand::ToggleMute(pair) => mixer.toggle_pair_mute(pair),
+            RtCommand::SetDsp(pair, param, value) => mixer.set_dsp_param(pair, param, value),
         }
     }
 
@@ -178,6 +179,27 @@ mod tests {
         // below the unmuted 0.5-gain full-scale value).
         let unmuted_half = (i32::MAX as f32 * 0.5) as i32;
         assert!(out[0] < unmuted_half, "expected {} < {}", out[0], unmuted_half);
+    }
+
+    #[test]
+    fn set_dsp_forwards_to_the_mixer() {
+        let mut m = mixer();
+        let mut rt = RtAudio::new();
+        rt.apply(&mut m, RtCommand::Start);
+        rt.apply(
+            &mut m,
+            RtCommand::SetDsp(0, crate::control_map::DspParam::Gain, 0),
+        );
+        let mut out = [0i32; 2];
+        rt.step(&mut m, &mut out);
+        // Gain starts ramping toward 0 immediately, same shape as mute.
+        let unmuted_half = (i32::MAX as f32 * 0.5) as i32;
+        assert!(
+            out[0] < unmuted_half,
+            "expected {} < {}",
+            out[0],
+            unmuted_half
+        );
     }
 
     #[test]
