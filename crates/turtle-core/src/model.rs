@@ -74,6 +74,18 @@ pub struct Control {
     pub input_port: String,
     /// MIDI channel (1..=16) on which Program Change selects a song.
     pub select_channel: u8,
+    /// Optional MIDI channel gate (1..=16) for the note bindings below
+    /// (start/stop/next/prev/panic/mute). `None` = any channel (default,
+    /// matches pre-existing behavior). Set this — together with
+    /// `dsp_channel` — when transport and DSP CC come from different
+    /// physical controllers merged onto one MIDI cable/port, so a stray
+    /// message from one can't be misread as the other's.
+    #[serde(default)]
+    pub transport_channel: Option<u8>,
+    /// Optional MIDI channel gate (1..=16) for every `dsp_*` CC binding.
+    /// `None` = any channel (default).
+    #[serde(default)]
+    pub dsp_channel: Option<u8>,
     pub start: Binding,
     pub stop: Binding,
     pub next: Binding,
@@ -191,6 +203,18 @@ impl Show {
                 "control.select_channel {} out of range 1..=16",
                 self.control.select_channel
             ));
+        }
+        if let Some(ch) = self.control.transport_channel {
+            if !(1..=16).contains(&ch) {
+                p.push(format!(
+                    "control.transport_channel {ch} out of range 1..=16"
+                ));
+            }
+        }
+        if let Some(ch) = self.control.dsp_channel {
+            if !(1..=16).contains(&ch) {
+                p.push(format!("control.dsp_channel {ch} out of range 1..=16"));
+            }
         }
         if self.playback_rate() == 0 {
             p.push("show.playback_rate must be > 0".into());
@@ -435,6 +459,47 @@ mute  = { type = "note", notes = [72] }
     fn rejects_bad_select_channel() {
         let show = Show::from_toml_str(&SHOW_TOML.replace("select_channel = 1", "select_channel = 0"))
             .expect("parse");
+        assert!(show.validate().is_err(), "channel 0 must be rejected");
+    }
+
+    #[test]
+    fn transport_and_dsp_channel_default_to_any() {
+        // Neither is present in SHOW_TOML, so both should default to `None`
+        // (any channel) rather than requiring every existing show to set them.
+        let show = Show::from_toml_str(SHOW_TOML).expect("parse");
+        assert_eq!(show.control.transport_channel, None);
+        assert_eq!(show.control.dsp_channel, None);
+    }
+
+    #[test]
+    fn parses_and_validates_transport_and_dsp_channel() {
+        let toml = SHOW_TOML.replacen(
+            "select_channel = 1",
+            "select_channel = 1\ntransport_channel = 3\ndsp_channel = 4",
+            1,
+        );
+        let show = Show::from_toml_str(&toml).expect("parse");
+        assert_eq!(show.control.transport_channel, Some(3));
+        assert_eq!(show.control.dsp_channel, Some(4));
+        show.validate().expect("valid");
+    }
+
+    #[test]
+    fn rejects_out_of_range_transport_and_dsp_channel() {
+        let toml = SHOW_TOML.replacen(
+            "select_channel = 1",
+            "select_channel = 1\ntransport_channel = 17",
+            1,
+        );
+        let show = Show::from_toml_str(&toml).expect("parse");
+        assert!(show.validate().is_err(), "channel 17 must be rejected");
+
+        let toml = SHOW_TOML.replacen(
+            "select_channel = 1",
+            "select_channel = 1\ndsp_channel = 0",
+            1,
+        );
+        let show = Show::from_toml_str(&toml).expect("parse");
         assert!(show.validate().is_err(), "channel 0 must be rejected");
     }
 

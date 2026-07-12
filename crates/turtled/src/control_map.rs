@@ -6,6 +6,12 @@
 //! ([`decode_mute`]) and live DSP CC ([`decode_dsp`]) are independent of
 //! transport state, so they decode separately rather than through a
 //! `Command`.
+//!
+//! `[control] transport_channel`/`dsp_channel` optionally gate note and CC
+//! decoding to one MIDI channel each — useful when transport and DSP CC come
+//! from different physical controllers merged onto one MIDI cable/port, so a
+//! stray message from one can't land on a binding meant for the other.
+//! `None` (the default) matches any channel, same as before these existed.
 
 use turtle_core::model::{Binding, BindingKind, Control};
 use turtle_core::Command;
@@ -22,9 +28,19 @@ pub enum DspParam {
     DelayMix,
 }
 
+/// Extract the 1-based MIDI channel from a status byte.
+fn midi_channel(status: u8) -> u8 {
+    (status & 0x0F) + 1
+}
+
+/// `gate` is an optional required channel (`None` = any channel matches).
+fn channel_matches(gate: Option<u8>, channel: u8) -> bool {
+    gate.is_none_or(|required| required == channel)
+}
+
 /// Decode a 3-byte-ish channel message into a transport command, if it maps.
 pub fn decode(control: &Control, status: u8, d1: u8, d2: u8) -> Option<Command> {
-    let channel = (status & 0x0F) + 1; // MIDI channels are 1-based in config
+    let channel = midi_channel(status);
     match status & 0xF0 {
         0xC0 => {
             // Program Change on the select channel picks a song.
@@ -34,7 +50,7 @@ pub fn decode(control: &Control, status: u8, d1: u8, d2: u8) -> Option<Command> 
                 None
             }
         }
-        0x90 if d2 > 0 => {
+        0x90 if d2 > 0 && channel_matches(control.transport_channel, channel) => {
             // Note-on: match against the transport note bindings, in priority
             // order.
             let n = d1;
@@ -70,6 +86,9 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
     if status & 0xF0 != 0x90 || d2 == 0 {
         return None;
     }
+    if !channel_matches(control.transport_channel, midi_channel(status)) {
+        return None;
+    }
     if control.mute.kind != BindingKind::Note {
         return None;
     }
@@ -85,6 +104,9 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
 /// move is valid in any state.
 pub fn decode_dsp(control: &Control, status: u8, d1: u8, d2: u8) -> Vec<(usize, DspParam, u8)> {
     if status & 0xF0 != 0xB0 {
+        return Vec::new();
+    }
+    if !channel_matches(control.dsp_channel, midi_channel(status)) {
         return Vec::new();
     }
     control
@@ -241,6 +263,59 @@ dsp_pair2_delay_time = { type = "cc", cc = 30 }
         assert!(decode_dsp(&c, 0xB0, 99, 64).is_empty()); // unmapped CC number
         assert!(decode_dsp(&c, 0x90, 20, 64).is_empty()); // note-on, not a CC status
         assert_eq!(decode(&c, 0xB0, 20, 64), None); // dsp CCs aren't transport Commands
+    }
+
+    const CHANNEL_GATED_SHOW: &str = r#"
+[show]
+name = "x"
+playback_rate = 48000
+[audio]
+device = "hw:0"
+[[destinations]]
+name = "lights"
+port = "CME:1"
+[control]
+input_port = "CME:in"
+select_channel = 1
+transport_channel = 2
+dsp_channel = 3
+start = { type = "note", note = 60 }
+stop  = { type = "note", note = 61 }
+next  = { type = "note", note = 62 }
+prev  = { type = "note", note = 63 }
+panic = { type = "note", note = 65 }
+mute  = { type = "note", notes = [72, 73, 74, 75] }
+dsp_pair0_cutoff = { type = "cc", cc = 20 }
+"#;
+
+    fn channel_gated_control() -> Control {
+        Show::from_toml_str(CHANNEL_GATED_SHOW).unwrap().control
+    }
+
+    #[test]
+    fn transport_channel_gates_notes_and_mute() {
+        let c = channel_gated_control();
+        // 0x91 = note-on channel 2 (the configured transport_channel).
+        assert_eq!(decode(&c, 0x91, 60, 100), Some(Command::Start));
+        assert_eq!(decode_mute(&c, 0x91, 72, 100), Some(0));
+        // 0x90 = note-on channel 1: same note, wrong channel, ignored.
+        assert_eq!(decode(&c, 0x90, 60, 100), None);
+        assert_eq!(decode_mute(&c, 0x90, 72, 100), None);
+    }
+
+    #[test]
+    fn dsp_channel_gates_cc_but_select_channel_is_independent() {
+        let c = channel_gated_control();
+        // 0xB2 = CC channel 3 (the configured dsp_channel).
+        assert_eq!(
+            decode_dsp(&c, 0xB2, 20, 64),
+            vec![(0, DspParam::Cutoff, 64)]
+        );
+        // 0xB0 = CC channel 1: same CC number, wrong channel, ignored.
+        assert!(decode_dsp(&c, 0xB0, 20, 64).is_empty());
+        // select_channel (song select, PC) is unaffected by either gate: PC
+        // still only checks its own channel, 1 here.
+        assert_eq!(decode(&c, 0xC0, 2, 0), Some(Command::Select(2)));
     }
 
     #[test]
