@@ -1,8 +1,11 @@
 //! Decode incoming foot-controller MIDI into transport [`Command`]s (spec §8).
 //!
-//! Uses the show's `[control]` map (§7.1). Only transport-affecting messages
-//! are decoded here: Program Change (song select) and the note bindings for
-//! start/stop/next/prev/panic. DSP CC and per-pair mute are handled elsewhere.
+//! Uses the show's `[control]` map (§7.1). Program Change (song select) and
+//! the note bindings for start/stop/next/prev/panic decode to a [`Command`]
+//! and go through the transport state machine ([`decode`]). Per-pair mute
+//! ([`decode_mute`]) is independent of transport state, so it decodes
+//! separately to a pair index rather than a `Command`. DSP CC is handled
+//! elsewhere.
 
 use turtle_core::model::{Binding, BindingKind, Control};
 use turtle_core::Command;
@@ -45,6 +48,20 @@ fn note_matches(binding: &Binding, note: u8) -> bool {
     binding.kind == BindingKind::Note
         && (binding.note == Some(note)
             || binding.notes.as_ref().is_some_and(|v| v.contains(&note)))
+}
+
+/// Decode a note-on against the `mute` binding, returning the pair index
+/// (the note's position in `mute.notes`) if it matches. A tap toggles that
+/// pair's mute directly on the mixer — this bypasses the transport state
+/// machine entirely, so it is decoded separately from [`decode`].
+pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usize> {
+    if status & 0xF0 != 0x90 || d2 == 0 {
+        return None;
+    }
+    if control.mute.kind != BindingKind::Note {
+        return None;
+    }
+    control.mute.notes.as_ref()?.iter().position(|&n| n == d1)
 }
 
 #[cfg(test)]
@@ -100,5 +117,23 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert_eq!(decode(&c, 0x90, 99, 100), None); // unmapped note
         assert_eq!(decode(&c, 0x90, 60, 0), None); // note-on vel 0 (a note-off)
         assert_eq!(decode(&c, 0x80, 60, 0), None); // note-off
+    }
+
+    #[test]
+    fn decodes_mute_notes_to_pair_index() {
+        let c = control();
+        assert_eq!(decode_mute(&c, 0x90, 72, 100), Some(0));
+        assert_eq!(decode_mute(&c, 0x90, 73, 100), Some(1));
+        assert_eq!(decode_mute(&c, 0x90, 74, 100), Some(2));
+        assert_eq!(decode_mute(&c, 0x90, 75, 100), Some(3));
+    }
+
+    #[test]
+    fn ignores_unmapped_mute_note_and_note_off() {
+        let c = control();
+        assert_eq!(decode_mute(&c, 0x90, 99, 100), None); // unmapped note
+        assert_eq!(decode_mute(&c, 0x90, 72, 0), None); // note-on vel 0
+        assert_eq!(decode_mute(&c, 0x80, 72, 0), None); // note-off
+        assert_eq!(decode(&c, 0x90, 72, 100), None); // mute notes aren't transport Commands
     }
 }

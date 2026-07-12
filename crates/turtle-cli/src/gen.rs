@@ -181,7 +181,7 @@ stop  = { type = "note", note = 15 }
 next  = { type = "note", note = 62 }
 prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
-mute  = { type = "note", notes = [72, 73, 74, 75] }
+mute  = { type = "note", notes = [12, 11, 13, 75] }
 
 [[setlist]]
 pc = 0

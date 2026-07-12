@@ -116,6 +116,16 @@ impl Mixer {
         self.pos
     }
 
+    /// Toggle mute on `pair` (§6/§8 per-pair mute), applied to both channels so
+    /// the stereo image stays balanced. Out-of-range indices (e.g. a mute note
+    /// for a pair the current song doesn't have) are a silent no-op.
+    pub fn toggle_pair_mute(&mut self, pair: usize) {
+        if let Some(p) = self.pairs.get_mut(pair) {
+            p.left.gain.toggle_mute();
+            p.right.gain.toggle_mute();
+        }
+    }
+
     /// True once the transport has run past the end of every stem (§8 ENDED).
     pub fn is_finished(&self) -> bool {
         self.pos >= self.song.frames as u64
@@ -253,6 +263,54 @@ mod tests {
         let ceiling = to_i32(0.98);
         assert!(out[0].abs() <= ceiling, "L overshoot: {}", out[0]);
         assert!(out[1].abs() <= ceiling, "R overshoot: {}", out[1]);
+    }
+
+    #[test]
+    fn toggle_pair_mute_ramps_that_pair_to_silence() {
+        // Two pairs, both constant 0.5, held over one second so the 5 ms
+        // smoother has long since converged (mirrors turtle_dsp::gain's own
+        // convergence test).
+        let frames = 48_000;
+        let s = song(vec![
+            pair(0, [0.5, 0.5].repeat(frames)),
+            pair(1, [0.5, 0.5].repeat(frames)),
+        ]);
+        let mut m = Mixer::new(s, 48_000);
+        m.toggle_pair_mute(0);
+        let mut out = vec![0i32; frames * 2];
+        m.render(&mut out);
+        let (last_l, last_r) = (out[out.len() - 2], out[out.len() - 1]);
+        // Only pair 1 sounds once pair 0's mute has converged: L = R ~= 0.5
+        // (pair 0's residual is exponentially small but not bit-exact zero,
+        // same tolerance as turtle_dsp::gain's own convergence test).
+        let tolerance = (to_i32(0.5) as f64 * 1e-3) as i32;
+        assert!((last_l - to_i32(0.5)).abs() <= tolerance, "L = {last_l}");
+        assert!((last_r - to_i32(0.5)).abs() <= tolerance, "R = {last_r}");
+    }
+
+    #[test]
+    fn toggle_pair_mute_twice_restores_the_pair() {
+        let s = song(vec![pair(0, vec![0.5, 0.5])]);
+        let mut m = Mixer::new(s, 48_000);
+        m.toggle_pair_mute(0);
+        m.toggle_pair_mute(0);
+        // Smoother starts already at unity, so this is instant, unlike the
+        // convergence test above.
+        let mut out = [0i32; 2];
+        m.render(&mut out);
+        assert_eq!(out[0], to_i32(0.5));
+        assert_eq!(out[1], to_i32(0.5));
+    }
+
+    #[test]
+    fn toggle_pair_mute_out_of_range_is_a_silent_no_op() {
+        let s = song(vec![pair(0, vec![0.5, 0.5])]);
+        let mut m = Mixer::new(s, 48_000);
+        m.toggle_pair_mute(3); // no pair 3 in this song
+        let mut out = [0i32; 2];
+        m.render(&mut out);
+        assert_eq!(out[0], to_i32(0.5));
+        assert_eq!(out[1], to_i32(0.5));
     }
 
     #[test]

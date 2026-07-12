@@ -23,6 +23,8 @@ pub enum RtCommand {
     Start,
     Stop,
     Seek(u64),
+    /// Toggle the mute on pair `index` (§6/§8), independent of transport state.
+    ToggleMute(usize),
 }
 
 pub type RtProducer = Producer<RtCommand>;
@@ -72,6 +74,10 @@ impl Engine {
     /// release / panic) is written to the borrowed `midi` sink, which the caller
     /// also uses for the scheduler — so a single `AlsaMidi` serves both without
     /// the engine owning it.
+    ///
+    /// Per-pair mute is checked first: it bypasses the transport state machine
+    /// entirely (a mute tap is valid in any state), so it never reaches
+    /// `control_map::decode` / `Command`.
     pub fn handle_midi(
         &mut self,
         status: u8,
@@ -79,6 +85,9 @@ impl Engine {
         d2: u8,
         midi: &mut impl MidiSink,
     ) -> Vec<RtCommand> {
+        if let Some(pair) = control_map::decode_mute(&self.control, status, d1, d2) {
+            return vec![RtCommand::ToggleMute(pair)];
+        }
         match control_map::decode(&self.control, status, d1, d2) {
             Some(cmd) => self.handle(cmd, midi),
             None => Vec::new(),
@@ -214,6 +223,19 @@ song = "01-opener"
         // 2 destinations x 16 channels x 2 messages = 64 messages.
         assert_eq!(midi.sent.len(), 64);
         assert!(midi.sent.iter().any(|(p, b)| *p == 1 && b == &[0xB0, 123, 0]));
+    }
+
+    #[test]
+    fn mute_note_forwards_toggle_mute_without_touching_transport() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+        // Note 73 = mute pair 1, regardless of transport state (still Idle here).
+        assert_eq!(
+            e.handle_midi(0x90, 73, 100, &mut midi),
+            vec![RtCommand::ToggleMute(1)]
+        );
+        assert_eq!(e.state(), State::Idle);
+        assert!(midi.sent.is_empty());
     }
 
     #[test]
