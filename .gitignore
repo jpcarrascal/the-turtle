@@ -2,6 +2,7 @@
 **/*.rs.bk
 Cargo.lock
 .DS_Store
+Icon?
 
 # Python (converter)
 .venv/
