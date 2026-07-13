@@ -181,9 +181,9 @@ name = "lights"
 port = "hw:5,0,0"
 
 [control]
-input_port = "hw:4,0,0"
+input_port = "hw:5,0,0"
 select_channel = 2
-transport_channel = 2
+transport_channel = 1
 dsp_channel = 3
 start = { type = "note", note = 14 }
 stop  = { type = "note", note = 15 }
