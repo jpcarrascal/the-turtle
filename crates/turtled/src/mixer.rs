@@ -42,8 +42,25 @@ const DEFAULT_Q: f32 = 0.707;
 /// Linear headroom above unity a `Gain` CC can reach (127 -> +6 dB-ish boost);
 /// the master limiter is the backstop against clipping.
 const MAX_GAIN: f32 = 2.0;
+/// The `Gain` CC value that maps to exactly unity (1.0x). Not the fader's
+/// midpoint (63.5) — like most mixing-console faders, more of the travel
+/// (0..=100) is devoted to attenuation than to boost (100..=127).
+const GAIN_UNITY_CC: u8 = 100;
 /// Full-scale for the S32 device format: map f32 [-1.0, 1.0] onto the i32 range.
 const I32_FULL_SCALE: f32 = i32::MAX as f32;
+
+/// Map a raw `0..=127` `Gain` CC to a linear gain, piecewise around
+/// [`GAIN_UNITY_CC`] so that value lands on *exactly* 1.0 rather than the
+/// nearest of two off-by-half-a-step neighbors: `0..=GAIN_UNITY_CC` ramps
+/// 0x -> 1x, `GAIN_UNITY_CC..=127` ramps 1x -> [`MAX_GAIN`].
+fn gain_from_cc(value: u8) -> f32 {
+    if value <= GAIN_UNITY_CC {
+        value as f32 / GAIN_UNITY_CC as f32
+    } else {
+        let v = (value - GAIN_UNITY_CC) as f32 / (127 - GAIN_UNITY_CC) as f32;
+        1.0 + v * (MAX_GAIN - 1.0)
+    }
+}
 
 /// The fixed per-channel DSP chain (§6), in signal order. `filter_type` is
 /// the pair's fixed topology (from `song.toml`, set once at load);
@@ -183,7 +200,7 @@ impl Mixer {
         let v = value as f32 / 127.0;
         match param {
             DspParam::Gain => {
-                let gain = v * MAX_GAIN;
+                let gain = gain_from_cc(value);
                 p.left.gain.set_target(gain);
                 p.right.gain.set_target(gain);
             }
@@ -425,12 +442,11 @@ mod tests {
         let frames = 48_000;
         let s = song(vec![pair(0, [0.1, 0.1].repeat(frames))]);
         let mut m = Mixer::new(s, 48_000);
-        let cc_value = 64u8;
+        let cc_value = 64u8; // below GAIN_UNITY_CC (100): the attenuation leg.
         m.set_dsp_param(0, DspParam::Gain, cc_value);
         let mut out = vec![0i32; frames * 2];
         m.render(&mut out);
-        let v = cc_value as f32 / 127.0;
-        let expected = to_i32(0.1 * (v * MAX_GAIN));
+        let expected = to_i32(0.1 * gain_from_cc(cc_value));
         let (last_l, last_r) = (out[out.len() - 2], out[out.len() - 1]);
         let tolerance = (expected.unsigned_abs() as f64 * 1e-2).max(2.0) as i32;
         assert!(
@@ -438,6 +454,17 @@ mod tests {
             "L = {last_l}, expected ~{expected}"
         );
         assert_eq!(last_l, last_r);
+    }
+
+    #[test]
+    fn gain_cc_100_is_exactly_unity() {
+        assert_eq!(gain_from_cc(GAIN_UNITY_CC), 1.0);
+    }
+
+    #[test]
+    fn gain_cc_endpoints_are_silence_and_max_gain() {
+        assert_eq!(gain_from_cc(0), 0.0);
+        assert_eq!(gain_from_cc(127), MAX_GAIN);
     }
 
     #[test]
