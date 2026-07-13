@@ -154,9 +154,16 @@ fn write_tone(path: &Path, frames: u64, hz: f64, beat_samples: u64) -> Result<()
 /// The `[audio] device`, `[control] input_port`, and the `lights` destination
 /// `port` here are the **dev rig's** ALSA names (`hw:L6` USB audio, `hw:4,0,0`
 /// MIDI controller in, `hw:5,0,0` CME MIDI out) plus the controller's actual
-/// `start`/`stop` note numbers, so `gen-tone` output plays, responds to control,
-/// and emits MIDI on that Pi without editing. Change these for a different setup
-/// — `aplay -l` lists audio cards, `amidi -l` lists MIDI ports.
+/// `start`/`stop`/mute note numbers, so `gen-tone` output plays, responds to
+/// control, and emits MIDI on that Pi without editing. Change these for a
+/// different setup — `aplay -l` lists audio cards, `amidi -l` lists MIDI
+/// ports. `transport_channel = 2` (matching `select_channel`) and
+/// `dsp_channel = 3` exercise the per-category channel gate (§7.1) — the
+/// dev rig's transport/select controller sends on channel 2, its mixing
+/// controller on channel 3. The `dsp_pair0_*` CCs (0, 4, 8, 12-14) are
+/// placeholder pedal/expression CC numbers for exercising live DSP control
+/// (§6) on pair 0, the bundle's only pair — remap to whatever CCs the dev
+/// rig's controller actually sends, on whichever channel it sends them.
 const SHOW_TOML: &str = r#"[show]
 name = "Tone Test"
 playback_rate = 48000
@@ -176,12 +183,20 @@ port = "hw:5,0,0"
 [control]
 input_port = "hw:4,0,0"
 select_channel = 2
+transport_channel = 2
+dsp_channel = 3
 start = { type = "note", note = 14 }
 stop  = { type = "note", note = 15 }
 next  = { type = "note", note = 62 }
 prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [12, 11, 13, 75] }
+dsp_pair0_gain = { type = "cc", cc = 0 }
+dsp_pair0_cutoff = { type = "cc", cc = 4 }
+dsp_pair0_resonance = { type = "cc", cc = 8 }
+dsp_pair0_delay_time = { type = "cc", cc = 12 }
+dsp_pair0_delay_feedback = { type = "cc", cc = 13 }
+dsp_pair0_delay_mix = { type = "cc", cc = 14 }
 
 [[setlist]]
 pc = 0

@@ -19,31 +19,58 @@
 //! pair. The chain's default parameters are transparent (§6), so until live CC
 //! drives them the mixer is a straight passthrough of the summed stems.
 
-use turtle_dsp::{Biquad, Delay, Gain, Limiter};
+use turtle_dsp::{Biquad, Delay, FilterType, Gain, Limiter};
 
+use crate::control_map::DspParam;
 use crate::stems::PreloadedSong;
 
 /// Smoothing time for the per-pair gain so mute/CC moves don't click (§6).
 const GAIN_SMOOTH_MS: f32 = 5.0;
-/// Headroom for the delay line: enough for any musical delay time (§6).
+/// Headroom for the delay line: enough for any musical delay time (§6). Also
+/// the ceiling a `DelayTime` CC maps to (127 -> exactly this many seconds).
 const DELAY_MAX_SECONDS: usize = 2;
+/// Cutoff CC range (§6): 20 Hz-20 kHz, mapped log/exponentially since that's
+/// how frequency is perceived. 20 kHz doubles as the transparent default
+/// (near-inaudible filtering) so an untouched pair stays a passthrough.
+const MIN_CUTOFF_HZ: f32 = 20.0;
+const MAX_CUTOFF_HZ: f32 = 20_000.0;
+/// Resonance (Q) CC range. `DEFAULT_Q` is the flat Butterworth response (no
+/// resonant peak) — "minimal Q" per §6's transparent-defaults note.
+const MIN_Q: f32 = 0.5;
+const MAX_Q: f32 = 10.0;
+const DEFAULT_Q: f32 = 0.707;
+/// Linear headroom above unity a `Gain` CC can reach (127 -> +6 dB-ish boost);
+/// the master limiter is the backstop against clipping.
+const MAX_GAIN: f32 = 2.0;
 /// Full-scale for the S32 device format: map f32 [-1.0, 1.0] onto the i32 range.
 const I32_FULL_SCALE: f32 = i32::MAX as f32;
 
-/// The fixed per-channel DSP chain (§6), in signal order.
+/// The fixed per-channel DSP chain (§6), in signal order. `filter_type` is
+/// the pair's fixed topology (from `song.toml`, set once at load);
+/// `cutoff_hz`/`q` are the live-CC-driven biquad params, tracked here
+/// because `Biquad::set` needs all three together on every recompute — a CC
+/// that moves just one still has to resupply the other's last value.
 struct ChannelChain {
     gain: Gain,
     biquad: Biquad,
+    filter_type: FilterType,
+    cutoff_hz: f32,
+    q: f32,
     delay: Delay,
+    sample_rate: f32,
 }
 
 impl ChannelChain {
     fn new(sample_rate: f32) -> Self {
         ChannelChain {
             gain: Gain::new(sample_rate, GAIN_SMOOTH_MS),
-            // Identity = transparent until a live CC picks a filter type/cutoff.
+            // Identity = transparent until a live CC picks a cutoff/resonance.
             biquad: Biquad::identity(),
+            filter_type: FilterType::Lowpass,
+            cutoff_hz: MAX_CUTOFF_HZ,
+            q: DEFAULT_Q,
             delay: Delay::new(DELAY_MAX_SECONDS * sample_rate as usize),
+            sample_rate,
         }
     }
 
@@ -54,6 +81,13 @@ impl ChannelChain {
         let g = self.gain.process(x);
         let f = self.biquad.process(g);
         self.delay.process(f)
+    }
+
+    /// Recompute the biquad from the current `filter_type`/`cutoff_hz`/`q` —
+    /// called whenever a CC moves either param (§6 "grabbing" a knob).
+    fn recompute_biquad(&mut self) {
+        self.biquad
+            .set(self.filter_type, self.cutoff_hz, self.q, self.sample_rate);
     }
 
     /// Clear filter/delay tails so a seek doesn't bleed the old position's
@@ -123,6 +157,67 @@ impl Mixer {
         if let Some(p) = self.pairs.get_mut(pair) {
             p.left.gain.toggle_mute();
             p.right.gain.toggle_mute();
+        }
+    }
+
+    /// Set `pair`'s fixed filter topology (from `song.toml`'s `[dsp.pairN]`,
+    /// §6). Called once at song load, before any live CC; doesn't itself
+    /// touch the biquad, which stays the transparent identity until a
+    /// `Cutoff`/`Resonance` CC "grabs" it (`set_dsp_param` below) and
+    /// recomputes using this topology.
+    pub fn set_filter_type(&mut self, pair: usize, filter: FilterType) {
+        if let Some(p) = self.pairs.get_mut(pair) {
+            p.left.filter_type = filter;
+            p.right.filter_type = filter;
+        }
+    }
+
+    /// Apply a live DSP CC (§6) to `pair`'s chain: map the raw `0..=127`
+    /// value to the parameter's engineering range and push it to both
+    /// channels. Out-of-range `pair` (e.g. a CC for a pair the current song
+    /// doesn't have) is a silent no-op, matching `toggle_pair_mute`.
+    pub fn set_dsp_param(&mut self, pair: usize, param: DspParam, value: u8) {
+        let Some(p) = self.pairs.get_mut(pair) else {
+            return;
+        };
+        let v = value as f32 / 127.0;
+        match param {
+            DspParam::Gain => {
+                let gain = v * MAX_GAIN;
+                p.left.gain.set_target(gain);
+                p.right.gain.set_target(gain);
+            }
+            DspParam::Cutoff => {
+                // Exponential (not linear) so the sweep feels even across the
+                // audible range, matching how frequency is perceived.
+                let hz = MIN_CUTOFF_HZ * (MAX_CUTOFF_HZ / MIN_CUTOFF_HZ).powf(v);
+                p.left.cutoff_hz = hz;
+                p.left.recompute_biquad();
+                p.right.cutoff_hz = hz;
+                p.right.recompute_biquad();
+            }
+            DspParam::Resonance => {
+                let q = MIN_Q + v * (MAX_Q - MIN_Q);
+                p.left.q = q;
+                p.left.recompute_biquad();
+                p.right.q = q;
+                p.right.recompute_biquad();
+            }
+            DspParam::DelayTime => {
+                let samples = (v * DELAY_MAX_SECONDS as f32 * self.sample_rate as f32) as usize;
+                p.left.delay.set_delay_samples(samples);
+                p.right.delay.set_delay_samples(samples);
+            }
+            // `Delay::set_feedback`/`set_mix` already clamp to their safe
+            // range, so the normalized 0..=1 CC value passes straight through.
+            DspParam::DelayFeedback => {
+                p.left.delay.set_feedback(v);
+                p.right.delay.set_feedback(v);
+            }
+            DspParam::DelayMix => {
+                p.left.delay.set_mix(v);
+                p.right.delay.set_mix(v);
+            }
         }
     }
 
@@ -318,5 +413,91 @@ mod tests {
         assert_eq!(to_i32(2.0), i32::MAX);
         assert_eq!(to_i32(-2.0), (-1.0 * I32_FULL_SCALE) as i32);
         assert_eq!(to_i32(0.0), 0);
+    }
+
+    fn to_f32(x: i32) -> f32 {
+        x as f32 / I32_FULL_SCALE
+    }
+
+    #[test]
+    fn dsp_gain_scales_the_pair_after_convergence() {
+        // 1s far exceeds the 5 ms smoother's settling time.
+        let frames = 48_000;
+        let s = song(vec![pair(0, [0.1, 0.1].repeat(frames))]);
+        let mut m = Mixer::new(s, 48_000);
+        let cc_value = 64u8;
+        m.set_dsp_param(0, DspParam::Gain, cc_value);
+        let mut out = vec![0i32; frames * 2];
+        m.render(&mut out);
+        let v = cc_value as f32 / 127.0;
+        let expected = to_i32(0.1 * (v * MAX_GAIN));
+        let (last_l, last_r) = (out[out.len() - 2], out[out.len() - 1]);
+        let tolerance = (expected.unsigned_abs() as f64 * 1e-2).max(2.0) as i32;
+        assert!(
+            (last_l - expected).abs() <= tolerance,
+            "L = {last_l}, expected ~{expected}"
+        );
+        assert_eq!(last_l, last_r);
+    }
+
+    #[test]
+    fn dsp_cutoff_grabs_the_biquad_using_the_configured_topology() {
+        // A highpass blocks DC: a sustained near-DC input should decay toward
+        // zero once the cutoff CC "grabs" the (until-now-identity) biquad.
+        let frames = 10_000;
+        let s = song(vec![pair(0, [1.0, 1.0].repeat(frames))]);
+        let mut m = Mixer::new(s, 48_000);
+        m.set_filter_type(0, FilterType::Highpass);
+        m.set_dsp_param(0, DspParam::Cutoff, 64);
+        let mut out = vec![0i32; frames * 2];
+        m.render(&mut out);
+        let last_l = out[out.len() - 2];
+        assert!(
+            to_f32(last_l).abs() < 1e-2,
+            "expected near-zero, got {}",
+            to_f32(last_l)
+        );
+    }
+
+    #[test]
+    fn dsp_delay_time_places_the_echo_at_the_cc_mapped_sample() {
+        // An impulse (well below the limiter ceiling) at frame 0, silence after.
+        let frames = 2_000;
+        let mut samples = vec![0.0f32; frames * 2];
+        samples[0] = 0.5;
+        samples[1] = 0.5;
+        let s = song(vec![pair(0, samples)]);
+        let mut m = Mixer::new(s, 48_000);
+        m.set_dsp_param(0, DspParam::DelayMix, 127); // fully wet
+        m.set_dsp_param(0, DspParam::DelayFeedback, 0); // single echo, no repeats
+        let cc_value = 1u8;
+        m.set_dsp_param(0, DspParam::DelayTime, cc_value);
+        let v = cc_value as f32 / 127.0;
+        let expected_samples = (v * DELAY_MAX_SECONDS as f32 * 48_000.0) as usize;
+        assert!(
+            expected_samples < frames,
+            "test needs to render past the tap"
+        );
+
+        let mut out = vec![0i32; frames * 2];
+        m.render(&mut out);
+        assert_eq!(
+            out[0],
+            to_i32(0.0),
+            "fully wet: nothing sounds before the tap"
+        );
+        assert_eq!(out[expected_samples * 2], to_i32(0.5));
+        assert_eq!(out[expected_samples * 2 + 1], to_i32(0.5));
+    }
+
+    #[test]
+    fn set_dsp_param_out_of_range_is_a_silent_no_op() {
+        let s = song(vec![pair(0, vec![0.5, 0.5])]);
+        let mut m = Mixer::new(s, 48_000);
+        m.set_dsp_param(3, DspParam::Gain, 127); // no pair 3 in this song
+        let mut out = [0i32; 2];
+        m.render(&mut out);
+        assert_eq!(out[0], to_i32(0.5));
+        assert_eq!(out[1], to_i32(0.5));
     }
 }

@@ -14,7 +14,7 @@ use turtle_core::transport::Action;
 use turtle_core::{Command, Show, State, Transport};
 
 use crate::backend::MidiSink;
-use crate::control_map;
+use crate::control_map::{self, DspParam};
 use crate::notes::ActiveNotes;
 
 /// A command from the control thread to the audio RT thread.
@@ -25,6 +25,9 @@ pub enum RtCommand {
     Seek(u64),
     /// Toggle the mute on pair `index` (§6/§8), independent of transport state.
     ToggleMute(usize),
+    /// Set a live DSP param on pair `index` to the raw `0..=127` CC value
+    /// (§6), independent of transport state.
+    SetDsp(usize, DspParam, u8),
 }
 
 pub type RtProducer = Producer<RtCommand>;
@@ -75,9 +78,9 @@ impl Engine {
     /// also uses for the scheduler — so a single `AlsaMidi` serves both without
     /// the engine owning it.
     ///
-    /// Per-pair mute is checked first: it bypasses the transport state machine
-    /// entirely (a mute tap is valid in any state), so it never reaches
-    /// `control_map::decode` / `Command`.
+    /// Per-pair mute and live DSP CC are checked first: both bypass the
+    /// transport state machine entirely (valid in any state), so neither
+    /// reaches `control_map::decode` / `Command`.
     pub fn handle_midi(
         &mut self,
         status: u8,
@@ -87,6 +90,13 @@ impl Engine {
     ) -> Vec<RtCommand> {
         if let Some(pair) = control_map::decode_mute(&self.control, status, d1, d2) {
             return vec![RtCommand::ToggleMute(pair)];
+        }
+        let dsp = control_map::decode_dsp(&self.control, status, d1, d2);
+        if !dsp.is_empty() {
+            return dsp
+                .into_iter()
+                .map(|(pair, param, value)| RtCommand::SetDsp(pair, param, value))
+                .collect();
         }
         match control_map::decode(&self.control, status, d1, d2) {
             Some(cmd) => self.handle(cmd, midi),
@@ -167,6 +177,9 @@ next  = { type = "note", note = 62 }
 prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [72, 73, 74, 75] }
+dsp_pair0_cutoff = { type = "cc", cc = 20 }
+dsp_pair0_delay_time = { type = "cc", cc = 30 }
+dsp_pair1_delay_time = { type = "cc", cc = 30 }
 [[setlist]]
 pc = 0
 song = "01-opener"
@@ -236,6 +249,33 @@ song = "01-opener"
         );
         assert_eq!(e.state(), State::Idle);
         assert!(midi.sent.is_empty());
+    }
+
+    #[test]
+    fn dsp_cc_forwards_set_dsp_without_touching_transport() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+        // CC 20 = dsp_pair0_cutoff, regardless of transport state (still Idle).
+        assert_eq!(
+            e.handle_midi(0xB0, 20, 90, &mut midi),
+            vec![RtCommand::SetDsp(0, DspParam::Cutoff, 90)]
+        );
+        assert_eq!(e.state(), State::Idle);
+        assert!(midi.sent.is_empty());
+    }
+
+    #[test]
+    fn dsp_cc_shared_by_two_pairs_fans_out_to_both() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+        // CC 30 drives both dsp_pair0_delay_time and dsp_pair1_delay_time.
+        assert_eq!(
+            e.handle_midi(0xB0, 30, 40, &mut midi),
+            vec![
+                RtCommand::SetDsp(0, DspParam::DelayTime, 40),
+                RtCommand::SetDsp(1, DspParam::DelayTime, 40),
+            ]
+        );
     }
 
     #[test]
