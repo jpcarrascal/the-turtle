@@ -19,13 +19,18 @@
 //! pair. The chain's default parameters are transparent (§6), so until live CC
 //! drives them the mixer is a straight passthrough of the summed stems.
 
-use turtle_dsp::{Biquad, Delay, FilterType, Gain, Limiter};
+use turtle_dsp::{one_pole_coeff, Biquad, Delay, FilterType, Gain, Limiter};
 
 use crate::control_map::DspParam;
 use crate::stems::PreloadedSong;
 
 /// Smoothing time for the per-pair gain so mute/CC moves don't click (§6).
 const GAIN_SMOOTH_MS: f32 = 5.0;
+/// Smoothing time for live cutoff/resonance CC moves. Without this, sweeping
+/// the filter "zippers" — the biquad's coefficients jump on every incoming CC
+/// while its internal state (z1/z2) is non-zero, producing an audible click
+/// per jump. Same order of magnitude as `GAIN_SMOOTH_MS`.
+const FILTER_SMOOTH_MS: f32 = 5.0;
 /// Headroom for the delay line: enough for any musical delay time (§6). Also
 /// the ceiling a `DelayTime` CC maps to (127 -> exactly this many seconds).
 const DELAY_MAX_SECONDS: usize = 2;
@@ -63,16 +68,29 @@ fn gain_from_cc(value: u8) -> f32 {
 }
 
 /// The fixed per-channel DSP chain (§6), in signal order. `filter_type` is
-/// the pair's fixed topology (from `song.toml`, set once at load);
-/// `cutoff_hz`/`q` are the live-CC-driven biquad params, tracked here
-/// because `Biquad::set` needs all three together on every recompute — a CC
-/// that moves just one still has to resupply the other's last value.
+/// the pair's fixed topology (from `song.toml`, set once at load); `cutoff_hz`/`q`
+/// are the *currently applied* (smoothed) biquad params, ramping each sample
+/// toward `target_cutoff_hz`/`target_q` while `filter_live`. They're tracked
+/// here (rather than inside `Biquad`) because `Biquad::set` needs all three
+/// — type, cutoff, Q — together on every recompute, so a CC that moves just
+/// one still has to resupply the other's last (smoothed) value.
 struct ChannelChain {
     gain: Gain,
     biquad: Biquad,
     filter_type: FilterType,
+    /// True once a Cutoff/Resonance CC has "grabbed" this pair (§6). While
+    /// false, `process` never touches `biquad`'s coefficients — it stays the
+    /// exact `Biquad::identity()` it was constructed with, bit-exact
+    /// passthrough, no per-sample recompute cost. Once true, `cutoff_hz`/`q`
+    /// ramp toward their targets and the biquad is recomputed every sample —
+    /// the fix for the "zipper" click a snapped coefficient change causes.
+    filter_live: bool,
     cutoff_hz: f32,
+    target_cutoff_hz: f32,
     q: f32,
+    target_q: f32,
+    /// Per-sample smoothing coefficient for `cutoff_hz`/`q`, from `FILTER_SMOOTH_MS`.
+    filter_coeff: f32,
     delay: Delay,
     sample_rate: f32,
 }
@@ -84,8 +102,12 @@ impl ChannelChain {
             // Identity = transparent until a live CC picks a cutoff/resonance.
             biquad: Biquad::identity(),
             filter_type: FilterType::Lowpass,
+            filter_live: false,
             cutoff_hz: MAX_CUTOFF_HZ,
+            target_cutoff_hz: MAX_CUTOFF_HZ,
             q: DEFAULT_Q,
+            target_q: DEFAULT_Q,
+            filter_coeff: one_pole_coeff(FILTER_SMOOTH_MS, sample_rate),
             delay: Delay::new(DELAY_MAX_SECONDS * sample_rate as usize),
             sample_rate,
         }
@@ -96,19 +118,26 @@ impl ChannelChain {
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let g = self.gain.process(x);
+        if self.filter_live {
+            self.cutoff_hz += (self.target_cutoff_hz - self.cutoff_hz) * self.filter_coeff;
+            self.q += (self.target_q - self.q) * self.filter_coeff;
+            self.recompute_biquad();
+        }
         let f = self.biquad.process(g);
         self.delay.process(f)
     }
 
-    /// Recompute the biquad from the current `filter_type`/`cutoff_hz`/`q` —
-    /// called whenever a CC moves either param (§6 "grabbing" a knob).
+    /// Recompute the biquad from the current `filter_type`/`cutoff_hz`/`q`.
     fn recompute_biquad(&mut self) {
         self.biquad
             .set(self.filter_type, self.cutoff_hz, self.q, self.sample_rate);
     }
 
     /// Clear filter/delay tails so a seek doesn't bleed the old position's
-    /// reverberant state into the new one.
+    /// reverberant state into the new one. Doesn't touch `filter_live`/the
+    /// cutoff-resonance targets — a seek shouldn't un-grab a live knob, only
+    /// clear the transient audio state (matches `Delay`, which also keeps
+    /// its time/feedback/mix across a seek).
     fn reset(&mut self) {
         self.biquad.reset();
         self.delay.reset();
@@ -204,21 +233,24 @@ impl Mixer {
                 p.left.gain.set_target(gain);
                 p.right.gain.set_target(gain);
             }
+            // Cutoff/resonance set a *target*; `ChannelChain::process` ramps
+            // toward it and recomputes the biquad every sample (§6) so a
+            // sweep glides instead of zippering.
             DspParam::Cutoff => {
                 // Exponential (not linear) so the sweep feels even across the
                 // audible range, matching how frequency is perceived.
                 let hz = MIN_CUTOFF_HZ * (MAX_CUTOFF_HZ / MIN_CUTOFF_HZ).powf(v);
-                p.left.cutoff_hz = hz;
-                p.left.recompute_biquad();
-                p.right.cutoff_hz = hz;
-                p.right.recompute_biquad();
+                p.left.target_cutoff_hz = hz;
+                p.left.filter_live = true;
+                p.right.target_cutoff_hz = hz;
+                p.right.filter_live = true;
             }
             DspParam::Resonance => {
                 let q = MIN_Q + v * (MAX_Q - MIN_Q);
-                p.left.q = q;
-                p.left.recompute_biquad();
-                p.right.q = q;
-                p.right.recompute_biquad();
+                p.left.target_q = q;
+                p.left.filter_live = true;
+                p.right.target_q = q;
+                p.right.filter_live = true;
             }
             DspParam::DelayTime => {
                 let samples = (v * DELAY_MAX_SECONDS as f32 * self.sample_rate as f32) as usize;
@@ -483,6 +515,59 @@ mod tests {
             to_f32(last_l).abs() < 1e-2,
             "expected near-zero, got {}",
             to_f32(last_l)
+        );
+    }
+
+    #[test]
+    fn dsp_cutoff_ramps_gradually_rather_than_snapping_instantly() {
+        // A lowpass swept from its wide-open default (~20 kHz) down to the
+        // bottom of the range (20 Hz, CC 0) should pass a mid tone almost
+        // unattenuated right after the CC lands, then crush it once the
+        // cutoff has actually glided down — proving the cutoff ramps toward
+        // its target instead of snapping there instantly (an instant snap
+        // would crush the tone from sample 0).
+        let sr = 48_000.0;
+        let hz = 5_000.0;
+        let frames = 20_000;
+        let mut samples = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr;
+            let v = (2.0 * std::f32::consts::PI * hz * t).sin();
+            samples[2 * i] = v;
+            samples[2 * i + 1] = v;
+        }
+        let s = song(vec![pair(0, samples)]);
+        let mut m = Mixer::new(s, 48_000);
+        // Default topology is already Lowpass (no set_filter_type needed).
+        m.set_dsp_param(0, DspParam::Cutoff, 0);
+        let mut out = vec![0i32; frames * 2];
+        m.render(&mut out);
+
+        let peak = |range: std::ops::Range<usize>| {
+            range
+                .map(|i| to_f32(out[2 * i]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        // Not the very first samples: a 20 Hz lowpass has its own natural
+        // step-response settling time (~8 ms / ~400 samples) even with an
+        // instant coefficient snap, so comparing against sample 0 mostly
+        // measures that, not the CC ramp. Sample ~1000 is past the filter's
+        // own settling time but — with the ramp — the *cutoff parameter
+        // itself* hasn't reached 20 Hz yet (needs ~25 ms / ~1200 samples),
+        // so it should still be passing more signal than the fully-settled
+        // end of the render.
+        let early = peak(900..1000);
+        let late = peak(frames - 100..frames); // long since settled
+
+        // Empirically: ~546x with the ramp in place, ~67x for an instant
+        // snap at the same measurement windows (the filter's own natural
+        // step-response settling time alone accounts for a real but much
+        // smaller gap). 100x sits cleanly between the two, so this catches
+        // a regression back to an instant snap without being flaky.
+        assert!(
+            early > late * 100.0,
+            "expected the ramp to still pass much more signal shortly \
+             after the CC lands than once settled (early={early}, late={late})"
         );
     }
 
