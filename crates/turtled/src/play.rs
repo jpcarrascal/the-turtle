@@ -136,7 +136,8 @@ pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), Strin
     use crate::alsa_backend::{AlsaAudio, AlsaMidi};
     use crate::backend::MidiSink;
     use crate::clock::TransportClock;
-    use crate::engine::{rt_channel, RtCommand};
+    use crate::engine::{rt_channel, rt_event_channel, RtCommand};
+    use crate::mixer::song_channel;
 
     let Playable { show, mut mixer, frames, song_dir } = load_playable(bundle, song)?;
     let rate = show.show.playback_rate;
@@ -164,6 +165,10 @@ pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), Strin
     let clock = TransportClock::new(rate);
     // Small SPSC command queue to the audio thread (§3). Producer stays here.
     let (mut tx, mut rx) = rt_channel(64);
+    // This one-shot path never swaps songs or needs `EndReached`, but
+    // `run_audio` still expects both channel halves — give it unread ones.
+    let (_song_tx, mut song_rx) = song_channel(2);
+    let (mut events_tx, _events_rx) = rt_event_channel(8);
     // Shared flag so this thread can ask the audio loop to exit.
     let running = AtomicBool::new(true);
     // Shared monotonic reference for the clock timestamps.
@@ -191,7 +196,16 @@ pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), Strin
         let clock = &clock;
         let running = &running;
         s.spawn(move || {
-            rt::run_audio(&audio, &mut mixer, clock, &mut rx, epoch, running);
+            rt::run_audio(
+                &audio,
+                &mut mixer,
+                clock,
+                &mut rx,
+                &mut song_rx,
+                &mut events_tx,
+                epoch,
+                running,
+            );
         });
 
         // Kick off playback, then run the MIDI scheduler on this thread (§5):
