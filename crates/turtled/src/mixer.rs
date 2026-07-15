@@ -19,10 +19,23 @@
 //! pair. The chain's default parameters are transparent (§6), so until live CC
 //! drives them the mixer is a straight passthrough of the summed stems.
 
+use rtrb::{Consumer, Producer, RingBuffer};
 use turtle_dsp::{one_pole_coeff, Biquad, Delay, FilterType, Gain, Limiter};
 
 use crate::control_map::DspParam;
 use crate::stems::PreloadedSong;
+
+pub type SongProducer = Producer<Mixer>;
+pub type SongConsumer = Consumer<Mixer>;
+
+/// The lock-free SPSC boundary the control thread uses to hand the audio RT
+/// thread a freshly loaded [`Mixer`] (§3/§8 song switching). Separate from
+/// [`crate::engine::rt_channel`]'s `RtCommand` queue so an infrequent,
+/// heavier payload (a whole `Mixer`) doesn't sit alongside frequent small
+/// commands — and so `RtCommand` can stay `Copy`.
+pub fn song_channel(capacity: usize) -> (SongProducer, SongConsumer) {
+    RingBuffer::new(capacity)
+}
 
 /// Smoothing time for the per-pair gain so mute/CC moves don't click (§6).
 const GAIN_SMOOTH_MS: f32 = 5.0;

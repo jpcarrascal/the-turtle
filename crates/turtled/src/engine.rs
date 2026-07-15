@@ -38,6 +38,22 @@ pub fn rt_channel(capacity: usize) -> (RtProducer, RtConsumer) {
     RingBuffer::new(capacity)
 }
 
+/// An event from the audio RT thread back to the control thread — the
+/// mirror-image boundary of [`RtCommand`] (§3/§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtEvent {
+    /// The mixer just rendered past the end of the current song.
+    EndReached,
+}
+
+pub type RtEventProducer = Producer<RtEvent>;
+pub type RtEventConsumer = Consumer<RtEvent>;
+
+/// The lock-free SPSC boundary for audio-RT -> control events (§3).
+pub fn rt_event_channel(capacity: usize) -> (RtEventProducer, RtEventConsumer) {
+    RingBuffer::new(capacity)
+}
+
 pub struct Engine {
     transport: Transport,
     control: turtle_core::model::Control,

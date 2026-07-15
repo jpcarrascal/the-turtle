@@ -5,13 +5,18 @@
 //! (spec §8), and the mute notes / `dsp_*` CCs act directly on the mixer
 //! regardless of transport state. The decode + transport logic already lives
 //! in [`crate::control_map`] and [`crate::engine`] (both unit-tested); this
-//! module adds the two missing pieces:
+//! module adds the pieces `turtle-core::transport` doesn't own:
 //!
 //!   * [`MidiParser`] — a **portable** MIDI byte-stream parser (running status,
 //!     interleaved real-time bytes). Unit-tested on the dev Mac.
-//!   * [`run`] — the **`cfg(linux)`** loop that reads ALSA rawmidi, feeds the
-//!     parser into the engine, and forwards the resulting RT commands to the
-//!     audio thread. Verified on the Pi.
+//!   * [`load_song_payload`]/[`spawn_load`] — the **portable** background
+//!     loader (§3/§8): a `Command::Select`/`Next`/`Prev` armed mid-song
+//!     doesn't block playback — it's loaded off-thread, and installed either
+//!     immediately (re-arming while stopped) or held until a gapless
+//!     `EndReached` auto-advance (armed *during* playback).
+//!   * [`run`] — the **`cfg(linux)`** loop that reads ALSA rawmidi, polls the
+//!     loader and the RT thread's `EndReached` events, and forwards the
+//!     resulting RT commands to the audio thread. Verified on the Pi.
 
 /// Incremental parser for a raw MIDI byte stream.
 ///
@@ -91,23 +96,66 @@ fn data_bytes_for(status: u8) -> usize {
     }
 }
 
+/// A song loaded off the RT/control threads (real file I/O + WAV decoding),
+/// ready to install: swap `mixer` into the audio thread and replace
+/// `schedulers` in the control thread (§3/§8).
+struct LoadedSong {
+    mixer: crate::mixer::Mixer,
+    schedulers: Vec<crate::scheduler::PortScheduler>,
+}
+
+/// The portable half of a background load: reuses the same loader the
+/// startup path and `turtled play` use. Kept separate from [`spawn_load`] so
+/// the `Result` plumbing (this can fail: missing song dir, bad stem, …) is
+/// testable without threads.
+fn load_song_payload(
+    bundle: &std::path::Path,
+    song: &str,
+    rate: u32,
+) -> Result<LoadedSong, String> {
+    let p = crate::play::load_playable(bundle, Some(song))?;
+    let schedulers = crate::play::load_schedulers(&p.show, &p.song_dir, rate);
+    Ok(LoadedSong {
+        mixer: p.mixer,
+        schedulers,
+    })
+}
+
+/// Spawn a background thread to load `song` and send the result back over
+/// `tx`, tagged with the song name so the receiver can tell a stale result
+/// (superseded by a newer Select/Next/Prev before this one finished) from a
+/// current one.
+fn spawn_load(
+    bundle: std::path::PathBuf,
+    song: String,
+    rate: u32,
+    tx: std::sync::mpsc::Sender<(String, Result<LoadedSong, String>)>,
+) {
+    std::thread::spawn(move || {
+        let result = load_song_payload(&bundle, &song, rate);
+        let _ = tx.send((song, result));
+    });
+}
+
 /// Open the audio device + MIDI input, arm the song, and let the controller
 /// drive the transport until Ctrl-C. Linux only (ALSA).
 #[cfg(target_os = "linux")]
 pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use alsa::rawmidi::Rawmidi;
     use alsa::Direction;
 
-    use turtle_core::Command;
+    use turtle_core::{Command, State};
 
     use crate::alsa_backend::{AlsaAudio, AlsaMidi};
     use crate::backend::MidiSink;
     use crate::clock::TransportClock;
-    use crate::engine::{rt_channel, Engine, RtCommand};
+    use crate::engine::{rt_channel, rt_event_channel, Engine, RtEvent};
+    use crate::mixer::song_channel;
     use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
     use crate::rt;
 
@@ -138,17 +186,40 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
 
     let clock = TransportClock::new(rate);
     let (mut tx, mut rx) = rt_channel(64);
+    let (mut song_tx, mut song_rx) = song_channel(2);
+    let (mut events_tx, mut events_rx) = rt_event_channel(8);
+    let (loader_tx, loader_rx) = mpsc::channel::<(String, Result<LoadedSong, String>)>();
     let running = AtomicBool::new(true);
     let epoch = Instant::now();
+    let bundle_owned = bundle.to_path_buf();
 
     // The transport engine. It shares `midi_out` with the scheduler: on Stop it
     // emits clean-release note-offs, on double-Stop/Panic all-notes-off (§5/§8).
     let mut eng = Engine::new(&show);
-    // The song is already preloaded, so arm it up front: Select its setlist PC,
-    // then feed the loader's "Loaded" so the state machine reaches ARMED.
-    let pc = show.setlist.first().map(|e| e.pc).ok_or("empty setlist")?;
+    // The song is already preloaded above, so arm it up front through the
+    // *real* Select/Loaded flow (not a synthetic shortcut) — that keeps the
+    // transport's `current` index in sync with whatever `load_playable`
+    // actually picked (the caller's `--song` override, or the first setlist
+    // entry). Deriving `pc` from the loaded song's directory name, rather
+    // than always assuming the setlist's first entry, matters once `--song`
+    // can pick something else.
+    let song_name = song_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("bad song directory name")?
+        .to_string();
+    let pc = show
+        .setlist
+        .iter()
+        .find(|e| e.song == song_name)
+        .map(|e| e.pc)
+        .ok_or_else(|| format!("song '{song_name}' not in the setlist"))?;
     // Arming emits no MIDI, but `handle` needs a sink; pass the shared one.
     eng.handle(Command::Select(pc), &mut midi_out);
+    // We already have this song's data (loaded synchronously above), so
+    // there's nothing for a background thread to do — just drop the
+    // preload request `Select` queued and go straight to Loaded.
+    let _ = eng.take_pending_preload();
     eng.handle(Command::Loaded, &mut midi_out);
 
     println!(
@@ -161,17 +232,37 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
         // rx into the audio thread; share atomic-backed clock/running by ref.
         let clock = &clock;
         let running = &running;
-        s.spawn(move || rt::run_audio(&audio, &mut mixer, clock, &mut rx, epoch, running));
+        s.spawn(move || {
+            rt::run_audio(
+                &audio,
+                &mut mixer,
+                clock,
+                &mut rx,
+                &mut song_rx,
+                &mut events_tx,
+                epoch,
+                running,
+            )
+        });
 
         // The control + MIDI-scheduler loop (one thread for v1). Each ~1 ms it:
         //  1. polls MIDI input (non-blocking) -> transport commands -> RT queue;
-        //  2. dispatches due MIDI output while playing.
+        //  2. polls the background loader for a finished (or failed) preload;
+        //  3. polls the RT thread for an EndReached event;
+        //  4. dispatches due MIDI output while playing.
         let mut parser = MidiParser::new();
         let mut io = midi_in.io();
         let mut buf = [0u8; 64];
         // Track play state locally so the scheduler only fires while running —
         // when stopped, the interpolated clock would otherwise drift and emit.
         let mut playing = false;
+        // Which song name the next accepted loader result must match — a
+        // fresh Select/Next/Prev before the previous one finished loading
+        // supersedes it; the stale result is dropped when it arrives (§8).
+        let mut expected_song: Option<String> = None;
+        // A song armed *during* playback (`armed_next`), loaded and waiting
+        // for the gapless auto-advance at EndReached to actually swap it in.
+        let mut held_next: Option<LoadedSong> = None;
 
         loop {
             // Non-blocking read: `Ok(n)` gives pending bytes; an `Err` means no
@@ -182,43 +273,99 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                     let Some((status, d1, d2)) = parser.push(byte) else { continue };
                     // The engine may emit clean-release/panic MIDI to `midi_out`.
                     for cmd in eng.handle_midi(status, d1, d2, &mut midi_out) {
-                        match cmd {
-                            RtCommand::Start => {
-                                playing = true;
-                                if verbose {
-                                    println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
-                                }
+                        dispatch_rt(cmd, &mut playing, &mut schedulers, &mut tx, epoch, verbose);
+                    }
+                    // Select/Next/Prev arm a song without emitting any
+                    // RtCommand (only `Action::Preload`), so this has to be
+                    // checked unconditionally after every decoded message,
+                    // not just when the loop above actually ran.
+                    if let Some(song) = eng.take_pending_preload() {
+                        if verbose {
+                            println!(
+                                "[preload] \"{song}\" wall={:.3}s",
+                                epoch.elapsed().as_secs_f64()
+                            );
+                        }
+                        expected_song = Some(song.clone());
+                        spawn_load(bundle_owned.clone(), song, rate, loader_tx.clone());
+                    }
+                }
+            }
+
+            // A finished (or failed) background load. `try_recv` never blocks.
+            while let Ok((song, result)) = loader_rx.try_recv() {
+                if expected_song.as_deref() != Some(song.as_str()) {
+                    // Superseded by a later Select/Next/Prev; drop it.
+                    continue;
+                }
+                match result {
+                    Err(e) => {
+                        // Per spec decision: log and stay armed-Loading; the
+                        // performer retries with another Select rather than
+                        // the transport growing a dedicated failure state.
+                        eprintln!("warning: failed to load '{song}': {e}");
+                    }
+                    Ok(loaded) => {
+                        // `Command::Loaded`'s effect depends on the state
+                        // *before* applying it (Loading -> Armed installs
+                        // now; Playing just marks armed-next ready) — so
+                        // read the state first, per `turtle_core::transport`.
+                        let was_loading = eng.state() == State::Loading;
+                        let was_playing = eng.state() == State::Playing;
+                        eng.handle(Command::Loaded, &mut midi_out); // always emits no RtCommand
+                        if was_loading {
+                            let _ = song_tx.push(loaded.mixer);
+                            schedulers = loaded.schedulers;
+                            if verbose {
+                                println!(
+                                    "[armed] \"{song}\" wall={:.3}s",
+                                    epoch.elapsed().as_secs_f64()
+                                );
                             }
-                            RtCommand::Stop => {
-                                playing = false;
-                                if verbose {
-                                    println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
-                                }
-                            }
-                            // Rewind: realign the output cursors with the audio.
-                            RtCommand::Seek(pos) => {
-                                for sched in schedulers.iter_mut() {
-                                    sched.seek(pos);
-                                }
-                            }
-                            RtCommand::ToggleMute(pair) => {
-                                if verbose {
-                                    println!(
-                                        "[mute] pair {pair} wall={:.3}s",
-                                        epoch.elapsed().as_secs_f64()
-                                    );
-                                }
-                            }
-                            RtCommand::SetDsp(pair, param, value) => {
-                                if verbose {
-                                    println!(
-                                        "[dsp] pair {pair} {param:?}={value} wall={:.3}s",
-                                        epoch.elapsed().as_secs_f64()
-                                    );
-                                }
+                        } else if was_playing {
+                            held_next = Some(loaded);
+                            if verbose {
+                                println!(
+                                    "[armed next] \"{song}\" wall={:.3}s",
+                                    epoch.elapsed().as_secs_f64()
+                                );
                             }
                         }
-                        let _ = tx.push(cmd);
+                        // Any other state (Stopped/Ended/Armed/Idle): the
+                        // transport itself treats Loaded as a no-op there
+                        // too (see `Transport::loaded`), so this result is
+                        // simply dropped rather than held indefinitely.
+                    }
+                }
+            }
+
+            // The RT thread reached the end of the current song.
+            while let Ok(event) = events_rx.pop() {
+                match event {
+                    RtEvent::EndReached => {
+                        let was_playing = eng.state() == State::Playing;
+                        let cmds = eng.handle(Command::EndReached, &mut midi_out);
+                        let now_playing = eng.state() == State::Playing;
+                        // Still Playing on both sides of the call = the
+                        // gapless-auto-advance branch fired (the only way
+                        // EndReached doesn't move to Ended); install the
+                        // held next song before its Seek(0)/Start land.
+                        if was_playing && now_playing {
+                            if let Some(held) = held_next.take() {
+                                let _ = song_tx.push(held.mixer);
+                                schedulers = held.schedulers;
+                            }
+                        }
+                        for cmd in cmds {
+                            dispatch_rt(
+                                cmd,
+                                &mut playing,
+                                &mut schedulers,
+                                &mut tx,
+                                epoch,
+                                verbose,
+                            );
+                        }
                     }
                 }
             }
@@ -252,6 +399,65 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Apply one `RtCommand`'s control-thread side effects (verbose logging,
+/// local `playing`/scheduler-cursor bookkeeping) and forward it to the RT
+/// audio thread. A plain function rather than a closure over `run`'s locals:
+/// it's called from two places (the MIDI-driven path and the
+/// EndReached-driven gapless-advance path), and a long-lived closure
+/// capturing `schedulers` by `&mut` would conflict with the plain
+/// reassignments (`schedulers = loaded.schedulers`) elsewhere in the loop.
+/// Portable (no ALSA types) so it's type-checked on the dev Mac even though
+/// its only caller, `run`, is `cfg(linux)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn dispatch_rt(
+    cmd: crate::engine::RtCommand,
+    playing: &mut bool,
+    schedulers: &mut [crate::scheduler::PortScheduler],
+    tx: &mut crate::engine::RtProducer,
+    epoch: std::time::Instant,
+    verbose: bool,
+) {
+    use crate::engine::RtCommand;
+
+    match cmd {
+        RtCommand::Start => {
+            *playing = true;
+            if verbose {
+                println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
+            }
+        }
+        RtCommand::Stop => {
+            *playing = false;
+            if verbose {
+                println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
+            }
+        }
+        // Rewind: realign the output cursors with the audio.
+        RtCommand::Seek(pos) => {
+            for sched in schedulers.iter_mut() {
+                sched.seek(pos);
+            }
+        }
+        RtCommand::ToggleMute(pair) => {
+            if verbose {
+                println!(
+                    "[mute] pair {pair} wall={:.3}s",
+                    epoch.elapsed().as_secs_f64()
+                );
+            }
+        }
+        RtCommand::SetDsp(pair, param, value) => {
+            if verbose {
+                println!(
+                    "[dsp] pair {pair} {param:?}={value} wall={:.3}s",
+                    epoch.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+    let _ = tx.push(cmd);
 }
 
 #[cfg(test)]
@@ -300,5 +506,79 @@ mod tests {
     fn system_common_cancels_running_status() {
         // After a SysEx-ish 0xF0/0xF7, a lone data byte must not be misread.
         assert_eq!(parse_all(&[0x90, 60, 100, 0xF7, 62]), vec![(0x90, 60, 100)]);
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Write a tiny valid bundle (mirrors `play::tests::write_bundle`) so
+    /// `load_song_payload` has something real to load.
+    fn write_bundle(frames: u32) -> std::path::PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("turtle-control-{}-{}", std::process::id(), n));
+        let stems = dir.join("songs/opener/stems");
+        std::fs::create_dir_all(&stems).unwrap();
+
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(stems.join("pair1.wav"), spec).unwrap();
+        for _ in 0..frames {
+            w.write_sample(1000i32).unwrap(); // L
+            w.write_sample(1000i32).unwrap(); // R
+        }
+        w.finalize().unwrap();
+
+        std::fs::write(
+            dir.join("show.toml"),
+            "[show]\nname = \"B\"\nplayback_rate = 48000\n\
+             [audio]\ndevice = \"hw:0\"\n\
+             [[destinations]]\nname = \"lights\"\nport = \"CME:1\"\n\
+             [control]\ninput_port = \"x\"\nselect_channel = 1\n\
+             start = { type = \"note\", note = 60 }\n\
+             stop = { type = \"note\", note = 61 }\n\
+             next = { type = \"note\", note = 62 }\n\
+             prev = { type = \"note\", note = 63 }\n\
+             panic = { type = \"note\", note = 65 }\n\
+             mute = { type = \"note\", notes = [72, 73, 74, 75] }\n\
+             [[setlist]]\npc = 0\nsong = \"opener\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("songs/opener/song.toml"),
+            format!(
+                "[song]\nname = \"O\"\nbpm = 120.0\nlength_samples = {frames}\n\
+                 [[pairs]]\nindex = 0\nfile = \"stems/pair1.wav\"\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_song_payload_loads_stems_and_schedulers() {
+        let dir = write_bundle(64);
+        let loaded = load_song_payload(&dir, "opener", 48_000).unwrap();
+        assert_eq!(loaded.mixer.position(), 0);
+        // One destination in this bundle, no MIDI file for it — an empty
+        // (not missing) scheduler, matching `load_schedulers`' contract.
+        assert_eq!(loaded.schedulers.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_song_payload_errors_on_missing_song() {
+        let dir = write_bundle(64);
+        // `unwrap_err` would require `LoadedSong: Debug` (it isn't, same
+        // reason `play::tests` avoids it for `Playable`); match instead.
+        let err = match load_song_payload(&dir, "nope", 48_000) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing song"),
+        };
+        assert!(err.contains("nope"), "error should name the song: {err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
