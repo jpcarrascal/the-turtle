@@ -14,7 +14,12 @@
 use crate::model::{SetlistEntry, Show};
 
 /// Discrete transport state (spec §8, mirrored by the GPIO status LED in §8.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because this crosses the control socket verbatim
+/// in [`crate::proto::Status`]; `rename_all` keeps the wire form lowercase
+/// (`"playing"`) rather than Rust's `"Playing"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum State {
     /// No song selected.
     Idle,
