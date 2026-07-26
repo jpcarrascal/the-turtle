@@ -263,6 +263,44 @@ journalctl -u turtled -b | grep sched
 `systemctl status` shows the daemon's own status line (`armed "MyShow"`), because
 the unit is `Type=notify` and `turtled` reports it.
 
+### Upgrading once it runs as a service
+
+Pulling a new version is no longer just `cargo build` — the binary in
+`/usr/local/bin` is a *copy*, and the running service is holding it:
+
+```bash
+cd ~/the-turtle
+git pull
+cargo build --release -p turtled -p turtle-cli
+
+# Stop first. Replacing an executable that is currently running fails
+# ("Text file busy"), and stopping is instant here anyway.
+sudo systemctl stop turtled
+sudo install -m755 target/release/turtled target/release/turtle /usr/local/bin/
+sudo systemctl start turtled
+
+systemctl status turtled          # armed, and on the new build
+```
+
+Two things that will bite otherwise:
+
+- **If a unit file changed**, re-copy it and `sudo systemctl daemon-reload` before
+  starting — systemd caches unit files, so an edited `turtled.service` is ignored
+  until you do. Note that `systemctl edit --full` copies the unit into
+  `/etc/systemd/system/`, so a later `git pull` does **not** update it; re-apply
+  your `ExecStart` path after copying a new version in.
+- **If you enabled the read-only overlay**, none of the above persists across a
+  reboot. Disable the overlay (`raspi-config`), upgrade, re-enable.
+
+To go back to a hand-started daemon for debugging, stop the service first — two
+`turtled` processes would fight over the audio device, and the second would fail to
+bind the control socket:
+
+```bash
+sudo systemctl stop turtled
+./target/release/turtled control /media/shows/Tone.turtle -v
+```
+
 ### Why `Type=notify` and not `simple`
 
 With `Type=simple`, systemd calls the unit started the moment `execve` returns —
@@ -359,8 +397,28 @@ Note the stems live on the USB SSD, not the overlay, so bundle size is unaffecte
 
 ## CPU tuning: governor, threadirqs, isolcpus (§12)
 
-The last of §12's tuning. All of it is **optional** — the show plays without any
-of it — and all of it is worth doing on a box you intend to trust on stage.
+The last of §12's tuning, and the part you are most likely to skip.
+
+**Read this before doing any of it.** The main defence against xruns in this design
+is not tuning at all — it is the **large audio buffers** (§3.1). Latency is
+irrelevant here, so we run 1024-frame buffers, which already absorb the delays this
+section guards against. What follows is insurance on top, and it is not all worth
+the same:
+
+| | Cost | Recommendation |
+|---|---|---|
+| **Governor** → `performance` | One command, reversible | Worth it. Removes clock-ramp jitter for free. |
+| **`threadirqs`** | Kernel cmdline + reboot | Optional. Modest benefit. |
+| **`isolcpus`** | Kernel cmdline + reboot; surrenders a core | **Skip unless you observe xruns.** |
+
+`isolcpus` is deliberately last and deliberately discouraged: it is the most
+invasive change here (a malformed `cmdline.txt` is a Pi that will not boot) and it
+permanently gives a quarter of the CPU to one thread that, on an otherwise-idle Pi
+4 with large buffers, very likely does not need it. Reach for it when you are
+*diagnosing* xruns, not in advance.
+
+`turtled` needs no configuration either way — it adapts to whatever you have done
+(or not done) and reports it.
 
 `turtled` prints what it observes at startup, so this is also how you check the
 tuning took:
