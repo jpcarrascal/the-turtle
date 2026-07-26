@@ -303,6 +303,8 @@ whole kernel wedges, enable the Pi's hardware watchdog so the board resets itsel
 echo 'dtparam=watchdog=on' | sudo tee -a /boot/firmware/config.txt
 
 # Hand it to systemd: it pets the hardware watchdog while the system is healthy.
+# The drop-in directory does not exist on a fresh install, hence the mkdir.
+sudo mkdir -p /etc/systemd/system.conf.d
 sudo tee /etc/systemd/system.conf.d/10-watchdog.conf >/dev/null <<'EOF'
 [Manager]
 RuntimeWatchdogSec=10
@@ -310,7 +312,25 @@ RebootWatchdogSec=2min
 EOF
 ```
 
-After a reboot, `wdctl` shows the device and its timeout.
+Both changes need a **reboot**: `dtparam` is read by the firmware at boot, and
+`RuntimeWatchdogSec` is picked up by PID 1 at startup (`daemon-reload` will not
+do it — that only rereads unit files, not systemd's own config). Afterwards:
+
+```bash
+# The device, its timeout, and who is petting it.
+wdctl
+
+# Confirm PID 1 actually took the setting (10s = 10000000us).
+systemctl show -p RuntimeWatchdogUSec
+```
+
+If `wdctl` reports no device, `dtparam=watchdog=on` did not take — check it
+landed in `/boot/firmware/config.txt` and not an older `/boot/config.txt`.
+
+> **This is a different watchdog from the service one.** `WatchdogSec=` in the
+> unit catches a wedged `turtled` and restarts *the daemon*; this one catches a
+> wedged **kernel** and resets *the board*. The service watchdog needs systemd
+> alive to act, which is exactly what this covers for.
 
 ### Read-only rootfs (§12)
 
