@@ -105,6 +105,13 @@ pub fn check_audio(device: &str, rate: u32) -> Vec<Check> {
             ));
         }
     }
+    // As with MIDI below: fragile tomorrow even if it opened fine today.
+    if looks_index_based(device) {
+        checks.push(Check::warn(
+            format!("\"{device}\" is an index-based ALSA name — it changes when devices are replugged"),
+            "use the stable form instead: hw:CARD=<id>, with <id> from /proc/asound/cards",
+        ));
+    }
     checks
 }
 
@@ -160,6 +167,26 @@ pub fn check_midi(destinations: &[Destination], input_port: &str) -> Vec<Check> 
             "logical-label resolution is not implemented yet — use the real ALSA name from `amidi -l`",
         ));
     }
+
+    // Deliberately reported even when the port resolved *fine*. An index-based
+    // name is not wrong today, it is fragile tomorrow: the whole point is to warn
+    // before the next reboot renumbers the cards and turns this into a show that
+    // will not start.
+    let fragile: Vec<&str> = destinations
+        .iter()
+        .map(|d| d.port.as_str())
+        .chain(std::iter::once(input_port))
+        .filter(|p| looks_index_based(p))
+        .collect();
+    if !fragile.is_empty() {
+        checks.push(Check::warn(
+            format!(
+                "index-based ALSA name(s) in use ({}) — these change when devices are replugged or the machine reboots",
+                fragile.join(", ")
+            ),
+            "use the stable form instead: hw:CARD=<id>,DEV=0,SUBDEV=0, with <id> from /proc/asound/cards",
+        ));
+    }
     checks
 }
 
@@ -173,6 +200,29 @@ pub fn check_midi(destinations: &[Destination], input_port: &str) -> Vec<Check> 
 #[cfg(any(target_os = "linux", test))]
 fn looks_logical(port: &str) -> bool {
     port.contains(':') && !port.starts_with("hw:") && !port.starts_with("plughw:")
+}
+
+/// Is this an **index-based** ALSA name like `hw:1,0,0` rather than a name-based
+/// one like `hw:CARD=H4MIDIWC,DEV=0`?
+///
+/// Worth calling out separately from "not found", because index-based names are a
+/// trap rather than a typo: ALSA assigns card *indices* in enumeration order, so
+/// they change when devices are replugged or the machine reboots in a different
+/// order. A config that worked yesterday fails today with no edit, and
+/// `turtled` treats a missing MIDI *input* as fatal — so the whole show refuses
+/// to start. Card *ids* are stable, which is why `hw:CARD=...` is the right form.
+#[cfg(any(target_os = "linux", test))]
+fn looks_index_based(port: &str) -> bool {
+    let Some(rest) = port
+        .strip_prefix("hw:")
+        .or_else(|| port.strip_prefix("plughw:"))
+    else {
+        return false;
+    };
+    // `hw:CARD=x` is the stable form; `hw:1,0,0` (or `hw:1`) is the fragile one.
+    // Testing the first character for a digit distinguishes them without having
+    // to parse the whole address.
+    rest.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Are the RT privileges available — `rtprio` for `SCHED_FIFO`, `memlock` for
@@ -278,5 +328,25 @@ mod tests {
         assert!(!looks_logical("plughw:CARD=CME"));
         // No colon at all: not a logical label, just a name that was not found.
         assert!(!looks_logical("bogus"));
+    }
+
+    /// The distinction that matters: an index-based name works until the next
+    /// reboot renumbers the cards, so it must be told apart from the stable
+    /// `CARD=` form even though both start with `hw:`.
+    #[test]
+    fn index_based_names_are_told_apart_from_stable_ones() {
+        // Fragile: these are what shift on replug.
+        assert!(looks_index_based("hw:1,0,0"));
+        assert!(looks_index_based("hw:0,0,0"));
+        assert!(looks_index_based("hw:2"));
+        assert!(looks_index_based("plughw:1,0"));
+        // Stable: addressed by card id.
+        assert!(!looks_index_based("hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0"));
+        assert!(!looks_index_based("hw:CARD=HXStomp"));
+        assert!(!looks_index_based("plughw:CARD=CME"));
+        // Not an ALSA hw address at all.
+        assert!(!looks_index_based("CME:1"));
+        assert!(!looks_index_based("virtual"));
+        assert!(!looks_index_based("null"));
     }
 }
