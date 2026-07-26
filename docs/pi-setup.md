@@ -2,8 +2,13 @@
 
 How to bring up a Pi for The Turtle and build/run the daemon: flashing the OS,
 building, the [ALSA backend](#alsa-backend), [real-time
-priorities](#real-time-thread-priorities-3), and
-[running it as a service](#running-as-a-service-12).
+priorities](#real-time-thread-priorities-3),
+[running it as a service](#running-as-a-service-12), and
+[CPU tuning](#cpu-tuning-governor-threadirqs-isolcpus-12).
+
+Everything from "real-time priorities" onwards is **optional tuning** — the show
+plays without any of it. Do the read-only rootfs step last of all, since it makes
+further changes not persist.
 
 ## 1. Flash the OS
 
@@ -344,16 +349,127 @@ The goal is that a yanked power cord mid-set cannot corrupt anything. Two layers
   partition read-only. Writes then land in a RAM overlay and are discarded at
   reboot.
 
-Do this **last**, once the show runs. With the overlay on, changes do not
-persist — including the unit file edits above — so develop first and seal
-afterwards. To make a change later, disable the overlay, edit, re-enable.
+Do this **genuinely last** — after the show runs *and* after the
+[CPU tuning](#cpu-tuning-governor-threadirqs-isolcpus-12) below, which edits
+`cmdline.txt` and installs another unit. With the overlay on, changes do not
+persist, so develop first and seal afterwards. To make a change later, disable the
+overlay, edit, re-enable.
 
 Note the stems live on the USB SSD, not the overlay, so bundle size is unaffected.
 
-### Remaining tuning
+## CPU tuning: governor, threadirqs, isolcpus (§12)
 
-`cpu governor=performance`, `threadirqs`, and `isolcpus` for the audio core are
-not wired up yet and are a later pass.
+The last of §12's tuning. All of it is **optional** — the show plays without any
+of it — and all of it is worth doing on a box you intend to trust on stage.
+
+`turtled` prints what it observes at startup, so this is also how you check the
+tuning took:
+
+```
+[sched] cpu: governor performance, isolated CPUs [3]
+```
+
+versus an untuned box:
+
+```
+[sched] cpu: governor ondemand, no isolated CPUs (isolcpus not set)
+```
+
+### 1. CPU governor → `performance`
+
+The default `ondemand` governor raises the clock *in response to* load, which is
+the wrong shape for audio: the ramp latency lands on the first periods after a
+quiet passage, and the frequency transitions add jitter of their own. Install the
+oneshot unit that pins the cores at full clock:
+
+```bash
+sudo cp deploy/turtle-tuning.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now turtle-tuning
+journalctl -u turtle-tuning     # "governor now: performance"
+```
+
+It is a **separate unit from `turtled` on purpose**: writing the governor needs
+root, and `turtled` deliberately runs unprivileged with `NoNewPrivileges=true`.
+Hoisting the one privileged action into a unit that runs once and exits is better
+than granting the daemon — the process exposed to a control socket and to stem
+files — the privilege to keep. `turtled.service` only `Wants=` it, so a failure
+here never stops a show.
+
+On a Pi 4 this means four cores at full clock: a heat and power question, not a
+stability one, and this is a mains-powered appliance.
+
+### 2. `threadirqs` — make IRQ handling preemptible
+
+By default, hard IRQ handlers run in a context your `SCHED_FIFO` thread cannot
+preempt. `threadirqs` moves them into kernel threads (priority 50, below our 80),
+so a burst of USB or network interrupt work can no longer delay an audio period.
+
+### 3. `isolcpus` — give the audio thread a core of its own
+
+**`isolcpus` alone does nothing for us.** It removes a core from the general
+scheduler, but no thread lands there unless explicitly placed — so without the
+matching affinity call it reserves a core that simply goes unused. `turtled` does
+the pinning: at startup it reads `/sys/devices/system/cpu/isolated` and pins the
+audio thread to the highest isolated CPU, so **the kernel parameter is all you
+have to configure.** Nothing to pass, and nothing happens if you skip it.
+
+Both settings are kernel command line. Edit `/boot/firmware/cmdline.txt` — it is a
+**single line**; append to it, do not add new lines:
+
+```bash
+sudo cp /boot/firmware/cmdline.txt /boot/firmware/cmdline.txt.bak
+# Append to the existing line. isolcpus=3 reserves the last of the Pi 4's 4 cores.
+sudo sed -i '1 s/$/ threadirqs isolcpus=3/' /boot/firmware/cmdline.txt
+cat /boot/firmware/cmdline.txt      # eyeball it before rebooting
+sudo reboot
+```
+
+> A malformed `cmdline.txt` can leave the Pi unbootable, which is why the backup
+> above is worth the two seconds. Recovery is to mount the SD card's boot
+> partition on another machine and restore `cmdline.txt.bak`.
+
+After the reboot:
+
+```bash
+cat /sys/devices/system/cpu/isolated        # 3
+grep -o 'threadirqs' /proc/cmdline          # threadirqs
+
+# The audio thread should now be alone on CPU 3. PSR is the CPU it last ran on.
+ps -Lo pid,tid,cls,rtprio,psr,comm -p "$(pgrep turtled)"
+```
+
+`turtled` logs `[sched] audio thread: pinned to CPU 3` when it takes effect.
+
+### Overriding the pinning
+
+Auto-detection is the default; both overrides exist for diagnosis:
+
+```bash
+turtled control <bundle> --audio-cpu none    # never pin, even with isolcpus set
+turtled control <bundle> --audio-cpu 2       # pin to a specific core
+```
+
+`--audio-cpu none` is the useful one: it isolates whether a glitch is
+pinning-related, on a box where `isolcpus` is configured.
+
+### Is any of this worth it? Measure.
+
+The honest answer is that these help under *load*, and the whole point of the
+large buffers (§3.1) is to make the unloaded case fine already. To find out on
+your hardware, load the Pi while a song plays and compare:
+
+```bash
+# In one shell: four spinners plus some I/O, roughly a worst-case stage moment.
+for i in 1 2 3 4; do (while :; do :; done) & done; sudo apt-get -qq update
+
+# In another, A/B the tuning:
+turtled control ~/Tone.turtle                          # fully tuned
+turtled control ~/Tone.turtle --rt-prio 0 --audio-cpu none   # fully untuned
+kill %1 %2 %3 %4
+```
+
+If both are clean, you have headroom — good, and worth knowing before you need it.
 
 ## Faster iteration (later)
 
