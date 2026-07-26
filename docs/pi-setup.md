@@ -1,8 +1,9 @@
 # Raspberry Pi setup
 
-How to bring up a Pi for The Turtle and build/run the daemon. This covers the
-host-independent core that compiles today; the Linux-only ALSA backend (§2/§3
-of `turtle-spec.md`) is not written yet — see [When we add ALSA](#when-we-add-alsa).
+How to bring up a Pi for The Turtle and build/run the daemon: flashing the OS,
+building, the [ALSA backend](#alsa-backend), [real-time
+priorities](#real-time-thread-priorities-3), and
+[running it as a service](#running-as-a-service-12).
 
 ## 1. Flash the OS
 
@@ -133,7 +134,7 @@ sudo apt install -y libasound2-dev
 ```
 
 Still to come before it is show-ready: resolving logical port labels
-(`"CME:1"`) to ALSA `hw:` device names, GPIO (§8.1), and the systemd unit (§12).
+(`"CME:1"`) to ALSA `hw:` device names, and GPIO (§8.1).
 
 ## Real-time thread priorities (§3)
 
@@ -160,7 +161,20 @@ warning: audio thread stays at normal priority: pthread_setschedparam(...)
          limit in /etc/security/limits.conf)
 ```
 
-To grant it, give your user an `rtprio` limit:
+`turtled` also locks its memory (`mlockall`) at startup, for a related but
+distinct reason: priority decides who gets the CPU, but a **page fault** stalls
+you regardless of priority, because you are waiting on the SD card rather than on
+the scheduler. Expect a third line, `[sched] memory locked (mlockall)`.
+`--rt-prio 0` turns off both, so it is a genuinely untuned baseline to A/B
+against.
+
+> **Running as a service? Skip this next part.** `limits.conf` is applied by PAM
+> at *login*, and a systemd service has no login session — so the file below does
+> nothing for `turtled.service`. The unit grants the same two privileges with
+> `LimitRTPRIO=` and `LimitMEMLOCK=` instead. You only need the limits file for
+> running `turtled` by hand from a shell.
+
+To grant it for hand-started runs, give your user an `rtprio` limit:
 
 ```bash
 # Allow RT priorities up to 95 for your login user.
@@ -194,8 +208,152 @@ scheduling-related — start with RT off:
 ./target/release/turtled control ~/Tone.turtle --rt-prio 60    # custom priority
 ```
 
-The remaining §12 system tuning (`cpu governor=performance`, `threadirqs`,
-`isolcpus`) is not wired up yet and is a later pass.
+## Running as a service (§12)
+
+Up to here `turtled` has been started by hand. The appliance model wants it to
+come up on boot, restart itself, and be recoverable when it wedges — that is
+`deploy/turtled.service`.
+
+### Install
+
+```bash
+# A dedicated unprivileged user. `audio` group for ALSA device access; no shell
+# and no home, because it never logs in.
+sudo useradd -r -g audio -s /usr/sbin/nologin turtle
+
+# The binaries somewhere outside your home directory (the unit sets
+# ProtectHome=true, so /home is invisible to the service).
+sudo install -m755 target/release/turtled target/release/turtle /usr/local/bin/
+
+# Bundles where the unit expects them, readable by the service user. Note this
+# is a *copy*, not a path change: a bundle left in your home directory will not
+# work, because ProtectHome=true makes /home invisible to the service (the
+# failure looks like "bundle not found" for a bundle you can plainly see).
+sudo mkdir -p /media/shows
+sudo cp -r ~/Tone.turtle /media/shows/
+sudo chown -R turtle:audio /media/shows
+
+sudo cp deploy/turtled.service /etc/systemd/system/
+# Edit ExecStart's bundle path to match what you just copied.
+sudo systemctl edit --full turtled
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now turtled
+```
+
+`/media/shows` is where the USB SSD is expected to be mounted (§12), but nothing
+here requires that yet — a plain directory on the SD card works for testing. The
+unit's `RequiresMountsFor=` adds a dependency on whatever mount actually covers
+the path, so it is satisfied either way.
+
+Check it came up, and that the two privileges landed:
+
+```bash
+systemctl status turtled
+systemctl show turtled -p LimitRTPRIO -p LimitMEMLOCK -p WatchdogUSec
+# Expect: LimitRTPRIO=95  LimitMEMLOCK=infinity  WatchdogUSec=15s
+journalctl -u turtled -b | grep sched
+```
+
+`systemctl status` shows the daemon's own status line (`armed "MyShow"`), because
+the unit is `Type=notify` and `turtled` reports it.
+
+### Why `Type=notify` and not `simple`
+
+With `Type=simple`, systemd calls the unit started the moment `execve` returns —
+before the stems are loaded or the transport is armed. `turtled` instead sends
+`READY=1` only once it can actually serve a request, so `systemctl start` blocks
+until the show is genuinely ready, and a start-up failure reads as a failed start
+rather than "started, then crashed".
+
+### The watchdog is the part worth understanding
+
+`Restart=always` can only notice a process that *exited*. A deadlocked audio
+thread or a wedged control loop leaves the process very much alive, and on stage
+that is indistinguishable from a dead one. So `turtled` pings systemd from **the
+control loop itself** — the same loop that dispatches MIDI — which is what makes
+a successful ping mean "the show is still running" rather than merely "a thread is
+still alive". Miss the 15 s deadline and systemd aborts and restarts it.
+
+To see it work, pause the process so the loop stops pinging:
+
+```bash
+sudo kill -STOP "$(systemctl show -P MainPID turtled)"
+journalctl -u turtled -f      # within ~15 s: "Watchdog timeout (limit 15s)!"
+                              # then: "Scheduled restart job"
+systemctl show -P NRestarts turtled    # should have incremented
+```
+
+### The control socket moves
+
+The unit sets `TURTLE_SOCKET=/run/turtle/control.sock` and creates that directory
+via `RuntimeDirectory=`, so a crash cannot leave a stale socket behind and it
+works on a read-only rootfs. Both `turtled` and the `turtle` CLI read
+`TURTLE_SOCKET`, and the CLI additionally *searches* — the system path first, then
+`/tmp/turtle.sock` — so plain `turtle status` over SSH finds whichever daemon is
+running with no flag either way.
+
+### Hardware watchdog (survives a kernel hang)
+
+The service watchdog above needs systemd alive to act. For the case where the
+whole kernel wedges, enable the Pi's hardware watchdog so the board resets itself:
+
+```bash
+# Broadcom watchdog device
+echo 'dtparam=watchdog=on' | sudo tee -a /boot/firmware/config.txt
+
+# Hand it to systemd: it pets the hardware watchdog while the system is healthy.
+# The drop-in directory does not exist on a fresh install, hence the mkdir.
+sudo mkdir -p /etc/systemd/system.conf.d
+sudo tee /etc/systemd/system.conf.d/10-watchdog.conf >/dev/null <<'EOF'
+[Manager]
+RuntimeWatchdogSec=10
+RebootWatchdogSec=2min
+EOF
+```
+
+Both changes need a **reboot**: `dtparam` is read by the firmware at boot, and
+`RuntimeWatchdogSec` is picked up by PID 1 at startup (`daemon-reload` will not
+do it — that only rereads unit files, not systemd's own config). Afterwards:
+
+```bash
+# The device, its timeout, and who is petting it.
+wdctl
+
+# Confirm PID 1 actually took the setting (10s = 10000000us).
+systemctl show -p RuntimeWatchdogUSec
+```
+
+If `wdctl` reports no device, `dtparam=watchdog=on` did not take — check it
+landed in `/boot/firmware/config.txt` and not an older `/boot/config.txt`.
+
+> **This is a different watchdog from the service one.** `WatchdogSec=` in the
+> unit catches a wedged `turtled` and restarts *the daemon*; this one catches a
+> wedged **kernel** and resets *the board*. The service watchdog needs systemd
+> alive to act, which is exactly what this covers for.
+
+### Read-only rootfs (§12)
+
+The goal is that a yanked power cord mid-set cannot corrupt anything. Two layers:
+
+- **The service** already writes nowhere: the unit sets `ProtectSystem=strict`,
+  so even `/media/shows` is read-only to it, and the only writable path is the
+  socket directory. That holds whether or not you do the next part.
+- **The SD card** via an overlay: `sudo raspi-config` →
+  *Performance Options* → *Overlay File System* → enable, and also set the boot
+  partition read-only. Writes then land in a RAM overlay and are discarded at
+  reboot.
+
+Do this **last**, once the show runs. With the overlay on, changes do not
+persist — including the unit file edits above — so develop first and seal
+afterwards. To make a change later, disable the overlay, edit, re-enable.
+
+Note the stems live on the USB SSD, not the overlay, so bundle size is unaffected.
+
+### Remaining tuning
+
+`cpu governor=performance`, `threadirqs`, and `isolcpus` for the audio core are
+not wired up yet and are a later pass.
 
 ## Faster iteration (later)
 

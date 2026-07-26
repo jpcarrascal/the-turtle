@@ -144,6 +144,11 @@ pub fn run(
     use crate::engine::{rt_channel, rt_event_channel, RtCommand};
     use crate::mixer::song_channel;
 
+    // Before the stems are allocated, so `MCL_FUTURE` covers them (§12). Tied to
+    // the same switch as thread priority, so `--rt-prio 0` is a fully untuned
+    // baseline to A/B against.
+    crate::sched::lock_memory_or_warn(rt_priority.is_some());
+
     let Playable { show, mut mixer, frames, song_dir } = load_playable(bundle, song)?;
     let rate = show.show.playback_rate;
 

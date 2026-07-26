@@ -1,4 +1,9 @@
-//! `SCHED_FIFO` real-time thread priorities (spec §3, §12).
+//! Real-time tuning: `SCHED_FIFO` thread priorities and `mlockall` (spec §3, §12).
+//!
+//! Two independent things can stall an audio period, and this module does both:
+//! [`apply_or_warn`] stops *other tasks* from taking the CPU, and
+//! [`lock_memory_or_warn`] stops the *kernel* from making us wait on a page
+//! fault. Priority alone is only half the job — see [`lock_memory`].
 //!
 //! The spec's thread table asks for the audio loop and the MIDI scheduler to run
 //! under `SCHED_FIFO` while the control and loader threads stay at normal
@@ -139,6 +144,81 @@ pub fn set_current_thread_fifo(_priority: u8) -> Result<(), String> {
     ))
 }
 
+/// Pin the whole process's memory into RAM with `mlockall` (§12).
+///
+/// # Why this is not the same thing as `SCHED_FIFO`
+///
+/// Priority decides *who gets the CPU*. A **page fault** is an orthogonal stall:
+/// if a page of code or data is not resident — swapped out, or lazily mapped and
+/// never yet touched — touching it traps into the kernel and may go to the SD
+/// card. Being priority 80 does not help at all, because the thread is not
+/// waiting for CPU, it is blocked on I/O. That is exactly the tens of
+/// milliseconds an xrun is made of, so RT scheduling without this is only half
+/// the job.
+///
+/// `MCL_CURRENT | MCL_FUTURE` locks what is mapped now *and* keeps locking new
+/// mappings, which is what makes it safe to call before the stems are loaded:
+/// their buffers are covered as they are allocated.
+///
+/// # The cost, and the failure mode to know about
+///
+/// Locked pages are committed RAM that the kernel can never reclaim — fine for a
+/// single-purpose appliance, and the reason the unit sets
+/// `LimitMEMLOCK=infinity`. With a *finite* limit, `MCL_FUTURE` turns a large
+/// later allocation (a background stem preload) into a hard `ENOMEM` rather than
+/// a slow one, which surfaces as a stem-load failure. That is a defined
+/// degradation per §12 — refuse to arm and signal the error — but it is why the
+/// limit must not be left at its small default.
+#[cfg(target_os = "linux")]
+pub fn lock_memory() -> Result<(), String> {
+    // SAFETY: a flags-only call with no pointer arguments; it either succeeds or
+    // sets errno, and cannot invalidate anything Rust is holding.
+    let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+    if rc == 0 {
+        return Ok(());
+    }
+    // Unlike `pthread_setschedparam`, this is a conventional syscall wrapper:
+    // it returns -1 and puts the reason in `errno`.
+    let err = std::io::Error::last_os_error();
+    let hint = match err.raw_os_error() {
+        Some(libc::ENOMEM) | Some(libc::EPERM) => {
+            " (need a memlock rlimit — LimitMEMLOCK=infinity, or memlock in limits.conf)"
+        }
+        _ => "",
+    };
+    Err(format!("mlockall failed: {err}{hint}"))
+}
+
+/// Non-Linux stub, mirroring [`set_current_thread_fifo`]: memory locking is a
+/// deployment concern for the Pi.
+#[cfg(not(target_os = "linux"))]
+pub fn lock_memory() -> Result<(), String> {
+    Err(format!(
+        "mlockall is Linux-only (this host is {})",
+        std::env::consts::OS
+    ))
+}
+
+/// Lock memory and report the outcome, never failing the caller.
+///
+/// Best-effort for the same reason as [`apply_or_warn`]: paging is a *tuning*
+/// concern, and §12 says the show must never refuse to play over one. Tied to
+/// the same `rt` switch, so `--rt-prio 0` gives a completely untuned process to
+/// A/B against rather than a half-tuned one.
+pub fn lock_memory_or_warn(enabled: bool) {
+    if !enabled {
+        println!("[sched] memory not locked (RT disabled)");
+        return;
+    }
+    match lock_memory() {
+        Ok(()) => println!("[sched] memory locked (mlockall)"),
+        Err(e) => eprintln!(
+            "warning: memory stays pageable: {e}\n\
+             \x20        audio may glitch if pages are evicted under memory pressure"
+        ),
+    }
+}
+
 /// Apply `SCHED_FIFO` and report the outcome, never failing the caller.
 ///
 /// The one place the "RT priority is best-effort" policy lives, so the audio and
@@ -200,5 +280,38 @@ mod tests {
     fn a_minimal_priority_saturates_instead_of_wrapping() {
         assert_eq!(midi_priority_for(1), 1);
         assert_eq!(midi_priority_for(3), 1);
+    }
+
+    /// `mlockall` either works or fails for one of the two documented reasons —
+    /// and the message must say how to fix it, because the whole point of the
+    /// best-effort policy is that the operator can act on the warning.
+    ///
+    /// Deliberately asserts the *contract* rather than success, so it passes both
+    /// with the privilege (a tuned Pi, a privileged container) and without it (a
+    /// plain container, an unprivileged user) instead of being a test that only
+    /// holds on one machine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn locking_memory_either_succeeds_or_explains_itself() {
+        // Printed (visible under `--nocapture`) so it is possible to tell which
+        // branch a given machine actually took — otherwise a test that accepts
+        // both outcomes cannot be shown to have exercised either.
+        match lock_memory() {
+            Ok(()) => {
+                eprintln!("mlockall: succeeded on this host");
+                // Undo it immediately: this test process is not the daemon, and
+                // leaving MCL_FUTURE set could make a later allocation in another
+                // test fail under a small memlock limit.
+                // SAFETY: a no-argument call that only relaxes what we just did.
+                unsafe { libc::munlockall() };
+            }
+            Err(e) => {
+                eprintln!("mlockall: refused on this host: {e}");
+                assert!(
+                    e.contains("memlock"),
+                    "the failure must name the limit to raise, got: {e}"
+                );
+            }
+        }
     }
 }

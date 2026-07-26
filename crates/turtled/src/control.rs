@@ -214,12 +214,21 @@ pub fn run(
     use crate::engine::{rt_channel, rt_event_channel, Engine, RtEvent};
     use crate::mixer::song_channel;
     use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
-    use crate::{rt, sched, socket};
+    use crate::{notify, rt, sched, socket};
 
     // Resolve both thread priorities up front, so the ordering invariant
     // (audio > midi) is established in one place rather than at two spawn sites.
     let audio_priority = rt_priority;
     let midi_priority = rt_priority.map(sched::midi_priority_for);
+
+    // Lock memory before anything large is allocated. Process-wide, so unlike the
+    // per-thread priority calls this belongs here rather than at a spawn site;
+    // `MCL_FUTURE` means the stems loaded below are covered as they arrive (§12).
+    sched::lock_memory_or_warn(rt_priority.is_some());
+
+    // systemd, if it started us. A no-op from a shell, so there is no branch on
+    // "are we a service" anywhere below (§12).
+    let mut sd = notify::Notifier::from_env();
 
     // Reuse the play path's loader: preload the chosen (or first) song's stems.
     let Playable {
@@ -324,6 +333,13 @@ pub fn run(
         show.control.input_port,
         socket_path.display()
     );
+
+    // Only *now* is `READY=1` honest: stems loaded, audio device open, socket
+    // bound, transport armed. Sending it from `main` would let systemd release
+    // anything ordered after us while we were still loading, and would turn a
+    // start-up failure into "started, then crashed" (§12).
+    sd.ready(&format!("armed \"{}\"", show.show.name));
+    println!("[systemd] {}", notify::describe(&sd));
 
     std::thread::scope(|s| {
         // Same ownership split as the play path: move the !Sync audio + mixer +
@@ -599,6 +615,13 @@ pub fn run(
                     snap.armed_next = armed_next_song.clone();
                 }
             }
+
+            // Tell systemd the loop is still turning (§12). Deliberately from
+            // *this* loop and not a timer thread: a timer would keep pinging
+            // while the loop that actually dispatches MIDI was wedged, proving
+            // only that the timer lives. Cheap enough for a 1 ms tick — with no
+            // watchdog configured it is one `Instant` comparison.
+            sd.watchdog_tick();
 
             std::thread::sleep(Duration::from_millis(1));
         }
