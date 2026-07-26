@@ -270,7 +270,12 @@ Pulling a new version is no longer just `cargo build` — the binary in
 
 ```bash
 cd ~/the-turtle
-git pull
+
+# Merged already? Pull main. Testing an unmerged PR? Check its branch out
+# instead -- `git pull` on main will NOT have it, and the failure is confusing:
+# a missing deploy/ file, or a binary silently lacking the new behaviour.
+git pull                          # ...or: git fetch && git checkout <branch>
+
 cargo build --release -p turtled -p turtle-cli
 
 # Stop first. Replacing an executable that is currently running fails
