@@ -329,7 +329,39 @@ fn read_trimmed(path: &str) -> Option<String> {
 }
 
 /// Is a daemon up, and what does it think it is doing?
+///
+/// The three outcomes are deliberately distinguished, because they call for
+/// completely different actions and the middle one used to be misreported as the
+/// first — which sent you looking for a dead daemon that was running fine.
 fn check_daemon(socket: &Path) -> Vec<Check> {
+    use std::os::unix::net::UnixStream;
+
+    // Absent socket: the daemon is not running. Expected before you start it.
+    if !socket.exists() {
+        return vec![Check::warn(
+            format!("no socket at {} — daemon not running", socket.display()),
+            "expected if you have not started it yet; otherwise: systemctl status turtled",
+        )];
+    }
+
+    // Present but unreachable *by us*. The daemon is up; this is a permissions
+    // problem in your shell session, and it breaks every CLI verb, not just
+    // doctor — so it is worth saying precisely.
+    if let Err(e) = UnixStream::connect(socket) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return vec![Check::fail(
+                format!("daemon is running on {} but this user cannot connect: {e}", socket.display()),
+                "the socket is owned by the service user and group-accessible: \
+                 run `sudo usermod -aG audio $USER`, then log out and back in \
+                 (this affects every turtle command, not just doctor)",
+            )];
+        }
+        return vec![Check::warn(
+            format!("socket at {} exists but will not connect: {e}", socket.display()),
+            "a stale socket from a crashed daemon? systemctl restart turtled",
+        )];
+    }
+
     match crate::client::request(socket, &Request::Status) {
         Ok(turtle_core::proto::Response::Status(s)) => vec![Check::ok(format!(
             "turtled responding on {}: {:?}, song {}",
@@ -341,10 +373,8 @@ fn check_daemon(socket: &Path) -> Vec<Check> {
             format!("turtled on {} gave an unexpected reply: {other:?}", socket.display()),
             "version mismatch between turtle and turtled?",
         )],
-        // Not a failure: `doctor` is most useful *before* starting the daemon,
-        // and "no daemon yet" is the expected state then.
         Err(e) => vec![Check::warn(
-            format!("no daemon on {}: {e}", socket.display()),
+            format!("no reply from {}: {e}", socket.display()),
             "expected if you have not started it yet; otherwise: systemctl status turtled",
         )],
     }
@@ -479,5 +509,27 @@ mod tests {
         let checks = check_daemon(Path::new("/nonexistent/turtle.sock"));
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].level, Level::Warn);
+        assert!(checks[0].detail.contains("not running"), "{:?}", checks[0]);
+    }
+
+    /// A socket that exists but refuses *us* is a running daemon we cannot drive,
+    /// which is a failure and not the same thing as an absent one. Reported as
+    /// "no daemon" it would send you chasing a process that is working fine.
+    #[test]
+    fn an_unreachable_daemon_is_distinguished_from_an_absent_one() {
+        let path = std::env::temp_dir().join(format!("turtle-perm-{}", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        // A plain file, not a socket: connect() fails with something other than
+        // "not found", which is the branch under test.
+        std::fs::write(&path, b"").unwrap();
+        let checks = check_daemon(&path);
+        assert_eq!(checks.len(), 1);
+        assert_ne!(
+            checks[0].level,
+            Level::Ok,
+            "a non-socket must not be reported as a healthy daemon"
+        );
+        assert!(!checks[0].detail.contains("not running"), "{:?}", checks[0]);
+        std::fs::remove_file(&path).ok();
     }
 }

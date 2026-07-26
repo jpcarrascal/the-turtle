@@ -412,6 +412,22 @@ works on a read-only rootfs. Both `turtled` and the `turtle` CLI read
 `/tmp/turtle.sock` — so plain `turtle status` over SSH finds whichever daemon is
 running with no flag either way.
 
+**You must be in the `audio` group to use the CLI against the service.** The socket
+belongs to the service user and is mode `0660`, so access is granted by group —
+the same group that already gates opening the audio device. Without it, *every*
+`turtle` verb fails with `Permission denied`, not just `doctor`:
+
+```bash
+sudo usermod -aG audio "$USER"
+# then log out and back in — group membership is applied at login
+id -nG | tr ' ' '\n' | grep -x audio    # confirm before reconnecting
+turtle status
+```
+
+This is easy to miss if you skipped the `limits.conf` step earlier on the grounds
+that it does not apply to services: that step also added you to `audio`, and this
+is the other reason to be in it.
+
 ### Hardware watchdog (survives a kernel hang)
 
 The service watchdog above needs systemd alive to act. For the case where the

@@ -136,14 +136,28 @@ pub fn start(path: &Path, status: StatusHandle, setlist: Vec<SetlistEntry>) -> i
 
     let listener = bind(path)?;
 
-    // Owner-only. There is a brief window between bind() and this chmod where
-    // the socket sits at the process umask — the airtight fix is to set the
-    // umask around bind(), which is process-global and not worth the footgun
-    // here. On a single-user show box this is the right trade.
+    // Owner **and group**, not owner-only.
+    //
+    // This started as 0600, which was right when `turtled` was only ever started
+    // by hand as your own user. It became wrong the moment §12 gave the service a
+    // dedicated `turtle` user: the socket was then owned by `turtle` and readable
+    // by nobody else, so `turtle status` / `arm` / `start` from a login shell
+    // failed with EACCES — the CLI could not talk to the daemon it exists to
+    // drive, which defeats the whole point of §10.
+    //
+    // 0660 hands control to the daemon's group, which the unit sets to `audio` —
+    // the same group that already gates opening the audio device. So the trust
+    // boundary is unchanged in substance: anyone who could take over the sound
+    // card could already ruin the show. It is still not world-accessible, which is
+    // what mattered about the default `/tmp` path.
+    //
+    // There is a brief window between bind() and this chmod where the socket sits
+    // at the process umask — the airtight fix is to set the umask around bind(),
+    // which is process-global and not worth the footgun here.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
@@ -647,12 +661,17 @@ mod tests {
     }
 
     #[test]
-    fn the_socket_is_owner_only() {
+    fn the_socket_is_owner_and_group_only() {
         use std::os::unix::fs::PermissionsExt;
         let sock = TempSock::new();
         let path = sock.path();
         let _server = start(path, Arc::new(Mutex::new(test_status())), test_setlist()).unwrap();
         let mode = std::fs::metadata(path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "socket mode was {:o}", mode & 0o777);
+        // Group access is required, not incidental: with the §12 unit the daemon
+        // runs as `turtle`:`audio`, and without the group bits a login user in
+        // `audio` cannot drive the CLI at all.
+        assert_eq!(mode & 0o777, 0o660, "socket mode was {:o}", mode & 0o777);
+        // Still never world-accessible.
+        assert_eq!(mode & 0o007, 0, "socket must not be world-accessible")
     }
 }
