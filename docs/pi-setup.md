@@ -6,6 +6,9 @@ priorities](#real-time-thread-priorities-3),
 [running it as a service](#running-as-a-service-12), and
 [CPU tuning](#cpu-tuning-governor-threadirqs-isolcpus-12).
 
+**Shortcut:** once built, [`turtle doctor`](#preflight-turtle-doctor-10) checks most
+of what the sections below tell you to verify by hand.
+
 Everything from "real-time priorities" onwards is **optional tuning** — the show
 plays without any of it. Do the read-only rootfs step last of all, since it makes
 further changes not persist.
@@ -140,6 +143,74 @@ sudo apt install -y libasound2-dev
 
 Still to come before it is show-ready: resolving logical port labels
 (`"CME:1"`) to ALSA `hw:` device names, and GPIO (§8.1).
+
+## Preflight: `turtle doctor` (§10)
+
+Everything below this point adds a "run this and check the output" step. `doctor`
+is all of those checks in one command, so you can confirm a box is ready without
+working through the sections by hand:
+
+```bash
+turtle doctor ~/Tone.turtle
+```
+
+```
+The Turtle — preflight
+
+show
+  ok   loaded "Tone Test": 1 song(s), 1 destination(s), 48000 Hz
+  ok   bundle validates
+
+stems
+  ok   all stems present and readable (45.2 MB across 1 song(s))
+
+audio
+  ok   device "hw:CARD=HXStomp" opens
+  ok   supports 48000 Hz
+
+midi
+  FAIL destination "lights" -> "CME:1" not found
+       -> available: hw:1,0,0, hw:1,0,1
+  warn some ports look like spec-style logical labels (e.g. "CME:1")
+       -> logical-label resolution is not implemented yet — use the real ALSA name from `amidi -l`
+
+realtime
+  ok   RT priority available (rtprio limit 95)
+  ok   memory locking available (memlock unlimited)
+
+system
+  ok   CPU governor: performance
+  warn no isolated CPUs (isolcpus not set)
+       -> optional, and usually unnecessary — see docs/pi-setup.md before enabling
+
+daemon
+  ok   turtled responding on /run/turtle/control.sock: Idle, song tone
+
+1 FAILURE(S), 2 warning(s)
+```
+
+Three things to know about reading it:
+
+- **`FAIL` and `warn` mean different things.** `FAIL` = the show cannot play.
+  `warn` = it will play, but something is untuned or unusual. Only failures set a
+  non-zero exit code, so `turtle doctor` is safe to use in a script without
+  tripping over the optional CPU tuning.
+- **It reports everything**, rather than stopping at the first problem — you want
+  the whole list before you start fixing things.
+- **`?` means "could not check here"**, not "fine". You will see it for the ALSA
+  and RT checks when running on a Mac, where those cannot be probed.
+
+The show argument is optional. Without it, the device and MIDI checks are skipped
+(they come from `show.toml`) but the box-level ones still run, which answers "is
+this Pi set up?" when you have no bundle to hand:
+
+```bash
+turtle doctor
+```
+
+Running it **while the daemon is up** is fine and expected: `turtled` holds the
+audio device exclusively, so doctor reports it as *present but busy* rather than
+broken.
 
 ## Real-time thread priorities (§3)
 

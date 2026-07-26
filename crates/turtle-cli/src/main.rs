@@ -7,8 +7,10 @@
 //!     `monitor`) speak the JSON line protocol in [`turtle_core::proto`] to a
 //!     running `turtled` over its Unix socket.
 //!
-//! Still to come per §10: `doctor` (mostly-offline preflight), `calibrate`,
-//! `test` — each its own workflow, deferred to a later pass.
+//! `doctor` is the third kind: it checks the *machine* (devices, RT limits, CPU
+//! tuning) rather than the daemon, so it works with or without one running.
+//!
+//! Still to come per §10: `calibrate` and `test` — each its own workflow.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,7 +18,9 @@ use std::process::ExitCode;
 use turtle_core::proto::{Request, Response, DEFAULT_SOCKET_PATH, SYSTEM_SOCKET_PATH};
 
 mod client;
+mod doctor;
 mod gen;
+mod probe;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +37,7 @@ fn main() -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("gen-tone") => gen_tone(&rest[1..]),
         Some("validate") => validate(&rest[1..]),
+        Some("doctor") => run_doctor(rest.get(1).map(String::as_str), &socket),
         Some("status") => socket_status(&socket),
         Some("monitor") => match client::monitor(&socket) {
             Ok(()) => ExitCode::SUCCESS,
@@ -163,11 +168,29 @@ fn validate(args: &[String]) -> ExitCode {
     }
 }
 
+/// `turtle doctor [<bundle|show.toml>]`: the §10 preflight.
+///
+/// The show argument is optional so the command still answers "is this *box*
+/// ready?" (RT limits, CPU tuning) when you do not have a bundle to hand — the
+/// show-dependent sections are then skipped rather than guessed at.
+fn run_doctor(show: Option<&str>, socket: &Path) -> ExitCode {
+    let report = doctor::run(show, socket);
+    println!("{report}");
+    // Warnings deliberately do not fail: they are optional tuning, and `doctor`
+    // should be usable in a boot script without tripping over them.
+    if report.is_failure() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn usage() {
     eprintln!("turtle <command> [--socket <path>]");
     eprintln!();
     eprintln!("offline (no daemon):");
     eprintln!("  validate <show.toml>          bundle validation");
+    eprintln!("  doctor [<bundle|show.toml>]    preflight: devices, RT limits, tuning");
     eprintln!("  gen-tone <out-dir> [s] [hz]   write a playable test bundle");
     eprintln!();
     eprintln!("control socket (needs a running turtled):");

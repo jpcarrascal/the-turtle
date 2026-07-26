@@ -14,3 +14,9 @@ turtle-core = { workspace = true }
 # WAV + SMF writing for the `gen-tone` bundle generator. Pure Rust, no C deps.
 hound = "3"
 midly = "0.5"
+
+# `doctor` probes real ALSA devices and reads RT rlimits (spec §10). Linux-only,
+# mirroring turtled: on the dev Mac these checks report "unknown" instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+libc = "0.2"
