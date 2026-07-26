@@ -14,11 +14,13 @@
 //! drives its transport from a live MIDI controller *and* the control socket.
 //! The default `turtled <show.toml>` still just loads + validates.
 //!
-//! The audio and MIDI threads request `SCHED_FIFO` priorities on startup
-//! ([`sched`], §3); `--rt-prio 0` opts out.
+//! The audio and MIDI threads request `SCHED_FIFO` priorities on startup and the
+//! process locks its memory ([`sched`], §3/§12); `--rt-prio 0` opts out of both.
+//! Under systemd it reports readiness and pings the watchdog ([`notify`], §12) —
+//! started from a shell, that is a no-op.
 //!
-//! What is **not** here yet: GPIO (§8.1), the systemd integration (§12), and
-//! resolving logical MIDI port labels to ALSA device names.
+//! What is **not** here yet: GPIO (§8.1), and resolving logical MIDI port labels
+//! to ALSA device names.
 
 // The RT modules below (clock, scheduler, engine, ...) are unit-tested but not
 // yet driven by `main`: their consumer is the ALSA RT loop, which is Linux-only
@@ -38,6 +40,7 @@ mod control_map;
 mod engine;
 mod mixer;
 mod notes;
+mod notify;
 mod play;
 mod rt;
 mod sched;
@@ -73,7 +76,10 @@ fn main() -> ExitCode {
                 "  -v, --verbose        log each dispatched MIDI event (bring-up diagnostics)"
             );
             eprintln!(
-                "  --socket <path>      control socket to bind (control only; default {})",
+                "  --socket <path>      control socket to bind (control only; default $TURTLE_SOCKET,"
+            );
+            eprintln!(
+                "                       else {})",
                 turtle_core::proto::DEFAULT_SOCKET_PATH
             );
             eprintln!(
@@ -149,11 +155,17 @@ fn control_command(opts: CmdOpts) -> ExitCode {
         eprintln!("usage: turtled control <bundle-dir> [song] [-v]");
         return ExitCode::FAILURE;
     };
-    // The socket path: the `--socket` override, else the protocol default.
-    let socket = opts
-        .socket
-        .clone()
-        .unwrap_or_else(|| turtle_core::proto::DEFAULT_SOCKET_PATH.to_string());
+    // The socket path: the `--socket` override, else the resolved default. The
+    // daemon *creates* the socket, so unlike the CLI it must not prefer an
+    // existing path — a leftover `/run/turtle/control.sock` would silently move
+    // where a hand-started daemon listens. Hence `$TURTLE_SOCKET` (which the unit
+    // sets) or the plain `/tmp` default, never the exists-check.
+    let socket = opts.socket.clone().unwrap_or_else(|| {
+        std::env::var(turtle_core::proto::SOCKET_ENV)
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| turtle_core::proto::DEFAULT_SOCKET_PATH.to_string())
+    });
     #[cfg(target_os = "linux")]
     {
         match control::run(

@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use turtle_core::proto::{Request, Response, DEFAULT_SOCKET_PATH};
+use turtle_core::proto::{Request, Response, DEFAULT_SOCKET_PATH, SYSTEM_SOCKET_PATH};
 
 mod client;
 mod gen;
@@ -63,8 +63,12 @@ fn main() -> ExitCode {
 /// Pull an optional `--socket <path>` out of the args, returning the socket to
 /// use (the override or the default) and the remaining args. A trailing
 /// `--socket` with no value is a usage error rather than a silent default.
+///
+/// The default is *resolved*, not constant: it finds the systemd unit's socket
+/// or a hand-started one, so neither case needs a flag (see
+/// [`turtle_core::proto::default_socket_path`]).
 fn extract_socket(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
-    let mut socket = PathBuf::from(DEFAULT_SOCKET_PATH);
+    let mut socket = turtle_core::proto::default_socket_path();
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -173,5 +177,6 @@ fn usage() {
     eprintln!("  panic                         all-notes-off on every port");
     eprintln!("  monitor                       stream incoming commands");
     eprintln!();
-    eprintln!("  --socket <path>  control socket to use (default {DEFAULT_SOCKET_PATH})");
+    eprintln!("  --socket <path>  control socket to use; default is $TURTLE_SOCKET, else");
+    eprintln!("                   {SYSTEM_SOCKET_PATH} (systemd), else {DEFAULT_SOCKET_PATH}");
 }
