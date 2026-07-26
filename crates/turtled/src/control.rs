@@ -184,12 +184,18 @@ fn pump_preload(
 /// fatal rather than a warning: it means either a stale path we cannot clean
 /// up or a second `turtled` already running, and quietly playing a show that
 /// the CLI cannot talk to is the worse outcome (§12's "fail loudly").
+///
+/// `rt_priority` is the audio thread's `SCHED_FIFO` priority; the fused
+/// control/MIDI thread derives its own one step below (§3, [`crate::sched`]).
+/// `None` disables RT scheduling entirely and runs both at normal priority —
+/// the pre-§3 behaviour, kept for A/B comparison on the Pi.
 #[cfg(target_os = "linux")]
 pub fn run(
     bundle: &std::path::Path,
     song: Option<&str>,
     verbose: bool,
     socket_path: &std::path::Path,
+    rt_priority: Option<u8>,
 ) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
@@ -208,7 +214,12 @@ pub fn run(
     use crate::engine::{rt_channel, rt_event_channel, Engine, RtEvent};
     use crate::mixer::song_channel;
     use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
-    use crate::{rt, socket};
+    use crate::{rt, sched, socket};
+
+    // Resolve both thread priorities up front, so the ordering invariant
+    // (audio > midi) is established in one place rather than at two spawn sites.
+    let audio_priority = rt_priority;
+    let midi_priority = rt_priority.map(sched::midi_priority_for);
 
     // Reuse the play path's loader: preload the chosen (or first) song's stems.
     let Playable {
@@ -320,6 +331,10 @@ pub fn run(
         let clock = &clock;
         let running = &running;
         s.spawn(move || {
+            // First thing on the new thread, before a single period is
+            // rendered: ask for SCHED_FIFO (§3). Best-effort — a failure warns
+            // and plays on at normal priority (see `crate::sched`).
+            sched::apply_or_warn("audio", audio_priority);
             rt::run_audio(
                 &audio,
                 &mut mixer,
@@ -331,6 +346,12 @@ pub fn run(
                 running,
             )
         });
+
+        // This thread *is* the MIDI scheduler in v1, so it takes RT priority
+        // too — one step below audio, so an audio period always wins (§3).
+        // Everything below this point runs at that priority, which is why the
+        // status snapshot is republished with `try_lock` rather than `lock`.
+        sched::apply_or_warn("control+midi", midi_priority);
 
         // The control + MIDI-scheduler loop (one thread for v1). Each ~1 ms it:
         //  1. polls MIDI input (non-blocking) -> transport commands -> RT queue;
@@ -554,11 +575,18 @@ pub fn run(
             };
 
             // Republish what `turtle status` reads (§10). This is the only
-            // place that writes the snapshot. The lock is uncontended in
-            // practice and held for a few field writes; it is never taken by
-            // the audio RT thread, so it cannot cause an xrun.
-            {
-                let mut snap = socket::lock(&status_handle);
+            // place that writes the snapshot.
+            //
+            // `try_lock`, not `lock`: this thread runs at SCHED_FIFO (§3, see
+            // `crate::sched`) while the socket threads that *read* the snapshot
+            // are normal priority. A blocking `lock()` here would be a textbook
+            // priority inversion — an RT thread waiting on a lower-priority
+            // thread that the scheduler may not run promptly, stalling MIDI
+            // dispatch for as long as it takes. Skipping the update instead is
+            // free: the snapshot is "latest value wins", and the next iteration
+            // is ~1 ms away, so a contended tick costs a client nothing
+            // observable.
+            if let Some(mut snap) = socket::try_lock_status(&status_handle) {
                 snap.state = eng.state();
                 snap.position_s = position as f64 / rate as f64;
                 snap.duration_s = duration_s;
