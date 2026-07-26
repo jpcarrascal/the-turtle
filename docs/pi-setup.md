@@ -225,17 +225,26 @@ sudo useradd -r -g audio -s /usr/sbin/nologin turtle
 # ProtectHome=true, so /home is invisible to the service).
 sudo install -m755 target/release/turtled target/release/turtle /usr/local/bin/
 
-# Bundles where the unit expects them, readable by the service user.
+# Bundles where the unit expects them, readable by the service user. Note this
+# is a *copy*, not a path change: a bundle left in your home directory will not
+# work, because ProtectHome=true makes /home invisible to the service (the
+# failure looks like "bundle not found" for a bundle you can plainly see).
 sudo mkdir -p /media/shows
+sudo cp -r ~/Tone.turtle /media/shows/
 sudo chown -R turtle:audio /media/shows
 
 sudo cp deploy/turtled.service /etc/systemd/system/
-# Edit ExecStart's bundle path to match yours.
+# Edit ExecStart's bundle path to match what you just copied.
 sudo systemctl edit --full turtled
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now turtled
 ```
+
+`/media/shows` is where the USB SSD is expected to be mounted (§12), but nothing
+here requires that yet — a plain directory on the SD card works for testing. The
+unit's `RequiresMountsFor=` adds a dependency on whatever mount actually covers
+the path, so it is satisfied either way.
 
 Check it came up, and that the two privileges landed:
 
