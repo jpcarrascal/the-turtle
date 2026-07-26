@@ -321,6 +321,16 @@ pub fn run(
     // an incoming status byte, and shadowing this behind it would be a trap.
     let status_handle: socket::StatusHandle = Arc::new(Mutex::new(Status {
         show: show.show.name.clone(),
+        // Canonicalised so a client comparing paths is not defeated by `..`, a
+        // symlink, or a relative argument. Falls back to the path as given if it
+        // cannot be resolved — a best-effort field must never fail a startup.
+        bundle: Some(
+            bundle
+                .canonicalize()
+                .unwrap_or_else(|_| bundle.to_path_buf())
+                .display()
+                .to_string(),
+        ),
         state: eng.state(),
         song: current_song.clone(),
         armed_next: None,

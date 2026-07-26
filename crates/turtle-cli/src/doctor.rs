@@ -174,7 +174,10 @@ pub fn run(show_path: Option<&str>, socket: &Path) -> Report {
 
     report.section("realtime", crate::probe::check_realtime());
     report.section("system", check_system());
-    report.section("daemon", check_daemon(socket));
+    report.section(
+        "daemon",
+        check_daemon(socket, show.as_ref().map(|(_, p)| p.as_path())),
+    );
     report
 }
 
@@ -333,7 +336,7 @@ fn read_trimmed(path: &str) -> Option<String> {
 /// The three outcomes are deliberately distinguished, because they call for
 /// completely different actions and the middle one used to be misreported as the
 /// first — which sent you looking for a dead daemon that was running fine.
-fn check_daemon(socket: &Path) -> Vec<Check> {
+fn check_daemon(socket: &Path, checked_show: Option<&Path>) -> Vec<Check> {
     use std::os::unix::net::UnixStream;
 
     // Absent socket: the daemon is not running. Expected before you start it.
@@ -363,12 +366,18 @@ fn check_daemon(socket: &Path) -> Vec<Check> {
     }
 
     match crate::client::request(socket, &Request::Status) {
-        Ok(turtle_core::proto::Response::Status(s)) => vec![Check::ok(format!(
-            "turtled responding on {}: {:?}, song {}",
-            socket.display(),
-            s.state,
-            s.song.as_deref().unwrap_or("(none)")
-        ))],
+        Ok(turtle_core::proto::Response::Status(st)) => {
+            let mut checks = vec![Check::ok(format!(
+                "turtled responding on {}: {:?}, song {}",
+                socket.display(),
+                st.state,
+                st.song.as_deref().unwrap_or("(none)")
+            ))];
+            if let Some(c) = bundle_mismatch(checked_show, st.bundle.as_deref()) {
+                checks.push(c);
+            }
+            checks
+        }
         Ok(other) => vec![Check::warn(
             format!("turtled on {} gave an unexpected reply: {other:?}", socket.display()),
             "version mismatch between turtle and turtled?",
@@ -378,6 +387,38 @@ fn check_daemon(socket: &Path) -> Vec<Check> {
             "expected if you have not started it yet; otherwise: systemctl status turtled",
         )],
     }
+}
+
+/// Warn when the bundle we just inspected is not the one the daemon is running.
+///
+/// Every check above can be individually truthful about a file that has nothing to
+/// do with what is playing. That is not a theoretical concern: a stale copy of a
+/// bundle in `$HOME` next to the live one under `/media/shows` cost real debugging
+/// time, because `doctor` reported the home copy's old MIDI ports while the service
+/// happily ran the corrected ones. Comparing the two makes that visible instead of
+/// baffling.
+///
+/// Compares the *bundle directories*, since `doctor` is given a `show.toml` (or a
+/// directory) while the daemon is given a bundle. Canonicalised on our side; the
+/// daemon canonicalises its own before publishing it.
+fn bundle_mismatch(checked_show: Option<&Path>, daemon_bundle: Option<&str>) -> Option<Check> {
+    let (checked, daemon) = (checked_show?, daemon_bundle?);
+    // `show.toml` -> its bundle directory.
+    let checked_dir = checked.parent().unwrap_or(checked);
+    let checked_dir = checked_dir.canonicalize().unwrap_or_else(|_| checked_dir.to_path_buf());
+    let daemon_dir = Path::new(daemon);
+    let daemon_dir = daemon_dir.canonicalize().unwrap_or_else(|_| daemon_dir.to_path_buf());
+    if checked_dir == daemon_dir {
+        return None;
+    }
+    Some(Check::warn(
+        format!(
+            "you asked about {}, but the daemon is running {} — these checks may not describe what is playing",
+            checked_dir.display(),
+            daemon_dir.display()
+        ),
+        format!("re-run against the live bundle: turtle doctor {}", daemon_dir.display()),
+    ))
 }
 
 #[cfg(test)]
@@ -428,6 +469,52 @@ mod tests {
         let explicit = dir.join("show.toml");
         assert_eq!(resolve_show_path(explicit.to_str().unwrap()), explicit);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The check that would have saved a real debugging session: inspecting one
+    /// bundle while the daemon runs another must be called out, not passed over.
+    #[test]
+    fn a_bundle_mismatch_with_the_running_daemon_is_reported() {
+        let c = bundle_mismatch(
+            Some(Path::new("/home/jp/Tone.turtle/show.toml")),
+            Some("/media/shows/Tone.turtle"),
+        )
+        .expect("a mismatch must be reported");
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("/media/shows/Tone.turtle"), "{:?}", c);
+        // The hint must be runnable as-is.
+        assert!(
+            c.hint.as_deref().unwrap().contains("turtle doctor /media/shows/Tone.turtle"),
+            "{:?}",
+            c
+        );
+    }
+
+    /// The same bundle spelled two ways must NOT warn, or the warning becomes
+    /// noise people learn to ignore. `doctor` is given a show.toml, the daemon a
+    /// directory.
+    #[test]
+    fn the_same_bundle_spelled_differently_does_not_warn() {
+        let dir = std::env::temp_dir().join(format!("turtle-match-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let show = dir.join("show.toml");
+        std::fs::write(&show, "").unwrap();
+
+        // show.toml vs its own directory: the same bundle.
+        assert!(bundle_mismatch(Some(&show), Some(dir.to_str().unwrap())).is_none());
+        // And with a redundant path component that canonicalisation resolves.
+        let noisy = dir.join(".").join("..").join(dir.file_name().unwrap());
+        assert!(bundle_mismatch(Some(&show), Some(noisy.to_str().unwrap())).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nothing to compare must stay silent: no show argument, or a daemon too old
+    /// to report its bundle.
+    #[test]
+    fn nothing_to_compare_produces_no_warning() {
+        assert!(bundle_mismatch(None, Some("/media/shows/X.turtle")).is_none());
+        assert!(bundle_mismatch(Some(Path::new("/a/show.toml")), None).is_none());
     }
 
     /// Stems must be looked for where `turtled` actually loads them.
@@ -506,7 +593,7 @@ mod tests {
     /// is a warning, not a failure.
     #[test]
     fn an_absent_daemon_is_only_a_warning() {
-        let checks = check_daemon(Path::new("/nonexistent/turtle.sock"));
+        let checks = check_daemon(Path::new("/nonexistent/turtle.sock"), None);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].level, Level::Warn);
         assert!(checks[0].detail.contains("not running"), "{:?}", checks[0]);
@@ -522,7 +609,7 @@ mod tests {
         // A plain file, not a socket: connect() fails with something other than
         // "not found", which is the branch under test.
         std::fs::write(&path, b"").unwrap();
-        let checks = check_daemon(&path);
+        let checks = check_daemon(&path, None);
         assert_eq!(checks.len(), 1);
         assert_ne!(
             checks[0].level,

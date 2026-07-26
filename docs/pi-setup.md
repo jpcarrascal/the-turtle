@@ -151,7 +151,10 @@ is all of those checks in one command, so you can confirm a box is ready without
 working through the sections by hand:
 
 ```bash
-turtle doctor ~/Tone.turtle
+# Point it at the bundle the *service* loads (see `systemctl show -P ExecStart
+# turtled`), not a copy in your home directory. A stale copy next to the live one
+# is the easiest way to spend an hour debugging a file nobody is playing.
+turtle doctor /media/shows/Tone.turtle
 ```
 
 ```
@@ -280,6 +283,9 @@ To A/B it against the old behaviour — useful when diagnosing whether a glitch 
 scheduling-related — start with RT off:
 
 ```bash
+# Before the service is installed these live wherever you built and unpacked
+# them; afterwards, use the installed binary and the bundle under /media/shows,
+# and `systemctl stop turtled` first so the two do not fight over the device.
 ./target/release/turtled control ~/Tone.turtle --rt-prio 0     # normal priority
 ./target/release/turtled control ~/Tone.turtle --rt-prio 60    # custom priority
 ```
@@ -614,8 +620,9 @@ your hardware, load the Pi while a song plays and compare:
 for i in 1 2 3 4; do (while :; do :; done) & done; sudo apt-get -qq update
 
 # In another, A/B the tuning:
-turtled control ~/Tone.turtle                          # fully tuned
-turtled control ~/Tone.turtle --rt-prio 0 --audio-cpu none   # fully untuned
+# `systemctl stop turtled` first: two daemons cannot share the audio device.
+turtled control /media/shows/Tone.turtle                        # fully tuned
+turtled control /media/shows/Tone.turtle --rt-prio 0 --audio-cpu none  # untuned
 kill %1 %2 %3 %4
 ```
 
