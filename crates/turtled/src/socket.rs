@@ -308,10 +308,33 @@ fn handle_request(
 /// A `Mutex` is poisoned if a thread panicked while holding it. Here the guarded
 /// data is a status snapshot and a subscriber list — neither can be left in a
 /// state that makes a later reader unsound — so recovering the data beats taking
-/// the whole control socket down with an `unwrap`. `pub(crate)` because the
-/// control loop republishes the snapshot through the same door.
+/// the whole control socket down with an `unwrap`.
+///
+/// Used by the socket threads, which are normal priority and may block freely.
+/// The **control thread must not** call this — see [`try_lock_status`].
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Try to take the status lock without ever blocking, for the RT control thread.
+///
+/// The control thread runs at `SCHED_FIFO` (§3) while the socket threads that
+/// read the snapshot do not. If it blocked on this mutex it would be waiting on
+/// a lower-priority thread — a priority inversion that stalls MIDI dispatch for
+/// however long the scheduler takes to run the lock holder. Returning `None`
+/// instead is safe here precisely because the snapshot is "latest value wins":
+/// a skipped republish is corrected ~1 ms later, and no client can observe the
+/// difference.
+///
+/// A poisoned mutex still yields its data, for the reason given on [`lock`].
+pub(crate) fn try_lock_status(m: &StatusHandle) -> Option<std::sync::MutexGuard<'_, Status>> {
+    use std::sync::TryLockError;
+    match m.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        // Held by a socket thread right now; skip this tick.
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 #[cfg(test)]

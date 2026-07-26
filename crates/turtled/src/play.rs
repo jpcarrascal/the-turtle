@@ -129,7 +129,12 @@ pub fn dispatch_pos(pos: u64, offset_ms: f64, rate: u32) -> Option<u64> {
 /// Open the device, spawn the audio RT thread, play the song, and stop. Linux
 /// only (drives `AlsaAudio`).
 #[cfg(target_os = "linux")]
-pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), String> {
+pub fn run(
+    bundle: &Path,
+    song: Option<&str>,
+    verbose: bool,
+    rt_priority: Option<u8>,
+) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -196,6 +201,9 @@ pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), Strin
         let clock = &clock;
         let running = &running;
         s.spawn(move || {
+            // Same as the control path: claim SCHED_FIFO on the RT thread
+            // before rendering anything (§3). Best-effort by design.
+            crate::sched::apply_or_warn("audio", rt_priority);
             rt::run_audio(
                 &audio,
                 &mut mixer,
@@ -207,6 +215,13 @@ pub fn run(bundle: &Path, song: Option<&str>, verbose: bool) -> Result<(), Strin
                 running,
             );
         });
+
+        // This thread is the MIDI scheduler, so it takes RT priority too — one
+        // step below audio, matching the control path (§3).
+        crate::sched::apply_or_warn(
+            "midi",
+            rt_priority.map(crate::sched::midi_priority_for),
+        );
 
         // Kick off playback, then run the MIDI scheduler on this thread (§5):
         // every ~1 ms, interpolate the transport position from the clock the

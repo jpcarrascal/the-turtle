@@ -132,11 +132,70 @@ requirement is the ALSA development headers, now folded into the §2 apt install
 sudo apt install -y libasound2-dev
 ```
 
-Still to come before it produces sound/lights: the RT audio loop that mixes
-stems and fills the PCM buffers, `SCHED_FIFO` thread spawning, rawmidi *input*
-for the control thread, and resolving logical port labels (`"CME:1"`) to ALSA
-`hw:` device names. Until `main` opens these backends, the §3 smoke test output
-is unchanged.
+Still to come before it is show-ready: resolving logical port labels
+(`"CME:1"`) to ALSA `hw:` device names, GPIO (§8.1), and the systemd unit (§12).
+
+## Real-time thread priorities (§3)
+
+`turtled` asks the kernel to put its audio thread on `SCHED_FIFO` priority 80,
+and the fused control/MIDI thread on 75, so neither can be preempted by ordinary
+work. Without this, a background `apt upgrade` or a busy shell can delay an audio
+period by tens of milliseconds and you get an xrun.
+
+**This needs permission, and by default a normal user does not have it.** When
+the request is refused, `turtled` prints a warning and keeps playing at normal
+priority — the show never refuses to start over a tuning issue — so watch the
+startup lines:
+
+```
+[sched] audio thread: SCHED_FIFO priority 80          <- got it
+[sched] control+midi thread: SCHED_FIFO priority 75
+```
+
+versus:
+
+```
+warning: audio thread stays at normal priority: pthread_setschedparam(...)
+         failed: Operation not permitted (need CAP_SYS_NICE, or an rtprio
+         limit in /etc/security/limits.conf)
+```
+
+To grant it, give your user an `rtprio` limit:
+
+```bash
+# Allow RT priorities up to 95 for your login user.
+sudo tee /etc/security/limits.d/99-turtle-realtime.conf >/dev/null <<'EOF'
+@audio   -  rtprio  95
+@audio   -  memlock unlimited
+EOF
+
+sudo usermod -aG audio "$USER"
+```
+
+Then **log out and back in** (limits are applied at login, so `su`-ing or
+re-running in the same shell will not pick them up) and confirm:
+
+```bash
+ulimit -r        # should print 95, not 0
+```
+
+Verify the daemon actually got it while it runs:
+
+```bash
+# RTPRIO column shows the priority; CLS shows FF for SCHED_FIFO.
+ps -Lo pid,tid,cls,rtprio,comm -p "$(pgrep turtled)"
+```
+
+To A/B it against the old behaviour — useful when diagnosing whether a glitch is
+scheduling-related — start with RT off:
+
+```bash
+./target/release/turtled control ~/Tone.turtle --rt-prio 0     # normal priority
+./target/release/turtled control ~/Tone.turtle --rt-prio 60    # custom priority
+```
+
+The remaining §12 system tuning (`cpu governor=performance`, `threadirqs`,
+`isolcpus`) is not wired up yet and is a later pass.
 
 ## Faster iteration (later)
 

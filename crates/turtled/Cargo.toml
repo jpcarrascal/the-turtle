@@ -18,6 +18,10 @@ thiserror = { workspace = true }
 # only compiled when building for the Pi. See `src/alsa_backend.rs`.
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
+# SCHED_FIFO thread priorities (§3/§12) via pthread_setschedparam. Linux-gated
+# alongside ALSA: RT scheduling is a Pi deployment concern, and there is no safe
+# Rust API for it. Already in the tree as an `alsa` dependency.
+libc = "0.2"
 
 [dev-dependencies]
 midly = "0.5"
