@@ -358,6 +358,25 @@ a preallocated log ring).
 
 ## 14. Open items / future
 
+- **Per-song looping** (requested 2026-07-26). A `loop = true` flag in a song's
+  `[song]` table makes it repeat **seamlessly** until explicitly stopped, instead
+  of auto-advancing. Notes for whoever picks this up:
+  - Three things have to wrap together, or audio and lights drift apart: the
+    mixer's stem read position (mid-buffer, or the loop point is quantised to the
+    buffer size and audibly gappy), the transport clock, and every per-destination
+    MIDI scheduler cursor — the schedulers hold a "next event" index that must be
+    re-seeked to the loop start on each wrap.
+  - It changes what `EndReached` means. Today that event drives the gapless
+    auto-advance to the next setlist entry (§8); with `loop = true` it must wrap
+    instead, and *not* advance. Stop still exits the loop.
+  - Seamlessness relies on the stems being an exact whole number of bars, which
+    Ableton's bounce already gives us. A crossfade at the seam is future polish,
+    not needed for v1 of this.
+  - A richer variant was discussed earlier and remains open: explicit loop
+    start/end points imported from Ableton, with loop on/off toggled live from a
+    MIDI binding (and "switch off mid-loop" meaning "continue past the loop end
+    next time it is crossed", never a jump). The `loop = true` whole-song flag is
+    the simpler subset and a sensible first phase.
 - Crossfade segues (v1 is hard auto-advance only).
 - Touch-takeover blending of DSP params (v1 is live-only, no blend).
 - FLAC/`symphonia` stem support for smaller bundles.
