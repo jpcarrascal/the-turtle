@@ -93,6 +93,10 @@ pub fn check_audio(device: &str, rate: u32) -> Vec<Check> {
                 "rate not checked while the device is in use".to_string(),
             ));
         }
+        Err(e) if e.errno() == libc::EACCES => checks.push(Check::warn(
+            format!("device \"{device}\" exists but this user cannot open it: {e}"),
+            "add yourself to the audio group (usermod -aG audio $USER, then log out and in); turtled itself runs as a member of it",
+        )),
         Err(e) => {
             let avail = available("pcm");
             checks.push(Check::fail(
@@ -116,46 +120,42 @@ pub fn check_audio(device: &str, rate: u32) -> Vec<Check> {
 }
 
 /// Are all the show's MIDI ports present — outputs and the control input?
+///
+/// Each port is checked by **opening it**, not by matching its name against the
+/// enumerated hint list. That matters more than it sounds: ALSA spells the same
+/// device several ways (`hw:0,0,0`, `hw:CARD=H4MIDIWC,DEV=0`,
+/// `hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0`), and hints do not necessarily include the
+/// spelling you wrote. String-matching therefore reports working ports as missing
+/// — a false negative, which is the one thing a preflight must not produce.
+/// Opening it asks the same question `turtled` will ask, in the same words.
+///
+/// Directions are checked as they will be used: destinations for output, the
+/// control port for input. A port can legitimately support one and not the other.
 #[cfg(target_os = "linux")]
 pub fn check_midi(destinations: &[Destination], input_port: &str) -> Vec<Check> {
-    let mut checks = Vec::new();
-    let avail = available("rawmidi");
+    use alsa::Direction;
 
-    // One shared hint so a show full of logical labels does not repeat it per
-    // destination.
+    let mut checks = Vec::new();
     let mut saw_unresolved = false;
 
     for d in destinations {
-        if avail.iter().any(|a| a == &d.port) {
-            checks.push(Check::ok(format!(
-                "destination \"{}\" -> \"{}\" present",
-                d.name, d.port
-            )));
-        } else {
-            if looks_logical(&d.port) {
-                saw_unresolved = true;
-            }
-            checks.push(Check::fail(
-                format!("destination \"{}\" -> \"{}\" not found", d.name, d.port),
-                if avail.is_empty() {
-                    "no ALSA MIDI ports found at all — is the interface plugged in?".to_string()
-                } else {
-                    format!("available: {}", avail.join(", "))
-                },
-            ));
+        checks.push(probe_port(
+            &d.port,
+            Direction::Playback,
+            &format!("destination \"{}\" -> \"{}\"", d.name, d.port),
+        ));
+        if looks_logical(&d.port) {
+            saw_unresolved = true;
         }
     }
 
-    if avail.iter().any(|a| a == input_port) {
-        checks.push(Check::ok(format!("control input \"{input_port}\" present")));
-    } else {
-        if looks_logical(input_port) {
-            saw_unresolved = true;
-        }
-        checks.push(Check::fail(
-            format!("control input \"{input_port}\" not found"),
-            "without it the foot controller cannot drive the transport".to_string(),
-        ));
+    checks.push(probe_port(
+        input_port,
+        Direction::Capture,
+        &format!("control input \"{input_port}\""),
+    ));
+    if looks_logical(input_port) {
+        saw_unresolved = true;
     }
 
     // The spec describes logical labels like "CME:1", but resolving them to ALSA
@@ -168,10 +168,9 @@ pub fn check_midi(destinations: &[Destination], input_port: &str) -> Vec<Check> 
         ));
     }
 
-    // Deliberately reported even when the port resolved *fine*. An index-based
-    // name is not wrong today, it is fragile tomorrow: the whole point is to warn
-    // before the next reboot renumbers the cards and turns this into a show that
-    // will not start.
+    // Deliberately reported even when the port opened *fine*. An index-based name
+    // is not wrong today, it is fragile tomorrow: the warning is only useful if it
+    // arrives before the next reboot renumbers the cards, not after.
     let fragile: Vec<&str> = destinations
         .iter()
         .map(|d| d.port.as_str())
@@ -184,10 +183,53 @@ pub fn check_midi(destinations: &[Destination], input_port: &str) -> Vec<Check> 
                 "index-based ALSA name(s) in use ({}) — these change when devices are replugged or the machine reboots",
                 fragile.join(", ")
             ),
-            "use the stable form instead: hw:CARD=<id>,DEV=0,SUBDEV=0, with <id> from /proc/asound/cards",
+            "use the stable form instead: hw:CARD=<id>,DEV=0,SUBDEV=<n>, with <id> from /proc/asound/cards",
         ));
     }
     checks
+}
+
+/// Open one rawmidi port in one direction and report what happened.
+///
+/// This is deliberately the *same call* `turtled` makes — `Rawmidi::new` with the
+/// direction it will use (`control.rs` for the input, `alsa_backend.rs` for the
+/// outputs) — so "doctor could open it" really does imply "turtled can open it".
+///
+/// One difference: this always opens non-blocking, whereas `turtled` opens its
+/// *outputs* blocking. That cannot change the outcome — `O_NONBLOCK` governs
+/// subsequent reads and writes, not whether the open succeeds — and it removes any
+/// possibility of a diagnostic tool stalling on a device.
+#[cfg(target_os = "linux")]
+fn probe_port(port: &str, dir: alsa::Direction, label: &str) -> Check {
+    match alsa::rawmidi::Rawmidi::new(port, dir, true) {
+        Ok(_) => Check::ok(format!("{label} opens")),
+        // Busy means present and in use — almost certainly by turtled itself.
+        // Reporting that as broken would fail the healthy running case.
+        Err(e) if e.errno() == libc::EBUSY => {
+            Check::ok(format!("{label} present but busy (turtled is probably using it)"))
+        }
+        // Permission, not absence. Worth its own message because the port is fine
+        // and `turtled` (which runs as a member of `audio`) will open it happily —
+        // reporting "not found" here would send you chasing the wrong problem.
+        Err(e) if e.errno() == libc::EACCES => Check::warn(
+            format!("{label} exists but this user cannot open it: {e}"),
+            "add yourself to the audio group (usermod -aG audio $USER, then log out and in); turtled itself runs as a member of it",
+        ),
+        Err(e) => {
+            let avail = available("rawmidi");
+            Check::fail(
+                format!("{label} will not open: {e}"),
+                if avail.is_empty() {
+                    "no ALSA MIDI ports found at all — is the interface plugged in?".to_string()
+                } else {
+                    // Hint names may be spelled differently from what works, so
+                    // point at `amidi -l` too rather than implying this list is
+                    // the only valid vocabulary.
+                    format!("ALSA suggests: {} (see also `amidi -l`)", avail.join(", "))
+                },
+            )
+        }
+    }
 }
 
 /// A `"CME:1"`-shaped label: a colon, and not already an ALSA `hw:`/`plughw:` name.
