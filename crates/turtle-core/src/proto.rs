@@ -20,14 +20,55 @@ use serde::{Deserialize, Serialize};
 
 use crate::transport::State;
 
-/// Where the daemon listens unless `--socket <path>` overrides it.
+/// Where a hand-started daemon listens unless `--socket <path>` overrides it.
 ///
-/// `/tmp` (not `/run/turtle`) so an unprivileged `turtled` started by hand on
-/// the Pi works with no setup; the systemd unit (§12) will pass an explicit
-/// `--socket /run/turtle/control.sock` with a `RuntimeDirectory=`. The socket
-/// is created mode `0600`, so "world-writable /tmp" does not mean anyone on
-/// the box can stop your show.
+/// `/tmp` (not `/run/turtle`) so an unprivileged `turtled` run from a shell on
+/// the Pi works with no setup at all. The socket is created mode `0600`, so
+/// "world-writable /tmp" does not mean anyone on the box can stop your show.
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/turtle.sock";
+
+/// Where the systemd unit puts the socket (§12).
+///
+/// `/run` rather than `/tmp` because the unit owns this directory via
+/// `RuntimeDirectory=turtle`: systemd creates it on start and removes it on stop,
+/// which means a crash cannot leave a stale socket behind, and it keeps working
+/// when the rootfs is mounted read-only (`/run` is always a tmpfs).
+pub const SYSTEM_SOCKET_PATH: &str = "/run/turtle/control.sock";
+
+/// The environment variable that overrides the search below.
+pub const SOCKET_ENV: &str = "TURTLE_SOCKET";
+
+/// Pick the socket to use when no `--socket` was given.
+///
+/// There are two legitimate daemons to find — the systemd one on
+/// [`SYSTEM_SOCKET_PATH`] and a hand-started one on [`DEFAULT_SOCKET_PATH`] — and
+/// making the operator remember which is running defeats the point of a default.
+/// So: `$TURTLE_SOCKET` wins if set, else whichever socket actually exists, with
+/// the system one first. Falling back to the hand-started path when *neither*
+/// exists keeps the "is turtled running?" error message pointing at the case a
+/// developer is far more likely to be in.
+pub fn default_socket_path() -> std::path::PathBuf {
+    resolve_socket_path(std::env::var(SOCKET_ENV).ok().as_deref(), |p| {
+        std::path::Path::new(p).exists()
+    })
+}
+
+/// The testable core of [`default_socket_path`], with the environment and the
+/// filesystem passed in rather than read.
+pub fn resolve_socket_path(env: Option<&str>, exists: impl Fn(&str) -> bool) -> std::path::PathBuf {
+    // An explicit override is obeyed even if nothing is listening there yet:
+    // "connection refused on the path you named" is a far better error than
+    // silently talking to a different daemon than the one you meant.
+    if let Some(path) = env.filter(|p| !p.is_empty()) {
+        return std::path::PathBuf::from(path);
+    }
+    for candidate in [SYSTEM_SOCKET_PATH, DEFAULT_SOCKET_PATH] {
+        if exists(candidate) {
+            return std::path::PathBuf::from(candidate);
+        }
+    }
+    std::path::PathBuf::from(DEFAULT_SOCKET_PATH)
+}
 
 /// A request from the `turtle` CLI to the daemon.
 ///
@@ -174,6 +215,40 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An explicit `$TURTLE_SOCKET` must win over both defaults, and be obeyed
+    /// even when nothing is listening there yet.
+    #[test]
+    fn the_socket_env_var_overrides_the_search() {
+        let p = resolve_socket_path(Some("/custom/turtle.sock"), |_| true);
+        assert_eq!(p, std::path::Path::new("/custom/turtle.sock"));
+        // Empty is treated as unset, not as a request for the empty path.
+        let p = resolve_socket_path(Some(""), |_| false);
+        assert_eq!(p, std::path::Path::new(DEFAULT_SOCKET_PATH));
+    }
+
+    /// With the systemd unit running, plain `turtle status` over SSH must find
+    /// its socket without anyone passing `--socket`.
+    #[test]
+    fn the_system_socket_is_preferred_when_it_exists() {
+        let p = resolve_socket_path(None, |c| c == SYSTEM_SOCKET_PATH);
+        assert_eq!(p, std::path::Path::new(SYSTEM_SOCKET_PATH));
+    }
+
+    /// A hand-started daemon during development is still found.
+    #[test]
+    fn a_hand_started_socket_is_found_when_the_system_one_is_absent() {
+        let p = resolve_socket_path(None, |c| c == DEFAULT_SOCKET_PATH);
+        assert_eq!(p, std::path::Path::new(DEFAULT_SOCKET_PATH));
+    }
+
+    /// With nothing running, the error the user sees should name the path a
+    /// developer most likely meant.
+    #[test]
+    fn with_no_socket_at_all_it_falls_back_to_the_dev_path() {
+        let p = resolve_socket_path(None, |_| false);
+        assert_eq!(p, std::path::Path::new(DEFAULT_SOCKET_PATH));
+    }
 
     /// The wire form is a stable contract between two separately-built
     /// binaries, so pin the exact bytes rather than only round-tripping —

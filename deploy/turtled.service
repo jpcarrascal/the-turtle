@@ -1,0 +1,118 @@
+# The Turtle — show playback daemon (spec §12).
+#
+# Install: see docs/pi-setup.md, "Running as a service". Every setting below is
+# there because of something in §12; the comments say which.
+#
+#   sudo cp deploy/turtled.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now turtled
+
+[Unit]
+Description=The Turtle show playback daemon
+Documentation=https://github.com/jpcarrascal/the-turtle
+
+# Boot-to-ready (§12): the daemon opens an ALSA device and reads stems off the
+# USB SSD, so it must not start before either exists. `sound.target` covers the
+# card; the mount unit is named after the mount point, and `RequiresMountsFor`
+# generates that dependency for us instead of hardcoding a `.mount` unit name.
+After=sound.target
+Wants=sound.target
+RequiresMountsFor=/media/shows
+
+# Never stop retrying. The default (5 starts in 10 s, then stay down for good) is
+# exactly wrong for a stage box: the one time the limit is reached is a repeated
+# fault, and a daemon that has given up at that point ends the show. Preferred
+# over escalating to `StartLimitAction=reboot`, which costs 30+ seconds of certain
+# silence to fix something a retry might not even hit again.
+# Belongs in [Unit], not [Service] — systemd ignores it there.
+StartLimitIntervalSec=0
+
+# Explicitly *no* network dependency: §12 says no network is required at
+# showtime, and ordering after network-online.target would delay boot-to-ready
+# for a resource we never use.
+
+[Service]
+# `notify`, not `simple`: turtled sends READY=1 only once the stems are loaded,
+# the audio device is open, the control socket is bound and the transport is
+# armed. With `simple`, systemd would call us started the moment exec returned —
+# so a failure to load would look like a successful start followed by a crash.
+Type=notify
+NotifyAccess=main
+
+# Adjust these two to your install. The bundle path is the only thing most
+# setups need to change.
+ExecStart=/usr/local/bin/turtled control /media/shows/Current.turtle
+WorkingDirectory=/media/shows
+
+# --- Restart policy (§12: auto-restart) -------------------------------------
+# `always`, not `on-failure`: if the daemon exits for *any* reason mid-set we
+# want it back. 1 s is long enough to avoid a tight crash loop and short enough
+# to be unnoticeable between songs.
+Restart=always
+RestartSec=1
+# (The rate limit that would otherwise cap this lives in [Unit] above, because
+# systemd parses StartLimit* there — set in [Service] it is silently ignored.)
+
+# --- Watchdog (§12: hardware watchdog) --------------------------------------
+# A wedged control loop keeps the process alive, so Restart= alone cannot catch
+# it. turtled pings from the control loop itself, which is what makes a
+# successful ping mean "MIDI is still being dispatched". It pings at half this
+# interval, so one missed ping is survivable.
+WatchdogSec=15
+# SIGABRT (systemd's default) rather than SIGKILL, so a watchdog timeout leaves a
+# core/backtrace in the journal to diagnose afterwards. Restart=always then brings
+# it back either way.
+WatchdogSignal=SIGABRT
+
+# --- Real-time tuning (§12) -------------------------------------------------
+# The permission for turtled's own SCHED_FIFO calls (§3). This replaces the
+# /etc/security/limits.d file entirely: limits.conf is applied by PAM at *login*,
+# and a systemd service has no login session, so that file does nothing here.
+# 95 matches sched::MAX_PRIORITY — the daemon asks for 80 (audio) and 75 (MIDI).
+LimitRTPRIO=95
+# Permission for mlockall. Must be generous: with MCL_FUTURE a finite limit turns
+# a large stem preload into a hard ENOMEM instead of a slow allocation.
+LimitMEMLOCK=infinity
+
+# Do not let systemd apply a scheduling policy itself. `CPUSchedulingPolicy=fifo`
+# would put *every* thread — including the loader — at one priority, flattening
+# the audio-above-MIDI ordering the design rests on. turtled sets its own
+# per-thread priorities; systemd only needs to permit them.
+
+# The OOM killer must not pick the one process that is the point of the machine.
+OOMScoreAdjust=-900
+
+# --- Control socket (§10) ---------------------------------------------------
+# systemd creates /run/turtle on start and removes it on stop, so a crash cannot
+# leave a stale socket behind, and it works with a read-only rootfs (/run is
+# always a tmpfs). TURTLE_SOCKET is read by both turtled and the turtle CLI, so
+# `turtle status` over SSH finds this socket with no --socket flag — which also
+# matters because PrivateTmp below means the /tmp default would be invisible from
+# outside the service.
+RuntimeDirectory=turtle
+RuntimeDirectoryMode=0755
+Environment=TURTLE_SOCKET=/run/turtle/control.sock
+
+# --- User and filesystem ----------------------------------------------------
+# `audio` group for ALSA device access. Not root: nothing here needs it once
+# LimitRTPRIO/LimitMEMLOCK grant the two privileges that do.
+User=turtle
+Group=audio
+
+# Read-only rootfs (§12) from the service's own side, independent of whether the
+# SD card is overlay-mounted. `strict` makes the entire hierarchy read-only —
+# including /media/shows, which is correct: turtled only ever *reads* stems, and
+# the one thing it creates is the socket in RuntimeDirectory (writable by
+# exception). If a future feature needs to write, add a narrow ReadWritePaths=
+# rather than relaxing this.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Logs go to the journal; with a read-only/overlay root that is a tmpfs, which is
+# what we want — a yanked power cord cannot corrupt a log we do not persist.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
