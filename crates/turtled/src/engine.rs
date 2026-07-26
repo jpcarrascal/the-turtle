@@ -54,12 +54,44 @@ pub fn rt_event_channel(capacity: usize) -> (RtEventProducer, RtEventConsumer) {
     RingBuffer::new(capacity)
 }
 
+/// What an incoming MIDI message decoded to.
+///
+/// Recorded by [`Engine::handle_midi`] and read back with
+/// [`Engine::take_last_decoded`] so a reporter (`turtle monitor`, `--verbose`)
+/// can say what a message *meant* without re-running the decode — two decode
+/// paths would be free to drift apart, and the mute/DSP/transport precedence
+/// only exists in one of them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decoded {
+    /// Toggled a pair's mute.
+    Mute(usize),
+    /// Moved a live DSP parameter on a pair.
+    Dsp(usize, DspParam, u8),
+    /// A transport command (§8).
+    Transport(Command),
+}
+
+/// Rendered for humans reading `turtle monitor` while debugging a controller
+/// map, so it names the thing the way `show.toml` does (`pair0`, `cutoff`).
+impl std::fmt::Display for Decoded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Decoded::Mute(pair) => write!(f, "mute pair{pair}"),
+            Decoded::Dsp(pair, param, value) => {
+                write!(f, "dsp pair{pair} {} = {value}", format!("{param:?}").to_lowercase())
+            }
+            Decoded::Transport(cmd) => write!(f, "{}", format!("{cmd:?}").to_lowercase()),
+        }
+    }
+}
+
 pub struct Engine {
     transport: Transport,
     control: turtle_core::model::Control,
     active_notes: ActiveNotes,
     num_ports: usize,
     pending_preload: Option<String>,
+    last_decoded: Vec<Decoded>,
 }
 
 impl Engine {
@@ -70,6 +102,7 @@ impl Engine {
             active_notes: ActiveNotes::new(),
             num_ports: show.destinations.len().max(1),
             pending_preload: None,
+            last_decoded: Vec::new(),
         }
     }
 
@@ -80,6 +113,17 @@ impl Engine {
     /// A song the loader should preload, taken once (set by a `Preload` action).
     pub fn take_pending_preload(&mut self) -> Option<String> {
         self.pending_preload.take()
+    }
+
+    /// What the last [`Engine::handle_midi`] decoded, taken once.
+    ///
+    /// A `Vec` because one CC may legitimately fan out to several pairs (the
+    /// "same CC on all four delay times" mapping), and a reporter that showed
+    /// only the first would misrepresent it. **Empty** means the message
+    /// matched no binding — precisely what you need to see when a controller
+    /// map isn't firing, so callers should report that rather than skip it.
+    pub fn take_last_decoded(&mut self) -> Vec<Decoded> {
+        std::mem::take(&mut self.last_decoded)
     }
 
     /// Record a message the scheduler dispatched, so clean-release stays correct.
@@ -104,18 +148,27 @@ impl Engine {
         d2: u8,
         midi: &mut impl MidiSink,
     ) -> Vec<RtCommand> {
+        // Cleared first so a message that matches nothing leaves an empty
+        // record, rather than the previous message's decode lingering.
+        self.last_decoded.clear();
         if let Some(pair) = control_map::decode_mute(&self.control, status, d1, d2) {
+            self.last_decoded.push(Decoded::Mute(pair));
             return vec![RtCommand::ToggleMute(pair)];
         }
         let dsp = control_map::decode_dsp(&self.control, status, d1, d2);
         if !dsp.is_empty() {
+            self.last_decoded
+                .extend(dsp.iter().map(|&(pair, param, value)| Decoded::Dsp(pair, param, value)));
             return dsp
                 .into_iter()
                 .map(|(pair, param, value)| RtCommand::SetDsp(pair, param, value))
                 .collect();
         }
         match control_map::decode(&self.control, status, d1, d2) {
-            Some(cmd) => self.handle(cmd, midi),
+            Some(cmd) => {
+                self.last_decoded.push(Decoded::Transport(cmd));
+                self.handle(cmd, midi)
+            }
             None => Vec::new(),
         }
     }
@@ -292,6 +345,65 @@ song = "01-opener"
                 RtCommand::SetDsp(1, DspParam::DelayTime, 40),
             ]
         );
+    }
+
+    #[test]
+    fn decode_is_recorded_for_each_binding_kind() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+
+        e.handle_midi(0x90, 60, 100, &mut midi); // start
+        assert_eq!(e.take_last_decoded(), vec![Decoded::Transport(Command::Start)]);
+
+        e.handle_midi(0x90, 73, 100, &mut midi); // mute pair 1
+        assert_eq!(e.take_last_decoded(), vec![Decoded::Mute(1)]);
+
+        e.handle_midi(0xB0, 20, 90, &mut midi); // dsp_pair0_cutoff
+        assert_eq!(e.take_last_decoded(), vec![Decoded::Dsp(0, DspParam::Cutoff, 90)]);
+    }
+
+    /// The record must show *every* pair a fanned-out CC drove, or `monitor`
+    /// would under-report the "one CC on all four delay times" mapping.
+    #[test]
+    fn a_fanned_out_dsp_cc_records_every_pair_it_drove() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+        e.handle_midi(0xB0, 30, 40, &mut midi);
+        assert_eq!(
+            e.take_last_decoded(),
+            vec![
+                Decoded::Dsp(0, DspParam::DelayTime, 40),
+                Decoded::Dsp(1, DspParam::DelayTime, 40),
+            ]
+        );
+    }
+
+    /// An unmapped message records nothing — that empty result is what `monitor`
+    /// renders as "arrived, matched nothing", the whole point of map debugging.
+    #[test]
+    fn an_unmapped_message_records_no_decode() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+        e.handle_midi(0xB0, 99, 1, &mut midi); // CC 99 is bound to nothing
+        assert!(e.take_last_decoded().is_empty());
+    }
+
+    /// `take` must not let a previous message's decode linger and be reported
+    /// against a later, unmapped one.
+    #[test]
+    fn a_recorded_decode_does_not_leak_into_the_next_message() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+        e.handle_midi(0x90, 60, 100, &mut midi); // start — recorded
+        e.handle_midi(0xB0, 99, 1, &mut midi); // unmapped — must clear it
+        assert!(e.take_last_decoded().is_empty());
+    }
+
+    #[test]
+    fn decoded_renders_the_way_show_toml_names_things() {
+        assert_eq!(Decoded::Mute(2).to_string(), "mute pair2");
+        assert_eq!(Decoded::Dsp(0, DspParam::Cutoff, 90).to_string(), "dsp pair0 cutoff = 90");
+        assert_eq!(Decoded::Transport(Command::Start).to_string(), "start");
     }
 
     #[test]

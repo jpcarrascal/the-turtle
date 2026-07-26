@@ -102,6 +102,10 @@ fn data_bytes_for(status: u8) -> usize {
 struct LoadedSong {
     mixer: crate::mixer::Mixer,
     schedulers: Vec<crate::scheduler::PortScheduler>,
+    /// Song length. Carried alongside the mixer because song length is
+    /// per-song: after a switch, `turtle status` would otherwise keep
+    /// reporting the *previous* song's duration.
+    frames: u64,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -118,6 +122,7 @@ fn load_song_payload(
     Ok(LoadedSong {
         mixer: p.mixer,
         schedulers,
+        frames: p.frames,
     })
 }
 
@@ -137,18 +142,64 @@ fn spawn_load(
     });
 }
 
-/// Open the audio device + MIDI input, arm the song, and let the controller
-/// drive the transport until Ctrl-C. Linux only (ALSA).
+/// If the engine armed a song, kick off its background load.
+///
+/// `Select`/`Next`/`Prev` produce no `RtCommand` — only an `Action::Preload`,
+/// which surfaces through `take_pending_preload()`. So this must be called
+/// after *every* command that could arm a song, from **both** the MIDI and the
+/// socket path: miss it and `turtle arm second` would move the transport to
+/// `Loading` and sit there forever, because nothing ever loads the song.
+///
+/// `expected_song` is updated to the newly-armed name, which is what makes a
+/// superseded load (a second Select before the first finished) get dropped on
+/// arrival rather than misapplied.
+///
+/// Portable, like [`dispatch_rt`] — no ALSA types — so it type-checks here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pump_preload(
+    eng: &mut crate::engine::Engine,
+    expected_song: &mut Option<String>,
+    bundle: &std::path::Path,
+    rate: u32,
+    loader_tx: &std::sync::mpsc::Sender<(String, Result<LoadedSong, String>)>,
+    epoch: std::time::Instant,
+    verbose: bool,
+) {
+    let Some(song) = eng.take_pending_preload() else { return };
+    if verbose {
+        println!(
+            "[preload] \"{song}\" wall={:.3}s",
+            epoch.elapsed().as_secs_f64()
+        );
+    }
+    *expected_song = Some(song.clone());
+    spawn_load(bundle.to_path_buf(), song, rate, loader_tx.clone());
+}
+
+/// Open the audio device + MIDI input, arm the song, start the control socket,
+/// and let the controller (or the `turtle` CLI) drive the transport until
+/// Ctrl-C. Linux only (ALSA).
+///
+/// `socket_path` is where the §10 control socket binds. A bind failure is
+/// fatal rather than a warning: it means either a stale path we cannot clean
+/// up or a second `turtled` already running, and quietly playing a show that
+/// the CLI cannot talk to is the worse outcome (§12's "fail loudly").
 #[cfg(target_os = "linux")]
-pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Result<(), String> {
+pub fn run(
+    bundle: &std::path::Path,
+    song: Option<&str>,
+    verbose: bool,
+    socket_path: &std::path::Path,
+) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use alsa::rawmidi::Rawmidi;
     use alsa::Direction;
 
+    use turtle_core::proto::{Event, Source, Status};
     use turtle_core::{Command, State};
 
     use crate::alsa_backend::{AlsaAudio, AlsaMidi};
@@ -157,11 +208,19 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
     use crate::engine::{rt_channel, rt_event_channel, Engine, RtEvent};
     use crate::mixer::song_channel;
     use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
-    use crate::rt;
+    use crate::{rt, socket};
 
     // Reuse the play path's loader: preload the chosen (or first) song's stems.
-    let Playable { show, mut mixer, song_dir, .. } = load_playable(bundle, song)?;
+    let Playable {
+        show,
+        mut mixer,
+        song_dir,
+        frames,
+    } = load_playable(bundle, song)?;
     let rate = show.show.playback_rate;
+    // Song length in seconds, for `turtle status`. Reassigned on a song switch,
+    // since it is a property of the song, not the show.
+    let mut duration_s = frames as f64 / rate as f64;
 
     let audio = AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize)
         .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
@@ -222,9 +281,37 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
     let _ = eng.take_pending_preload();
     eng.handle(Command::Loaded, &mut midi_out);
 
+    // The song currently armed/playing, and the one held for a gapless
+    // advance — reported by `turtle status`, and kept in step with the
+    // transport's own notion of them as songs are switched below.
+    let mut current_song = Some(song_name.clone());
+    let mut armed_next_song: Option<String> = None;
+
+    // Start the control socket only once the transport is armed, so the very
+    // first `turtle status` a client can possibly see is already truthful.
+    // `status_handle`, not `status`: the MIDI byte loop below binds `status` to
+    // an incoming status byte, and shadowing this behind it would be a trap.
+    let status_handle: socket::StatusHandle = Arc::new(Mutex::new(Status {
+        show: show.show.name.clone(),
+        state: eng.state(),
+        song: current_song.clone(),
+        armed_next: None,
+        position_s: 0.0,
+        duration_s,
+    }));
+    let server = socket::start(
+        socket_path,
+        Arc::clone(&status_handle),
+        show.setlist.clone(),
+    )
+    .map_err(|e| format!("control socket {}: {e}", socket_path.display()))?;
+
     println!(
-        "armed \"{}\" on {}; drive it from {} (Ctrl-C to quit)",
-        show.show.name, show.audio.device, show.control.input_port
+        "armed \"{}\" on {}; drive it from {} or `turtle` on {} (Ctrl-C to quit)",
+        show.show.name,
+        show.audio.device,
+        show.control.input_port,
+        socket_path.display()
     );
 
     std::thread::scope(|s| {
@@ -247,15 +334,16 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
 
         // The control + MIDI-scheduler loop (one thread for v1). Each ~1 ms it:
         //  1. polls MIDI input (non-blocking) -> transport commands -> RT queue;
-        //  2. polls the background loader for a finished (or failed) preload;
-        //  3. polls the RT thread for an EndReached event;
-        //  4. dispatches due MIDI output while playing.
+        //  2. polls the control socket for CLI-injected commands (§10);
+        //  3. polls the background loader for a finished (or failed) preload;
+        //  4. polls the RT thread for an EndReached event;
+        //  5. dispatches due MIDI output while playing;
+        //  6. republishes the status snapshot the socket serves.
         let mut parser = MidiParser::new();
         let mut io = midi_in.io();
         let mut buf = [0u8; 64];
-        // Track play state locally so the scheduler only fires while running —
-        // when stopped, the interpolated clock would otherwise drift and emit.
-        let mut playing = false;
+        // What we believe the RT thread is doing (play state + last seek).
+        let mut view = RtView::default();
         // Which song name the next accepted loader result must match — a
         // fresh Select/Next/Prev before the previous one finished loading
         // supersedes it; the stale result is dropped when it arrives (§8).
@@ -272,24 +360,81 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                 for &byte in &buf[..n] {
                     let Some((status, d1, d2)) = parser.push(byte) else { continue };
                     // The engine may emit clean-release/panic MIDI to `midi_out`.
-                    for cmd in eng.handle_midi(status, d1, d2, &mut midi_out) {
-                        dispatch_rt(cmd, &mut playing, &mut schedulers, &mut tx, epoch, verbose);
+                    let rt_cmds = eng.handle_midi(status, d1, d2, &mut midi_out);
+                    // Report the raw message and what it meant, before acting on
+                    // it. Gated on `monitored()` because formatting this costs
+                    // allocations on a 1 ms loop, and nobody is watching during
+                    // an actual show. `take_last_decoded` must follow the
+                    // `handle_midi` it belongs to.
+                    if server.monitored() {
+                        let decoded = eng.take_last_decoded();
+                        let decoded = (!decoded.is_empty()).then(|| {
+                            decoded
+                                .iter()
+                                .map(|d| d.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        });
+                        // Report the real message length: Program Change carries
+                        // one data byte, and printing a phantom third would be a
+                        // lie in the one tool meant to explain the wire.
+                        let bytes = if data_bytes_for(status) == 1 {
+                            vec![status, d1]
+                        } else {
+                            vec![status, d1, d2]
+                        };
+                        server.publish(Event::Midi {
+                            wall_s: epoch.elapsed().as_secs_f64(),
+                            bytes,
+                            decoded,
+                        });
+                    }
+                    for cmd in rt_cmds {
+                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
                     }
                     // Select/Next/Prev arm a song without emitting any
                     // RtCommand (only `Action::Preload`), so this has to be
                     // checked unconditionally after every decoded message,
                     // not just when the loop above actually ran.
-                    if let Some(song) = eng.take_pending_preload() {
-                        if verbose {
-                            println!(
-                                "[preload] \"{song}\" wall={:.3}s",
-                                epoch.elapsed().as_secs_f64()
-                            );
-                        }
-                        expected_song = Some(song.clone());
-                        spawn_load(bundle_owned.clone(), song, rate, loader_tx.clone());
-                    }
+                    pump_preload(
+                        &mut eng,
+                        &mut expected_song,
+                        &bundle_owned,
+                        rate,
+                        &loader_tx,
+                        epoch,
+                        verbose,
+                    );
                 }
+            }
+
+            // Commands injected over the control socket (§10). `try_recv` never
+            // blocks, so a CLI client can never stall the scheduler. These take
+            // exactly the same path as a MIDI-decoded command — including the
+            // preload pump, without which `turtle arm` would sit in `Loading`
+            // forever.
+            while let Ok(cmd) = server.commands.try_recv() {
+                let rt_cmds = eng.handle(cmd, &mut midi_out);
+                if server.monitored() {
+                    server.publish(Event::Command {
+                        wall_s: epoch.elapsed().as_secs_f64(),
+                        source: Source::Socket,
+                        command: format!("{cmd:?}").to_lowercase(),
+                        state: eng.state(),
+                    });
+                }
+                for c in rt_cmds {
+                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                }
+                pump_preload(
+                    &mut eng,
+                    &mut expected_song,
+                    &bundle_owned,
+                    rate,
+                    &loader_tx,
+                    epoch,
+                    verbose,
+                );
             }
 
             // A finished (or failed) background load. `try_recv` never blocks.
@@ -314,6 +459,10 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                         let was_playing = eng.state() == State::Playing;
                         eng.handle(Command::Loaded, &mut midi_out); // always emits no RtCommand
                         if was_loading {
+                            // Read the length before `mixer`/`schedulers` are
+                            // moved out of `loaded` below.
+                            duration_s = loaded.frames as f64 / rate as f64;
+                            current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
                             if verbose {
@@ -323,6 +472,10 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                                 );
                             }
                         } else if was_playing {
+                            // Held for the gapless advance: the *current* song
+                            // is still the one playing, so only `armed_next`
+                            // (and not `duration_s`) changes here.
+                            armed_next_song = Some(song.clone());
                             held_next = Some(loaded);
                             if verbose {
                                 println!(
@@ -352,25 +505,31 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                         // held next song before its Seek(0)/Start land.
                         if was_playing && now_playing {
                             if let Some(held) = held_next.take() {
+                                duration_s = held.frames as f64 / rate as f64;
+                                // The song armed next has just become current.
+                                current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
                                 schedulers = held.schedulers;
                             }
                         }
+                        if server.monitored() {
+                            server.publish(Event::Command {
+                                wall_s: epoch.elapsed().as_secs_f64(),
+                                source: Source::Internal,
+                                command: "endreached".into(),
+                                state: eng.state(),
+                            });
+                        }
                         for cmd in cmds {
-                            dispatch_rt(
-                                cmd,
-                                &mut playing,
-                                &mut schedulers,
-                                &mut tx,
-                                epoch,
-                                verbose,
-                            );
+                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
                         }
                     }
                 }
             }
 
-            if playing {
+            // While playing, the interpolated clock is the live position; once
+            // stopped it would drift, so the last seek we dispatched stands in.
+            let position = if view.playing {
                 let wall_s = epoch.elapsed().as_secs_f64();
                 let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
                 for (port, sched) in schedulers.iter_mut().enumerate() {
@@ -389,6 +548,28 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
                         }
                     }
                 }
+                pos
+            } else {
+                view.position
+            };
+
+            // Republish what `turtle status` reads (§10). This is the only
+            // place that writes the snapshot. The lock is uncontended in
+            // practice and held for a few field writes; it is never taken by
+            // the audio RT thread, so it cannot cause an xrun.
+            {
+                let mut snap = socket::lock(&status_handle);
+                snap.state = eng.state();
+                snap.position_s = position as f64 / rate as f64;
+                snap.duration_s = duration_s;
+                // Only clone the names when they actually change — this runs
+                // ~1000x a second, and in the steady state they don't.
+                if snap.song.as_deref() != current_song.as_deref() {
+                    snap.song = current_song.clone();
+                }
+                if snap.armed_next.as_deref() != armed_next_song.as_deref() {
+                    snap.armed_next = armed_next_song.clone();
+                }
             }
 
             std::thread::sleep(Duration::from_millis(1));
@@ -401,19 +582,39 @@ pub fn run(bundle: &std::path::Path, song: Option<&str>, verbose: bool) -> Resul
     Ok(())
 }
 
+/// The control thread's view of what the audio RT thread is doing, kept in
+/// sync by [`dispatch_rt`] as commands are forwarded.
+///
+/// Not authoritative — the audio thread owns the real transport — but it is
+/// what gates the MIDI scheduler and what `turtle status` reports.
+#[derive(Debug, Default, Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct RtView {
+    /// Whether the transport is running. The scheduler only dispatches while
+    /// it is: stopped, the interpolated clock would drift and emit.
+    playing: bool,
+    /// The last position we *told* the RT thread to be at, via `Seek`.
+    ///
+    /// While playing, the interpolated clock is the better answer and this is
+    /// stale — but once stopped the clock keeps drifting, so this is what
+    /// `status` must report. `Stop` with `rewind_on_stop` emits `Seek(0)` right
+    /// behind it, so tracking seeks is what makes a stopped position honest.
+    position: u64,
+}
+
 /// Apply one `RtCommand`'s control-thread side effects (verbose logging,
-/// local `playing`/scheduler-cursor bookkeeping) and forward it to the RT
+/// local [`RtView`]/scheduler-cursor bookkeeping) and forward it to the RT
 /// audio thread. A plain function rather than a closure over `run`'s locals:
-/// it's called from two places (the MIDI-driven path and the
-/// EndReached-driven gapless-advance path), and a long-lived closure
-/// capturing `schedulers` by `&mut` would conflict with the plain
+/// it's called from three places (the MIDI-driven path, the socket-driven
+/// path, and the EndReached-driven gapless-advance path), and a long-lived
+/// closure capturing `schedulers` by `&mut` would conflict with the plain
 /// reassignments (`schedulers = loaded.schedulers`) elsewhere in the loop.
 /// Portable (no ALSA types) so it's type-checked on the dev Mac even though
 /// its only caller, `run`, is `cfg(linux)`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn dispatch_rt(
     cmd: crate::engine::RtCommand,
-    playing: &mut bool,
+    view: &mut RtView,
     schedulers: &mut [crate::scheduler::PortScheduler],
     tx: &mut crate::engine::RtProducer,
     epoch: std::time::Instant,
@@ -423,19 +624,20 @@ fn dispatch_rt(
 
     match cmd {
         RtCommand::Start => {
-            *playing = true;
+            view.playing = true;
             if verbose {
                 println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }
         }
         RtCommand::Stop => {
-            *playing = false;
+            view.playing = false;
             if verbose {
                 println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }
         }
         // Rewind: realign the output cursors with the audio.
         RtCommand::Seek(pos) => {
+            view.position = pos;
             for sched in schedulers.iter_mut() {
                 sched.seek(pos);
             }
