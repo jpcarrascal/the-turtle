@@ -1,9 +1,18 @@
-//! Real-time tuning: `SCHED_FIFO` thread priorities and `mlockall` (spec §3, §12).
+//! Real-time tuning: thread priorities, memory locking, CPU pinning (spec §3, §12).
 //!
-//! Two independent things can stall an audio period, and this module does both:
-//! [`apply_or_warn`] stops *other tasks* from taking the CPU, and
-//! [`lock_memory_or_warn`] stops the *kernel* from making us wait on a page
-//! fault. Priority alone is only half the job — see [`lock_memory`].
+//! Three independent things can stall an audio period, and this module addresses
+//! each:
+//!
+//!   * [`apply_or_warn`] — `SCHED_FIFO`, so *other tasks* cannot take the CPU.
+//!   * [`lock_memory_or_warn`] — `mlockall`, so the *kernel* cannot make us wait
+//!     on a page fault. Priority does not help there; see [`lock_memory`].
+//!   * [`pin_or_warn`] — CPU affinity, so the audio thread gets a core to itself
+//!     when one has been reserved with `isolcpus`. Without pinning, that kernel
+//!     parameter reserves a core nothing ever uses; see
+//!     [`pin_current_thread_to_cpu`].
+//!
+//! All three are best-effort and independently optional, because §12's failure
+//! policy is that a show must never refuse to play over a tuning issue.
 //!
 //! The spec's thread table asks for the audio loop and the MIDI scheduler to run
 //! under `SCHED_FIFO` while the control and loader threads stay at normal
@@ -144,6 +153,185 @@ pub fn set_current_thread_fifo(_priority: u8) -> Result<(), String> {
     ))
 }
 
+/// The RT tuning knobs, resolved once at startup and passed as one value.
+///
+/// Grouped rather than threaded through as separate parameters because they are
+/// one decision ("how aggressively do we tune?") made in one place, they are
+/// always passed together, and `run`/`run_audio` are already at the edge of
+/// readable arity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Tuning {
+    /// Audio-thread `SCHED_FIFO` priority; `None` = normal priority.
+    pub rt_priority: Option<u8>,
+    /// CPU to pin the audio thread to; `None` = leave placement to the scheduler.
+    pub audio_cpu: Option<usize>,
+}
+
+impl Tuning {
+    /// The fused control/MIDI thread's priority: one step below audio, or `None`
+    /// when RT is off (§3). Derived rather than stored so the two cannot drift.
+    pub fn midi_priority(&self) -> Option<u8> {
+        self.rt_priority.map(midi_priority_for)
+    }
+
+    /// Whether RT tuning is on at all. `mlockall` follows this too, so
+    /// `--rt-prio 0` gives a wholly untuned baseline rather than a half-tuned one.
+    pub fn rt_enabled(&self) -> bool {
+        self.rt_priority.is_some()
+    }
+}
+
+/// Where the kernel reports the CPUs removed from the general scheduler.
+///
+/// Populated by the `isolcpus=` kernel command-line parameter. Empty (or absent)
+/// on an untuned system, which is the signal we use to mean "do not pin".
+const ISOLATED_CPUS_PATH: &str = "/sys/devices/system/cpu/isolated";
+
+/// Where the current CPU frequency governor is reported (CPU 0 stands in for the
+/// package — the Pi scales all four cores together).
+const GOVERNOR_PATH: &str = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor";
+
+/// Parse a kernel "cpulist" — `"3"`, `"2-3"`, `"1,3-5"`, or empty.
+///
+/// Its own function because this is the only part of CPU pinning that is pure
+/// logic, so it is the only part testable on the dev Mac. Malformed entries are
+/// skipped rather than erroring: this drives an optimisation, and a garbled
+/// `isolcpus=` should degrade to "don't pin" rather than refuse to start a show.
+pub fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                    // Guard against a reversed range ("3-1") producing nothing
+                    // surprising; an empty iterator is the natural result.
+                    out.extend(lo..=hi.max(lo));
+                }
+            }
+            None => {
+                if let Ok(n) = part.trim().parse::<usize>() {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The CPUs the kernel has isolated, or empty if none / not Linux.
+pub fn isolated_cpus() -> Vec<usize> {
+    std::fs::read_to_string(ISOLATED_CPUS_PATH)
+        .map(|s| parse_cpu_list(&s))
+        .unwrap_or_default()
+}
+
+/// Which CPU the audio thread should be pinned to, given the isolated set.
+///
+/// Picks the **highest** isolated CPU. Arbitrary but deliberate: `isolcpus`
+/// examples conventionally isolate the top core(s), and CPU 0 handles most IRQ
+/// and kernel housekeeping work on the Pi, so counting down stays away from it
+/// even if someone isolates an unusual set.
+///
+/// `None` when nothing is isolated — pinning to a core the rest of the system is
+/// also using would *reduce* determinism, not improve it, because the audio
+/// thread would lose the scheduler's freedom to migrate away from a busy core
+/// without gaining a core of its own.
+pub fn audio_cpu_for(isolated: &[usize]) -> Option<usize> {
+    isolated.iter().copied().max()
+}
+
+/// Pin the **calling** thread to one CPU.
+///
+/// Despite `sched_setaffinity`'s `pid` argument, passing 0 means "this thread"
+/// on Linux (affinity is per-thread), which is what lets this follow the same
+/// call-it-first-thing-on-the-new-thread pattern as
+/// [`set_current_thread_fifo`].
+///
+/// # Why pin at all
+///
+/// `isolcpus=3` alone does nothing for us: it removes CPU 3 from the general
+/// scheduler, but no thread lands there unless explicitly placed. Pinning the
+/// audio thread to that reserved core is what turns the kernel parameter into an
+/// actual guarantee — the audio loop then runs on a CPU with no other runnable
+/// work on it at all.
+#[cfg(target_os = "linux")]
+pub fn pin_current_thread_to_cpu(cpu: usize) -> Result<(), String> {
+    // SAFETY: `cpu_set_t` is a plain bitmask struct; all-zero is the valid
+    // "empty set" state that CPU_SET then populates.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a live, initialised cpu_set_t and `cpu` is bounds-checked
+    // by the kernel against the mask size on the call below.
+    unsafe { libc::CPU_SET(cpu, &mut set) };
+
+    // SAFETY: pid 0 = the calling thread; `&set` is valid for the call.
+    let rc = unsafe {
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    let hint = match err.raw_os_error() {
+        // The requested CPU is not in the process's allowed set — usually a
+        // typo'd --audio-cpu, or a systemd CPUAffinity= narrowing it.
+        Some(libc::EINVAL) => " (no such CPU, or it is outside this process's allowed set)",
+        _ => "",
+    };
+    Err(format!("sched_setaffinity(cpu {cpu}) failed: {err}{hint}"))
+}
+
+/// Non-Linux stub, mirroring the other tuning calls.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_current_thread_to_cpu(_cpu: usize) -> Result<(), String> {
+    Err(format!(
+        "CPU pinning is Linux-only (this host is {})",
+        std::env::consts::OS
+    ))
+}
+
+/// Pin and report, never failing the caller.
+///
+/// `None` means "do not pin", which is the *normal* case on an untuned system
+/// (nothing isolated) — so it reports plainly rather than warning. Only an actual
+/// failed attempt warrants a warning.
+pub fn pin_or_warn(what: &str, cpu: Option<usize>) {
+    let Some(cpu) = cpu else { return };
+    match pin_current_thread_to_cpu(cpu) {
+        Ok(()) => println!("[sched] {what} thread: pinned to CPU {cpu}"),
+        Err(e) => eprintln!("warning: {what} thread not pinned: {e}"),
+    }
+}
+
+/// Report the CPU frequency governor, for the startup log.
+///
+/// Read-only: setting it needs root and is system-wide, so it belongs to
+/// deployment (`deploy/turtle-tuning.service`), not to the daemon. But *reporting*
+/// it needs no privilege and answers "did my tuning actually take effect?", which
+/// is otherwise a surprisingly annoying question at 5pm on a stage.
+pub fn cpu_governor() -> Option<String> {
+    std::fs::read_to_string(GOVERNOR_PATH)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// One line describing the CPU tuning actually in effect (§12).
+///
+/// Deliberately reports the *observed* state rather than what was requested, so
+/// the log answers whether `isolcpus`/the governor unit took effect — a
+/// `performance` governor here is proof, a `powersave` one is a finding.
+pub fn describe_cpu_tuning() -> String {
+    let isolated = isolated_cpus();
+    let gov = cpu_governor().unwrap_or_else(|| "unknown".into());
+    if isolated.is_empty() {
+        format!("governor {gov}, no isolated CPUs (isolcpus not set)")
+    } else {
+        format!("governor {gov}, isolated CPUs {isolated:?}")
+    }
+}
+
 /// Pin the whole process's memory into RAM with `mlockall` (§12).
 ///
 /// # Why this is not the same thing as `SCHED_FIFO`
@@ -280,6 +468,101 @@ mod tests {
     fn a_minimal_priority_saturates_instead_of_wrapping() {
         assert_eq!(midi_priority_for(1), 1);
         assert_eq!(midi_priority_for(3), 1);
+    }
+
+    /// The kernel writes cpulists in several shapes and we read this file to
+    /// decide where the audio thread lands, so all of them must parse.
+    #[test]
+    fn cpu_lists_parse_in_every_kernel_shape() {
+        assert_eq!(parse_cpu_list("3"), vec![3]);
+        assert_eq!(parse_cpu_list("2-3"), vec![2, 3]);
+        assert_eq!(parse_cpu_list("1,3-5"), vec![1, 3, 4, 5]);
+        // Trailing newline is how the sysfs file actually arrives.
+        assert_eq!(parse_cpu_list("2-3\n"), vec![2, 3]);
+        // Duplicates and unsorted input normalise, so `max()` below is sound.
+        assert_eq!(parse_cpu_list("3,1,3"), vec![1, 3]);
+    }
+
+    /// An untuned system has an empty `isolated` file. That must mean "do not
+    /// pin", not "pin to CPU 0" — pinning to a shared core would make things
+    /// worse by removing the scheduler's freedom to migrate off a busy CPU.
+    #[test]
+    fn no_isolated_cpus_means_no_pinning() {
+        assert_eq!(parse_cpu_list(""), Vec::<usize>::new());
+        assert_eq!(parse_cpu_list("\n"), Vec::<usize>::new());
+        assert_eq!(audio_cpu_for(&[]), None);
+    }
+
+    /// A garbled `isolcpus=` must degrade to "don't pin" rather than panic or
+    /// refuse to start: this drives an optimisation, not correctness.
+    #[test]
+    fn a_malformed_cpu_list_degrades_instead_of_failing() {
+        assert_eq!(parse_cpu_list("banana"), Vec::<usize>::new());
+        assert_eq!(parse_cpu_list("1,,banana,3"), vec![1, 3]);
+        // A reversed range must not silently produce a huge or empty-then-panic
+        // result.
+        assert_eq!(parse_cpu_list("3-1"), vec![3]);
+    }
+
+    /// Pin to the top isolated core, staying away from CPU 0 (IRQs and kernel
+    /// housekeeping land there on the Pi).
+    #[test]
+    fn the_audio_thread_takes_the_highest_isolated_cpu() {
+        assert_eq!(audio_cpu_for(&[3]), Some(3));
+        assert_eq!(audio_cpu_for(&[2, 3]), Some(3));
+        assert_eq!(audio_cpu_for(&[0, 1]), Some(1));
+    }
+
+    /// Pinning must actually take effect, not merely return `Ok`. Reads the mask
+    /// back from the kernel, which is the only way to catch a wrong `CPU_SET`
+    /// call or a silently-ignored request.
+    ///
+    /// Restores the original mask so the rest of the suite is unaffected —
+    /// affinity is per-thread, but the test harness reuses threads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinning_actually_moves_the_thread_and_is_reversible() {
+        // SAFETY: a plain bitmask struct; all-zero is the valid empty set.
+        let mut before: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: pid 0 = calling thread; `before` is a live, correctly-sized set.
+        let rc = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut before)
+        };
+        assert_eq!(rc, 0, "could not read the current affinity mask");
+
+        // Pin to a CPU we are already allowed to run on, so this tests our call
+        // rather than the container's cpuset policy.
+        // SAFETY: reads a bit from an initialised set.
+        let target = (0..256).find(|&c| unsafe { libc::CPU_ISSET(c, &before) });
+        let Some(target) = target else {
+            eprintln!("affinity: no CPU in the allowed set; skipping");
+            return;
+        };
+
+        pin_current_thread_to_cpu(target).expect("pinning to an allowed CPU should succeed");
+
+        // SAFETY: same pattern as above.
+        let mut after: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: pid 0 = calling thread.
+        let rc = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut after)
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: reads from an initialised set.
+        let count = unsafe { libc::CPU_COUNT(&after) };
+        assert_eq!(count, 1, "expected exactly one CPU in the mask, got {count}");
+        // SAFETY: reads a bit from an initialised set.
+        assert!(
+            unsafe { libc::CPU_ISSET(target, &after) },
+            "the one CPU in the mask should be the one we asked for"
+        );
+        eprintln!("affinity: pinned to CPU {target} and read it back");
+
+        // SAFETY: restoring the mask we read at entry.
+        let rc = unsafe {
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &before)
+        };
+        assert_eq!(rc, 0, "could not restore the original affinity mask");
     }
 
     /// `mlockall` either works or fails for one of the two documented reasons —

@@ -14,8 +14,10 @@
 //! drives its transport from a live MIDI controller *and* the control socket.
 //! The default `turtled <show.toml>` still just loads + validates.
 //!
-//! The audio and MIDI threads request `SCHED_FIFO` priorities on startup and the
-//! process locks its memory ([`sched`], §3/§12); `--rt-prio 0` opts out of both.
+//! The audio and MIDI threads request `SCHED_FIFO` priorities on startup, the
+//! process locks its memory, and the audio thread is pinned to an
+//! `isolcpus`-reserved core if there is one ([`sched`], §3/§12); `--rt-prio 0`
+//! opts out of the first two and `--audio-cpu none` out of the third.
 //! Under systemd it reports readiness and pings the watchdog ([`notify`], §12) —
 //! started from a shell, that is a no-op.
 //!
@@ -86,6 +88,12 @@ fn main() -> ExitCode {
                 "  --rt-prio <n>        SCHED_FIFO priority for audio (default {}, 0 disables)",
                 sched::AUDIO_PRIORITY
             );
+            eprintln!(
+                "  --audio-cpu <n>      pin the audio thread to a CPU; 'auto' (default) uses an"
+            );
+            eprintln!(
+                "                       isolcpus-reserved core if there is one, 'none' never pins"
+            );
             ExitCode::FAILURE
         }
     }
@@ -99,7 +107,8 @@ fn arg_error(e: String) -> ExitCode {
 
 /// Parsed args for the `play` / `control` subcommands: two positionals (bundle,
 /// song), a `-v`/`--verbose` flag, an optional `--socket <path>` (control only),
-/// and an optional `--rt-prio <n>`, all accepted in any position.
+/// an optional `--rt-prio <n>`, and an optional `--audio-cpu <n|auto|none>`, all
+/// accepted in any position.
 #[derive(Debug)]
 struct CmdOpts {
     bundle: Option<String>,
@@ -109,15 +118,70 @@ struct CmdOpts {
     /// Audio-thread `SCHED_FIFO` priority; `None` = run at normal priority.
     /// The MIDI/control thread derives its own one step below (§3).
     rt_priority: Option<u8>,
+    /// Which CPU to pin the audio thread to (§12).
+    audio_cpu: CpuChoice,
+}
+
+/// How the audio thread's CPU is chosen.
+///
+/// Three states rather than `Option<usize>` because "decide for me" and "don't
+/// pin" are genuinely different intents, and collapsing them would make the
+/// default unexpressible: `Auto` pins only when a core has actually been
+/// reserved with `isolcpus`, whereas `None` is an explicit override for A/B
+/// testing on a machine that *does* have one reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuChoice {
+    /// Pin to the top isolated CPU if any exist, else do not pin. The default.
+    Auto,
+    /// Never pin, even if CPUs are isolated.
+    None,
+    /// Pin to exactly this CPU.
+    Fixed(usize),
+}
+
+impl CpuChoice {
+    /// Resolve to an actual CPU, consulting the kernel only for `Auto`.
+    fn resolve(self) -> Option<usize> {
+        match self {
+            CpuChoice::Auto => sched::audio_cpu_for(&sched::isolated_cpus()),
+            CpuChoice::None => Option::None,
+            CpuChoice::Fixed(cpu) => Some(cpu),
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "auto" => Ok(CpuChoice::Auto),
+            // Both spellings: "none" reads naturally, "-1" matches how
+            // `--rt-prio 0` disables its feature.
+            "none" | "-1" => Ok(CpuChoice::None),
+            _ => raw
+                .parse::<usize>()
+                .map(CpuChoice::Fixed)
+                .map_err(|_| format!("--audio-cpu: '{raw}' is not a CPU number, 'auto', or 'none'")),
+        }
+    }
 }
 
 impl CmdOpts {
+    /// Collapse the parsed flags into the tuning the RT threads actually use.
+    /// This is where `--audio-cpu auto` becomes a concrete CPU (or nothing).
+    fn tuning(&self) -> sched::Tuning {
+        sched::Tuning {
+            rt_priority: self.rt_priority,
+            audio_cpu: self.audio_cpu.resolve(),
+        }
+    }
+
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut positionals = Vec::new();
         let mut verbose = false;
         let mut socket = None;
         // Default to the spec's RT behaviour (§3); `--rt-prio 0` opts out.
         let mut rt_priority = Some(sched::AUDIO_PRIORITY);
+        // Auto: use a reserved core if `isolcpus` gave us one, otherwise leave
+        // placement to the scheduler (§12).
+        let mut audio_cpu = CpuChoice::Auto;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-v" | "--verbose" => verbose = true,
@@ -135,6 +199,12 @@ impl CmdOpts {
                     // it maps to None rather than to an invalid priority.
                     rt_priority = (n > 0).then_some(n);
                 }
+                "--audio-cpu" => {
+                    let raw = args
+                        .next()
+                        .ok_or("--audio-cpu needs a CPU number, 'auto', or 'none'")?;
+                    audio_cpu = CpuChoice::parse(&raw)?;
+                }
                 _ => positionals.push(arg),
             }
         }
@@ -145,12 +215,17 @@ impl CmdOpts {
             verbose,
             socket,
             rt_priority,
+            audio_cpu,
         })
     }
 }
 
 /// `turtled control <bundle> [song]`: drive a song's transport from live MIDI.
 fn control_command(opts: CmdOpts) -> ExitCode {
+    // Resolve `--audio-cpu auto` against the kernel here, before any thread is
+    // spawned, so the decision is made once and both threads see the same answer.
+    // Must precede the `opts.bundle` move below.
+    let tuning = opts.tuning();
     let Some(bundle) = opts.bundle else {
         eprintln!("usage: turtled control <bundle-dir> [song] [-v]");
         return ExitCode::FAILURE;
@@ -173,7 +248,7 @@ fn control_command(opts: CmdOpts) -> ExitCode {
             opts.song.as_deref(),
             opts.verbose,
             std::path::Path::new(&socket),
-            opts.rt_priority,
+            tuning,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -184,7 +259,7 @@ fn control_command(opts: CmdOpts) -> ExitCode {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&bundle, &opts.song, opts.verbose, &socket, opts.rt_priority);
+        let _ = (&bundle, &opts.song, opts.verbose, &socket, tuning);
         eprintln!(
             "control requires Linux/ALSA (this host is {})",
             std::env::consts::OS
@@ -195,6 +270,7 @@ fn control_command(opts: CmdOpts) -> ExitCode {
 
 /// `turtled play <bundle> [song]`: play a bundle's song to the audio device.
 fn play_command(opts: CmdOpts) -> ExitCode {
+    let tuning = opts.tuning();
     let Some(bundle) = opts.bundle else {
         eprintln!("usage: turtled play <bundle-dir> [song] [-v]");
         return ExitCode::FAILURE;
@@ -205,7 +281,7 @@ fn play_command(opts: CmdOpts) -> ExitCode {
             std::path::Path::new(&bundle),
             opts.song.as_deref(),
             opts.verbose,
-            opts.rt_priority,
+            tuning,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -218,7 +294,7 @@ fn play_command(opts: CmdOpts) -> ExitCode {
     {
         // The audio runtime is Linux-only; keep the args "used" so the dev-Mac
         // build stays warning-free.
-        let _ = (&bundle, &opts.song, opts.verbose, opts.rt_priority);
+        let _ = (&bundle, &opts.song, opts.verbose, tuning);
         eprintln!(
             "play requires Linux/ALSA (this host is {})",
             std::env::consts::OS
@@ -302,6 +378,54 @@ mod tests {
         let err = parse(&["bundle", "--rt-prio", "high"]).unwrap_err();
         assert!(err.contains("not a number"), "{err}");
         assert!(parse(&["bundle", "--rt-prio"]).is_err());
+    }
+
+    /// Pinning must default to `Auto` — using a reserved core if the operator set
+    /// one up, and doing nothing if they did not. Neither "always pin" nor "never
+    /// pin" is a sensible default.
+    #[test]
+    fn audio_cpu_defaults_to_auto() {
+        assert_eq!(parse(&["bundle"]).unwrap().audio_cpu, CpuChoice::Auto);
+    }
+
+    /// All three spellings of the flag, including both opt-outs.
+    #[test]
+    fn audio_cpu_accepts_a_number_auto_or_none() {
+        assert_eq!(
+            parse(&["b", "--audio-cpu", "3"]).unwrap().audio_cpu,
+            CpuChoice::Fixed(3)
+        );
+        assert_eq!(
+            parse(&["b", "--audio-cpu", "auto"]).unwrap().audio_cpu,
+            CpuChoice::Auto
+        );
+        assert_eq!(
+            parse(&["b", "--audio-cpu", "none"]).unwrap().audio_cpu,
+            CpuChoice::None
+        );
+        // `-1` mirrors how `--rt-prio 0` disables its feature.
+        assert_eq!(
+            parse(&["b", "--audio-cpu", "-1"]).unwrap().audio_cpu,
+            CpuChoice::None
+        );
+    }
+
+    /// A typo must be a loud usage error, not a silent fall back to `auto` —
+    /// otherwise a deliberate pinning attempt fails invisibly.
+    #[test]
+    fn a_bad_audio_cpu_is_an_error() {
+        let err = parse(&["b", "--audio-cpu", "core3"]).unwrap_err();
+        assert!(err.contains("not a CPU number"), "{err}");
+        assert!(parse(&["b", "--audio-cpu"]).is_err());
+    }
+
+    /// `CpuChoice::None` must resolve to no pinning even on a machine that *does*
+    /// have isolated CPUs — that is the whole point of the explicit override, and
+    /// it must not consult the kernel at all.
+    #[test]
+    fn explicit_none_never_pins_and_fixed_never_consults_the_kernel() {
+        assert_eq!(CpuChoice::None.resolve(), None);
+        assert_eq!(CpuChoice::Fixed(2).resolve(), Some(2));
     }
 
     /// Flags are position-independent and must not be mistaken for positionals.

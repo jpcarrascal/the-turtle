@@ -185,17 +185,20 @@ fn pump_preload(
 /// up or a second `turtled` already running, and quietly playing a show that
 /// the CLI cannot talk to is the worse outcome (§12's "fail loudly").
 ///
-/// `rt_priority` is the audio thread's `SCHED_FIFO` priority; the fused
-/// control/MIDI thread derives its own one step below (§3, [`crate::sched`]).
-/// `None` disables RT scheduling entirely and runs both at normal priority —
-/// the pre-§3 behaviour, kept for A/B comparison on the Pi.
+/// `tuning` carries the §3/§12 RT knobs: thread priority (the fused control/MIDI
+/// thread derives its own one step below), whether memory is locked, and which
+/// CPU the audio thread is pinned to. `--rt-prio 0` disables the lot and runs at
+/// normal priority — the pre-§3 behaviour, kept for A/B comparison on the Pi.
 #[cfg(target_os = "linux")]
 pub fn run(
     bundle: &std::path::Path,
     song: Option<&str>,
     verbose: bool,
     socket_path: &std::path::Path,
-    rt_priority: Option<u8>,
+    // Fully qualified: this function's `use` statements are inside its body (so
+    // the ALSA imports stay out of the non-Linux build), which means the
+    // signature cannot see the short `sched` path.
+    tuning: crate::sched::Tuning,
 ) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
@@ -218,13 +221,18 @@ pub fn run(
 
     // Resolve both thread priorities up front, so the ordering invariant
     // (audio > midi) is established in one place rather than at two spawn sites.
-    let audio_priority = rt_priority;
-    let midi_priority = rt_priority.map(sched::midi_priority_for);
+    let audio_priority = tuning.rt_priority;
+    let midi_priority = tuning.midi_priority();
 
     // Lock memory before anything large is allocated. Process-wide, so unlike the
     // per-thread priority calls this belongs here rather than at a spawn site;
     // `MCL_FUTURE` means the stems loaded below are covered as they arrive (§12).
-    sched::lock_memory_or_warn(rt_priority.is_some());
+    sched::lock_memory_or_warn(tuning.rt_enabled());
+
+    // Report the CPU tuning actually in effect (§12) — the governor and whether
+    // isolcpus reserved a core. Read-only: setting these is deployment's job, but
+    // logging them is how you find out the tuning did not take.
+    println!("[sched] cpu: {}", sched::describe_cpu_tuning());
 
     // systemd, if it started us. A no-op from a shell, so there is no branch on
     // "are we a service" anywhere below (§12).
@@ -351,6 +359,9 @@ pub fn run(
             // rendered: ask for SCHED_FIFO (§3). Best-effort — a failure warns
             // and plays on at normal priority (see `crate::sched`).
             sched::apply_or_warn("audio", audio_priority);
+            // Pin after the priority is set, so if pinning fails we at least
+            // keep the priority we just got (§12).
+            sched::pin_or_warn("audio", tuning.audio_cpu);
             rt::run_audio(
                 &audio,
                 &mut mixer,

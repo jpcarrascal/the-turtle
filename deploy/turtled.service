@@ -18,6 +18,12 @@ After=sound.target
 Wants=sound.target
 RequiresMountsFor=/media/shows
 
+# System-wide tuning that needs root (CPU governor, §12). `Wants=`, not
+# `Requires=`: a failed tuning step must not stop the show from playing, and
+# turtled logs the governor it observes so a miss is still visible.
+Wants=turtle-tuning.service
+After=turtle-tuning.service
+
 # Never stop retrying. The default (5 starts in 10 s, then stay down for good) is
 # exactly wrong for a stage box: the one time the limit is reached is a repeated
 # fault, and a daemon that has given up at that point ends the show. Preferred

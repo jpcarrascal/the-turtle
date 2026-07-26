@@ -1,0 +1,52 @@
+# System-wide RT tuning that needs root (spec §12).
+#
+# Separate from turtled.service on purpose. Setting the CPU governor means writing
+# to /sys, which needs root — and turtled deliberately runs as an unprivileged
+# `turtle` user with NoNewPrivileges=true. Rather than weaken that (the daemon is
+# the thing exposed to a control socket and to stem files), the privileged work is
+# hoisted into this tiny oneshot that runs once at boot and exits.
+#
+# Everything here is system-wide and idempotent, so it is safe to re-run and there
+# is nothing to undo on stop.
+#
+# Install:
+#   sudo cp deploy/turtle-tuning.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now turtle-tuning
+
+[Unit]
+Description=The Turtle — system RT tuning (CPU governor)
+Documentation=https://github.com/jpcarrascal/the-turtle
+# Ordered before the daemon so the governor is already set when audio starts.
+Before=turtled.service
+# Not `Requires=`: if this fails, the show must still play (§12's failure policy).
+# turtled logs the governor it observes at startup, so a silent miss is still
+# visible rather than invisible.
+
+[Service]
+Type=oneshot
+# The unit stays "active" after exiting so `systemctl status` shows it ran, and
+# so Before= ordering is meaningful.
+RemainAfterExit=yes
+
+# `performance` pins the cores at their maximum clock. The default `ondemand`
+# governor ramps up *in response to* load, which is exactly the wrong shape for
+# audio: the ramp latency lands on the first periods after a quiet passage, and
+# the clock transitions themselves add jitter. A Pi 4 running four cores flat out
+# is a heat and power question, not a stability one, and this is a mains-powered
+# appliance.
+#
+# Writes to every core: the Pi scales the package together, but the sysfs
+# interface is per-CPU and being explicit costs nothing.
+ExecStart=/bin/sh -c 'for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do [ -w "$c" ] && echo performance > "$c"; done; true'
+
+# Report what actually took effect, so `journalctl -u turtle-tuning` is the
+# answer to "is the governor set?" rather than something to work out by hand.
+ExecStartPost=/bin/sh -c 'echo "governor now: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unavailable)"'
+
+# `true` above and `-w` guards mean a kernel or board without cpufreq (or a
+# container) is a no-op rather than a failed unit.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
