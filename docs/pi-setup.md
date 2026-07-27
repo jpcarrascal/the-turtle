@@ -248,6 +248,52 @@ assumes one subdevice per port on device 0, which is how both interfaces on this
 rig enumerate. If a device does not fit that shape, write its full address in
 `port` — no new syntax needed.
 
+## Looping a song (§14)
+
+A song repeats seamlessly until stopped when its `song.toml` says so:
+
+```toml
+[song]
+name = "Opener"
+bpm  = 122.0
+length_samples = 14112000
+loop = true
+```
+
+What changes while a song loops:
+
+- **It never ends**, so the gapless auto-advance to the next setlist entry never
+  fires. **Stop is the only way out** — that is the point, not an oversight.
+- **`turtle status` says so**, which matters because a looping song never reaches
+  `ended`, so "the position stopped rising" and "the song is over" would otherwise
+  be indistinguishable:
+  ```
+  song:   opener (looping)
+  ```
+- **MIDI keeps firing.** Each destination's scheduler rewinds at the seam, so
+  lights and pedal cues repeat with the audio rather than playing once.
+
+To try it without editing anything:
+
+```bash
+turtle gen-tone /media/shows/Loop.turtle 4 440 --loop
+```
+
+then point its `show.toml` at your devices. **Re-running `gen-tone` over an
+existing bundle is refused**, because it rewrites `show.toml` and `song.toml` from
+templates and would silently discard those device settings — the failure would
+show up much later as a device that will not open. Pass `--force` if you really do
+want to start over.
+
+The seam is sample-accurate: the wrap happens **inside** the audio buffer, not at
+its boundary. Wrapping only at buffer boundaries would quantise the loop point to
+the period size — about 21 ms at 1024 frames — which you would hear as a gap every
+time round. Seamlessness beyond that is a property of your stems: they must be an
+exact whole number of bars, which Ableton's bounce already gives you.
+
+`turtled play` is a fixed-duration tool and stops after one pass even for a
+looping song; use `turtled control` (or the service) to hear it repeat.
+
 ## Preflight: `turtle doctor` (§10)
 
 Everything below this point adds a "run this and check the output" step. `doctor`

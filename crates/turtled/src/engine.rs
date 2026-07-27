@@ -51,6 +51,12 @@ pub enum RtEvent {
     /// **on the RT thread**, which must not allocate (§3) — formatting is the
     /// control thread's job.
     AudioFailed { errno: i32 },
+    /// A looping song just wrapped past its end back to the start (§14).
+    ///
+    /// The control thread reseeks every MIDI scheduler's cursor: they hold an
+    /// index into a time-sorted event list, so without this a looping song would
+    /// play its lights on the first pass only.
+    Looped,
 }
 
 pub type RtEventProducer = Producer<RtEvent>;

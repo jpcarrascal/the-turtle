@@ -106,6 +106,9 @@ struct LoadedSong {
     /// per-song: after a switch, `turtle status` would otherwise keep
     /// reporting the *previous* song's duration.
     frames: u64,
+    /// Whether the incoming song loops (§14) — same reason as `frames`: it is a
+    /// property of the song, so it has to travel with it across a switch.
+    looping: bool,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -120,6 +123,7 @@ fn load_song_payload(
     let p = crate::play::load_playable(bundle, Some(song))?;
     let schedulers = crate::play::load_schedulers(&p.show, &p.song_dir, rate);
     Ok(LoadedSong {
+        looping: p.mixer.is_looping(),
         mixer: p.mixer,
         schedulers,
         frames: p.frames,
@@ -250,6 +254,10 @@ pub fn run(
     // Song length in seconds, for `turtle status`. Reassigned on a song switch,
     // since it is a property of the song, not the show.
     let mut duration_s = frames as f64 / rate as f64;
+    // Tracked next to `duration_s` for the same reason: both are per-song, so
+    // both must change when a song does, or `turtle status` describes the
+    // previous song.
+    let mut looping = mixer.is_looping();
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -370,6 +378,7 @@ pub fn run(
         armed_next: None,
         position_s: 0.0,
         duration_s,
+        looping: mixer.is_looping(),
     }));
     let server = socket::start(
         socket_path,
@@ -556,6 +565,7 @@ pub fn run(
                             // Read the length before `mixer`/`schedulers` are
                             // moved out of `loaded` below.
                             duration_s = loaded.frames as f64 / rate as f64;
+                            looping = loaded.looping;
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -617,6 +627,22 @@ pub fn run(
                             show.audio.device
                         ));
                     }
+                    // A looping song wrapped: rewind every destination's cursor so
+                    // the next pass dispatches its events again (§14). Reseeking to
+                    // 0 rather than to the interpolated position deliberately —
+                    // events between 0 and now fire immediately, which at ~1 ms of
+                    // slack is inaudible, whereas skipping them would silently drop
+                    // a cue at the top of the loop.
+                    RtEvent::Looped => {
+                        for sched in schedulers.iter_mut() {
+                            sched.seek(0);
+                        }
+                        // Anything sounding from the previous pass is released, so
+                        // a note held across the seam does not hang.
+                        if verbose {
+                            println!("[loop] wrapped; MIDI cursors rewound");
+                        }
+                    }
                     RtEvent::EndReached => {
                         let was_playing = eng.state() == State::Playing;
                         let cmds = eng.handle(Command::EndReached, &mut midi_out);
@@ -628,6 +654,7 @@ pub fn run(
                         if was_playing && now_playing {
                             if let Some(held) = held_next.take() {
                                 duration_s = held.frames as f64 / rate as f64;
+                                looping = held.looping;
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -691,6 +718,7 @@ pub fn run(
                 snap.state = eng.state();
                 snap.position_s = position as f64 / rate as f64;
                 snap.duration_s = duration_s;
+                snap.looping = looping;
                 // Only clone the names when they actually change — this runs
                 // ~1000x a second, and in the steady state they don't.
                 if snap.song.as_deref() != current_song.as_deref() {

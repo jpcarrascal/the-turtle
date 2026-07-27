@@ -41,7 +41,33 @@ const CLICK_DECAY: f64 = 300.0;
 /// Returns `Box<dyn Error>` so the two unrelated failure kinds here — filesystem
 /// (`std::io::Error`) and WAV encoding (`hound::Error`) — can both flow through
 /// the same `?` without a bespoke error enum. Fine for a CLI helper.
-pub fn gen_tone(out: &Path, seconds: f64, hz: f64) -> Result<(), Box<dyn Error>> {
+pub fn gen_tone(
+    out: &Path,
+    seconds: f64,
+    hz: f64,
+    looping: bool,
+    force: bool,
+) -> Result<(), Box<dyn Error>> {
+    // Refuse to clobber an existing bundle. `show.toml` is rewritten from a
+    // built-in template, so re-running this over a bundle you have pointed at your
+    // own devices silently resets `device`, `port` and `input_port` to
+    // placeholders — and the failure shows up later as a device that will not
+    // open, with no clue that a regeneration caused it.
+    //
+    // Checked on `show.toml` rather than the directory: `mkdir`-ing the path first
+    // is a reasonable thing to have done, and should not block generation.
+    let existing = out.join("show.toml");
+    if existing.exists() && !force {
+        return Err(format!(
+            "{} already exists — refusing to overwrite it.\n\
+             Regenerating rewrites show.toml and song.toml from templates, discarding \
+             any device settings you have made.\n\
+             Pass --force if that is what you want, or generate into a new directory.",
+            existing.display()
+        )
+        .into());
+    }
+
     let frames = (seconds * SAMPLE_RATE as f64) as u64;
 
     let song_dir = out.join("songs").join("tone");
@@ -62,7 +88,7 @@ pub fn gen_tone(out: &Path, seconds: f64, hz: f64) -> Result<(), Box<dyn Error>>
     write_test_smf(&midi_dir.join("lights.mid"), beats)?;
 
     std::fs::write(out.join("show.toml"), SHOW_TOML)?;
-    std::fs::write(song_dir.join("song.toml"), song_toml(frames))?;
+    std::fs::write(song_dir.join("song.toml"), song_toml(frames, looping))?;
 
     Ok(())
 }
@@ -204,13 +230,15 @@ song = "tone"
 "#;
 
 /// The song manifest, with `length_samples` filled in from the generated stem.
-fn song_toml(frames: u64) -> String {
+fn song_toml(frames: u64, looping: bool) -> String {
+    // Written only when set, so a normal bundle's song.toml is unchanged.
+    let loop_line = if looping { "loop = true\n" } else { "" };
     format!(
         r#"[song]
 name = "Tone"
 bpm = 120.0
 length_samples = {frames}
-
+{loop_line}
 [[pairs]]
 index = 0
 file = "stems/pair1.wav"
@@ -220,6 +248,52 @@ file = "stems/pair1.wav"
 
 #[cfg(test)]
 mod tests {
+
+    /// Regenerating over a configured bundle used to silently reset show.toml to
+    /// the template, discarding the device settings that make it work. The failure
+    /// surfaced much later as "device will not open", with nothing pointing at the
+    /// regeneration — so refusing is the right default.
+    #[test]
+    fn it_refuses_to_overwrite_an_existing_bundle() {
+        let out = std::env::temp_dir().join(format!("turtle-gen-guard-{}", std::process::id()));
+        std::fs::remove_dir_all(&out).ok();
+        gen_tone(&out, 0.2, 440.0, false, false).expect("first generation succeeds");
+
+        // Stand in for the edits a real setup makes.
+        let show = out.join("show.toml");
+        std::fs::write(&show, "# my carefully configured devices\n").unwrap();
+
+        let err = gen_tone(&out, 0.2, 440.0, false, false)
+            .expect_err("a second run must refuse")
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(err.contains("--force"), "the message must name the escape hatch: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&show).unwrap(),
+            "# my carefully configured devices\n",
+            "the refusal must leave the file untouched"
+        );
+
+        // --force is the documented way through, and it really does overwrite.
+        gen_tone(&out, 0.2, 440.0, false, true).expect("--force overwrites");
+        assert!(
+            std::fs::read_to_string(&show).unwrap().contains("[show]"),
+            "--force should have rewritten the template"
+        );
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    /// A pre-made empty directory is a reasonable thing to have; only an existing
+    /// `show.toml` means "there is a bundle here".
+    #[test]
+    fn an_empty_directory_is_not_treated_as_an_existing_bundle() {
+        let out = std::env::temp_dir().join(format!("turtle-gen-empty-{}", std::process::id()));
+        std::fs::remove_dir_all(&out).ok();
+        std::fs::create_dir_all(&out).unwrap();
+        gen_tone(&out, 0.2, 440.0, false, false).expect("an empty dir should generate fine");
+        std::fs::remove_dir_all(&out).ok();
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -232,7 +306,7 @@ mod tests {
     #[test]
     fn generates_a_valid_bundle() {
         let out = temp_dir("bundle");
-        gen_tone(&out, 0.5, 440.0).unwrap();
+        gen_tone(&out, 0.5, 440.0, false, false).unwrap();
 
         // The show must load and pass semantic validation.
         let show = turtle_core::Show::load(out.join("show.toml")).unwrap();
@@ -257,7 +331,7 @@ mod tests {
     #[test]
     fn generates_a_dispatchable_midi_track() {
         let out = temp_dir("midi");
-        gen_tone(&out, 2.0, 440.0).unwrap(); // 2 s @ 120 BPM = 4 beats
+        gen_tone(&out, 2.0, 440.0, false, false).unwrap(); // 2 s @ 120 BPM = 4 beats
 
         // The generated SMF must compile via the same timeline the daemon uses.
         let bytes = std::fs::read(out.join("songs/tone/midi/lights.mid")).unwrap();
@@ -276,7 +350,7 @@ mod tests {
         // 1 s @ 120 BPM = beats at 0 and 24000 samples. The click window at a beat
         // onset should peak higher than a quiet window mid-beat.
         let out = temp_dir("click");
-        gen_tone(&out, 1.0, 440.0).unwrap();
+        gen_tone(&out, 1.0, 440.0, false, false).unwrap();
         let mut reader = hound::WavReader::open(out.join("songs/tone/stems/pair1.wav")).unwrap();
         // Left channel only (every other interleaved sample).
         let left: Vec<i32> = reader.samples::<i32>().map(|s| s.unwrap()).step_by(2).collect();
@@ -294,7 +368,7 @@ mod tests {
     #[test]
     fn tone_is_audible_not_silence() {
         let out = temp_dir("audible");
-        gen_tone(&out, 0.1, 440.0).unwrap();
+        gen_tone(&out, 0.1, 440.0, false, false).unwrap();
         let mut reader = hound::WavReader::open(out.join("songs/tone/stems/pair1.wav")).unwrap();
         // At least one sample must be non-zero (a real waveform, not silence).
         let any_nonzero = reader.samples::<i32>().any(|s| s.unwrap() != 0);

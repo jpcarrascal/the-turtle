@@ -202,6 +202,12 @@ pub fn run(
         "playing \"{}\" ({:.1}s) on {} ...",
         show.show.name, secs, show.audio.device
     );
+    // `play` is a fixed-duration dev tool, so it stops after one pass even for a
+    // looping song. Saying so avoids reading that as the loop not working; the
+    // loop is exercised for real by `turtled control`.
+    if mixer.is_looping() {
+        println!("  (song loops; `play` still stops after one pass — use `control` to hear it repeat)");
+    }
 
     // `thread::scope` lets the spawned thread borrow these stack locals (`mixer`,
     // `audio`, ...) without `'static` — the scope guarantees the thread joins

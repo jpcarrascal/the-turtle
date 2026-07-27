@@ -147,6 +147,11 @@ pub struct Status {
     pub position_s: f64,
     /// Current song's length, seconds.
     pub duration_s: f64,
+    /// Whether the current song repeats instead of ending (§14). Worth reporting
+    /// because a looping song never reaches `Ended`, so "position stopped rising"
+    /// and "the song is over" mean different things.
+    #[serde(default)]
+    pub looping: bool,
 }
 
 /// Where a command came from, for `monitor`.
@@ -303,6 +308,7 @@ mod tests {
         let status = Status {
             show: "Tone".into(),
             bundle: Some("/media/shows/Tone.turtle".into()),
+            looping: false,
             state: State::Playing,
             song: Some("tone".into()),
             armed_next: None,

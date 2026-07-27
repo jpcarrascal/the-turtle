@@ -58,7 +58,13 @@ pub fn print_status(s: &Status) {
     let song = s.song.as_deref().unwrap_or("(none)");
     println!("show:   {}", s.show);
     println!("state:  {state}");
-    println!("song:   {song}");
+    // On the song line, not its own: looping is a property of the song, and a
+    // reader scanning for "why has this not ended?" looks there.
+    if s.looping {
+        println!("song:   {song} (looping)");
+    } else {
+        println!("song:   {song}");
+    }
     if let Some(next) = &s.armed_next {
         println!("next:   {next}");
     }

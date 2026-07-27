@@ -155,6 +155,13 @@ pub struct SongMeta {
     /// Nominal tempo, used for tempo-synced delay (§6).
     pub bpm: f64,
     pub length_samples: u64,
+    /// Repeat this song seamlessly until it is stopped, instead of ending and
+    /// auto-advancing to the next setlist entry (§14).
+    ///
+    /// Named `looping` because `loop` is a Rust keyword; the TOML key is `loop`.
+    /// Defaults to false, so existing songs are unaffected.
+    #[serde(default, rename = "loop")]
+    pub looping: bool,
 }
 
 /// One stereo stem pair (§4): up to 4 per song.
