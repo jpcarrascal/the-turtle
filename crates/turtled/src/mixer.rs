@@ -205,6 +205,14 @@ impl Mixer {
         }
     }
 
+    /// Whether the loaded song repeats instead of ending (§14).
+    ///
+    /// Read from the song rather than stored separately on the mixer, so a song
+    /// switch cannot leave a stale flag behind.
+    pub fn is_looping(&self) -> bool {
+        self.song.looping
+    }
+
     pub fn position(&self) -> u64 {
         self.pos
     }
@@ -285,7 +293,10 @@ impl Mixer {
 
     /// True once the transport has run past the end of every stem (§8 ENDED).
     pub fn is_finished(&self) -> bool {
-        self.pos >= self.song.frames as u64
+        // A looping song never finishes, which is what stops `EndReached` firing
+        // and therefore what stops the gapless auto-advance (§8) from carrying the
+        // setlist forward. Stop is the only way out, by design.
+        !self.song.looping && self.pos >= self.song.frames as u64
     }
 
     /// Jump to `pos` (rewind / restart) and clear DSP tails.
@@ -303,10 +314,27 @@ impl Mixer {
 
     /// Render one period into `out`, an interleaved `L, R, L, R, …` buffer whose
     /// length is `frames * 2`. Advances the transport by `frames`.
+    /// Wraps the read position when the song loops (§14).
+    ///
+    /// The wrap happens **per frame**, not per buffer, which is what makes the
+    /// seam inaudible: wrapping only at buffer boundaries would quantise the loop
+    /// point to the period size — 21 ms at 1024 frames — and you would hear the
+    /// gap. Doing it here costs a compare and a subtract per frame.
     pub fn render(&mut self, out: &mut [i32]) {
         let frames = out.len() / 2;
+        // 0 when not looping, which turns the wrap below into a never-taken branch.
+        let wrap_at = if self.song.looping { self.song.frames as u64 } else { 0 };
         for f in 0..frames {
-            let frame_idx = self.pos + f as u64;
+            let raw = self.pos + f as u64;
+            // `pos` is kept below `wrap_at` at the end of this function, so a
+            // single subtraction covers any song at least one period long. The
+            // modulo is the fallback for a song shorter than one buffer, which is
+            // degenerate but should still loop rather than misbehave.
+            let frame_idx = if wrap_at != 0 && raw >= wrap_at {
+                if raw < wrap_at * 2 { raw - wrap_at } else { raw % wrap_at }
+            } else {
+                raw
+            };
             // Sum every pair's contribution for this frame.
             let mut acc_l = 0.0f32;
             let mut acc_r = 0.0f32;
@@ -328,6 +356,13 @@ impl Mixer {
             out[2 * f + 1] = to_i32(self.limiter_r.process(acc_r));
         }
         self.pos += frames as u64;
+        // Wrap the transport position too, not just the read index: `position()`
+        // feeds the clock and `turtle status`, so letting it run past the song
+        // length would report a position beyond the duration and stop the MIDI
+        // scheduler from ever re-firing the loop's events.
+        if wrap_at != 0 && self.pos >= wrap_at {
+            self.pos %= wrap_at;
+        }
     }
 }
 
@@ -347,7 +382,12 @@ mod tests {
 
     fn song(pairs: Vec<StemPair>) -> PreloadedSong {
         let frames = pairs.iter().map(|p| p.frames).max().unwrap_or(0);
-        PreloadedSong { name: "t".into(), sample_rate: 48_000, frames, pairs }
+        PreloadedSong { name: "t".into(), sample_rate: 48_000, frames, pairs, looping: false }
+    }
+
+    /// The same, but flagged `loop = true`.
+    fn looping_song(pairs: Vec<StemPair>) -> PreloadedSong {
+        PreloadedSong { looping: true, ..song(pairs) }
     }
 
     fn pair(index: u8, samples: Vec<f32>) -> StemPair {
@@ -624,5 +664,85 @@ mod tests {
         m.render(&mut out);
         assert_eq!(out[0], to_i32(0.5));
         assert_eq!(out[1], to_i32(0.5));
+    }
+
+    /// A looping song must repeat its samples indefinitely rather than running
+    /// into the silence past its end.
+    #[test]
+    fn a_looping_song_repeats_its_samples() {
+        // Two frames whose left channel is distinguishable: 1.0 then -1.0.
+        let m_pair = pair(0, vec![0.5, 0.5, -0.5, -0.5]);
+        let mut m = Mixer::new(looping_song(vec![m_pair]), 48_000);
+
+        // Render six frames over a two-frame song: the pattern must repeat 3x.
+        let mut out = vec![0i32; 6 * 2];
+        m.render(&mut out);
+        let left: Vec<i32> = out.iter().step_by(2).copied().collect();
+        assert_eq!(left[0].signum(), 1, "{left:?}");
+        assert_eq!(left[1].signum(), -1, "{left:?}");
+        assert_eq!(left[2].signum(), 1, "frame 2 should be frame 0 again: {left:?}");
+        assert_eq!(left[3].signum(), -1, "{left:?}");
+        assert_eq!(left[4].signum(), 1, "{left:?}");
+        assert_eq!(left[5].signum(), -1, "{left:?}");
+    }
+
+    /// The seam must fall **inside** a buffer, not be quantised to the buffer
+    /// boundary. This is the difference between a seamless loop and a ~21 ms gap
+    /// at 1024 frames, and it is the entire reason the wrap lives in the per-frame
+    /// loop rather than around it.
+    #[test]
+    fn the_loop_seam_falls_mid_buffer_not_at_a_buffer_boundary() {
+        // A 3-frame song rendered in 2-frame buffers, so the wrap lands at
+        // frame 1 of the second buffer — mid-buffer by construction.
+        let m_pair = pair(0, vec![0.5, 0.5, 0.5, 0.5, -0.5, -0.5]);
+        let mut m = Mixer::new(looping_song(vec![m_pair]), 48_000);
+
+        let mut buf = vec![0i32; 2 * 2];
+        m.render(&mut buf); // frames 0,1  -> +,+
+        assert_eq!(m.position(), 2);
+        m.render(&mut buf); // frames 2,0  -> -,+   <- wrap inside this buffer
+        let left: Vec<i32> = buf.iter().step_by(2).copied().collect();
+        assert_eq!(left[0].signum(), -1, "frame 2 of the song: {left:?}");
+        assert_eq!(
+            left[1].signum(),
+            1,
+            "second half of this buffer must already be the loop restart: {left:?}"
+        );
+        assert_eq!(m.position(), 1, "position wraps with the audio");
+    }
+
+    /// A looping song must never report finished — that is what keeps
+    /// `EndReached` (and therefore the setlist auto-advance) from firing.
+    #[test]
+    fn a_looping_song_never_finishes() {
+        let mut m = Mixer::new(looping_song(vec![pair(0, vec![0.5, 0.5])]), 48_000);
+        let mut out = vec![0i32; 2];
+        for _ in 0..10 {
+            m.render(&mut out);
+            assert!(!m.is_finished(), "a looping song must not finish");
+        }
+    }
+
+    /// Non-looping songs must behave exactly as before: this feature is additive.
+    #[test]
+    fn a_normal_song_still_ends_and_does_not_wrap() {
+        let mut m = Mixer::new(song(vec![pair(0, vec![0.5, 0.5])]), 48_000);
+        let mut out = vec![0i32; 2 * 2];
+        m.render(&mut out);
+        assert!(m.is_finished(), "a one-frame-pair song ends");
+        assert_eq!(m.position(), 2, "position keeps running past the end");
+    }
+
+    /// A song shorter than one period is degenerate, but must still loop rather
+    /// than read out of range or stall — the fallback path in `render`.
+    #[test]
+    fn a_song_shorter_than_one_buffer_still_loops() {
+        // One frame, rendered five at a time: every output frame is that frame.
+        let mut m = Mixer::new(looping_song(vec![pair(0, vec![0.5, 0.5])]), 48_000);
+        let mut out = vec![0i32; 5 * 2];
+        m.render(&mut out);
+        let left: Vec<i32> = out.iter().step_by(2).copied().collect();
+        assert!(left.iter().all(|v| v.signum() == 1), "{left:?}");
+        assert!(m.position() < 1 || m.position() == 0, "pos wrapped: {}", m.position());
     }
 }

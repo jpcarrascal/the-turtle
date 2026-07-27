@@ -41,7 +41,7 @@ const CLICK_DECAY: f64 = 300.0;
 /// Returns `Box<dyn Error>` so the two unrelated failure kinds here — filesystem
 /// (`std::io::Error`) and WAV encoding (`hound::Error`) — can both flow through
 /// the same `?` without a bespoke error enum. Fine for a CLI helper.
-pub fn gen_tone(out: &Path, seconds: f64, hz: f64) -> Result<(), Box<dyn Error>> {
+pub fn gen_tone(out: &Path, seconds: f64, hz: f64, looping: bool) -> Result<(), Box<dyn Error>> {
     let frames = (seconds * SAMPLE_RATE as f64) as u64;
 
     let song_dir = out.join("songs").join("tone");
@@ -62,7 +62,7 @@ pub fn gen_tone(out: &Path, seconds: f64, hz: f64) -> Result<(), Box<dyn Error>>
     write_test_smf(&midi_dir.join("lights.mid"), beats)?;
 
     std::fs::write(out.join("show.toml"), SHOW_TOML)?;
-    std::fs::write(song_dir.join("song.toml"), song_toml(frames))?;
+    std::fs::write(song_dir.join("song.toml"), song_toml(frames, looping))?;
 
     Ok(())
 }
@@ -204,13 +204,15 @@ song = "tone"
 "#;
 
 /// The song manifest, with `length_samples` filled in from the generated stem.
-fn song_toml(frames: u64) -> String {
+fn song_toml(frames: u64, looping: bool) -> String {
+    // Written only when set, so a normal bundle's song.toml is unchanged.
+    let loop_line = if looping { "loop = true\n" } else { "" };
     format!(
         r#"[song]
 name = "Tone"
 bpm = 120.0
 length_samples = {frames}
-
+{loop_line}
 [[pairs]]
 index = 0
 file = "stems/pair1.wav"
@@ -232,7 +234,7 @@ mod tests {
     #[test]
     fn generates_a_valid_bundle() {
         let out = temp_dir("bundle");
-        gen_tone(&out, 0.5, 440.0).unwrap();
+        gen_tone(&out, 0.5, 440.0, false).unwrap();
 
         // The show must load and pass semantic validation.
         let show = turtle_core::Show::load(out.join("show.toml")).unwrap();
@@ -257,7 +259,7 @@ mod tests {
     #[test]
     fn generates_a_dispatchable_midi_track() {
         let out = temp_dir("midi");
-        gen_tone(&out, 2.0, 440.0).unwrap(); // 2 s @ 120 BPM = 4 beats
+        gen_tone(&out, 2.0, 440.0, false).unwrap(); // 2 s @ 120 BPM = 4 beats
 
         // The generated SMF must compile via the same timeline the daemon uses.
         let bytes = std::fs::read(out.join("songs/tone/midi/lights.mid")).unwrap();
@@ -276,7 +278,7 @@ mod tests {
         // 1 s @ 120 BPM = beats at 0 and 24000 samples. The click window at a beat
         // onset should peak higher than a quiet window mid-beat.
         let out = temp_dir("click");
-        gen_tone(&out, 1.0, 440.0).unwrap();
+        gen_tone(&out, 1.0, 440.0, false).unwrap();
         let mut reader = hound::WavReader::open(out.join("songs/tone/stems/pair1.wav")).unwrap();
         // Left channel only (every other interleaved sample).
         let left: Vec<i32> = reader.samples::<i32>().map(|s| s.unwrap()).step_by(2).collect();
@@ -294,7 +296,7 @@ mod tests {
     #[test]
     fn tone_is_audible_not_silence() {
         let out = temp_dir("audible");
-        gen_tone(&out, 0.1, 440.0).unwrap();
+        gen_tone(&out, 0.1, 440.0, false).unwrap();
         let mut reader = hound::WavReader::open(out.join("songs/tone/stems/pair1.wav")).unwrap();
         // At least one sample must be non-zero (a real waveform, not silence).
         let any_nonzero = reader.samples::<i32>().any(|s| s.unwrap() != 0);

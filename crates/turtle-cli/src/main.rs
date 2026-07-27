@@ -142,9 +142,13 @@ fn gen_tone(args: &[String]) -> ExitCode {
     // supplies the default when absent or unparsable.
     let seconds = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let hz = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(440.0);
-    match gen::gen_tone(Path::new(out), seconds, hz) {
+    // `--loop` anywhere after the path: it is a flag, not a positional, so it
+    // must not shift `seconds`/`hz`.
+    let looping = args.iter().any(|a| a == "--loop");
+    match gen::gen_tone(Path::new(out), seconds, hz, looping) {
         Ok(()) => {
-            println!("wrote tone bundle to {out} ({seconds}s @ {hz} Hz)");
+            let mode = if looping { " looping" } else { "" };
+            println!("wrote{mode} tone bundle to {out} ({seconds}s @ {hz} Hz)");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -212,7 +216,8 @@ fn usage() {
     eprintln!("  validate <show.toml>          bundle validation");
     eprintln!("  doctor [<bundle|show.toml>]    preflight: devices, RT limits, tuning");
     eprintln!("  ports [--toml]                 list devices with their stable ALSA names");
-    eprintln!("  gen-tone <out-dir> [s] [hz]   write a playable test bundle");
+    eprintln!("  gen-tone <out-dir> [s] [hz] [--loop]");
+    eprintln!("                                write a playable test bundle");
     eprintln!();
     eprintln!("control socket (needs a running turtled):");
     eprintln!("  status                        transport state, song, position");

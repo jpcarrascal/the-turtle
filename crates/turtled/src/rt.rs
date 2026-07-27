@@ -20,6 +20,11 @@ pub struct RtAudio {
     /// doesn't spam the event queue every period while the control thread's
     /// resulting `Stop`/`Seek` is still in flight (§8).
     reported_end: bool,
+    /// Highest position seen since the last `Start`/`Seek`, so [`check_loop`] can
+    /// spot the backwards jump a loop wrap makes.
+    ///
+    /// [`check_loop`]: RtAudio::check_loop
+    last_pos: u64,
 }
 
 impl Default for RtAudio {
@@ -27,6 +32,7 @@ impl Default for RtAudio {
         RtAudio {
             playing: false,
             reported_end: false,
+            last_pos: 0,
         }
     }
 }
@@ -44,11 +50,17 @@ impl RtAudio {
             RtCommand::Start => {
                 self.playing = true;
                 self.reported_end = false;
+                // Re-baseline: Start follows a Seek(0) on the rewind path, and a
+                // stale high watermark would read as a loop wrap on the next tick.
+                self.last_pos = mixer.position();
             }
             RtCommand::Stop => self.playing = false,
             RtCommand::Seek(pos) => {
                 mixer.seek(pos);
                 self.reported_end = false;
+                // A seek moves the position backwards too; only a *loop* wrap
+                // should report, so re-baseline rather than fire a false one.
+                self.last_pos = mixer.position();
             }
             RtCommand::ToggleMute(pair) => mixer.toggle_pair_mute(pair),
             RtCommand::SetDsp(pair, param, value) => mixer.set_dsp_param(pair, param, value),
@@ -59,6 +71,20 @@ impl RtAudio {
     /// the song while playing (§8 `EndReached`) — call after [`step`](Self::step).
     /// Silent (returns `false`) once already reported, until the next
     /// `Start`/`Seek` resets the flag.
+    /// Did the mixer just wrap around a loop point (§14)? Reports once per wrap.
+    ///
+    /// Detected by the position moving *backwards*, which only a loop wrap does —
+    /// a `Seek` goes through [`RtAudio::apply`] and resets the watermark there.
+    /// The control thread needs this because every per-destination MIDI scheduler
+    /// holds a cursor into a time-sorted event list: once past the end it would
+    /// never fire again, so a looping song would play its lights exactly once.
+    pub fn check_loop(&mut self, mixer: &Mixer) -> bool {
+        let pos = mixer.position();
+        let wrapped = self.playing && pos < self.last_pos;
+        self.last_pos = pos;
+        wrapped
+    }
+
     pub fn check_end(&mut self, mixer: &Mixer) -> bool {
         if self.playing && mixer.is_finished() && !self.reported_end {
             self.reported_end = true;
@@ -143,6 +169,10 @@ pub fn run_audio(
         let pos = rt.step(mixer, &mut buf);
         clock.publish(pos, now_ns);
 
+        if rt.check_loop(mixer) {
+            let _ = events.push(crate::engine::RtEvent::Looped);
+        }
+
         if rt.check_end(mixer) {
             let _ = events.push(crate::engine::RtEvent::EndReached);
         }
@@ -180,7 +210,13 @@ mod tests {
     // is easy to see in the output.
     fn mixer() -> Mixer {
         let pair = StemPair { index: 0, samples: vec![0.5, 0.5, 0.5, 0.5], frames: 2 };
-        let song = PreloadedSong { name: "t".into(), sample_rate: 48_000, frames: 2, pairs: vec![pair] };
+        let song = PreloadedSong {
+            name: "t".into(),
+            sample_rate: 48_000,
+            frames: 2,
+            pairs: vec![pair],
+            looping: false,
+        };
         Mixer::new(song, 48_000)
     }
 
@@ -220,6 +256,62 @@ mod tests {
         assert_eq!(pos, 1);
         assert_eq!(out, [0, 0]);
         assert_eq!(m.position(), 1, "no advance while stopped");
+    }
+
+    /// A looping mixer wraps, and that wrap must be reported exactly once so the
+    /// control thread rewinds the MIDI cursors.
+    #[test]
+    fn check_loop_reports_each_wrap_once() {
+        let pair = StemPair { index: 0, samples: vec![0.5, 0.5, 0.5, 0.5], frames: 2 };
+        let song = PreloadedSong {
+            name: "t".into(),
+            sample_rate: 48_000,
+            frames: 2,
+            pairs: vec![pair],
+            looping: true,
+        };
+        let mut m = Mixer::new(song, 48_000);
+        let mut rt = RtAudio::new();
+        rt.apply(&mut m, RtCommand::Start);
+        let mut out = [0i32; 2];
+
+        rt.step(&mut m, &mut out); // pos 0 -> 1
+        assert!(!rt.check_loop(&m), "no wrap yet");
+        rt.step(&mut m, &mut out); // pos 1 -> 0 (wrapped)
+        assert!(rt.check_loop(&m), "the wrap should be reported");
+        assert!(!rt.check_loop(&m), "and not repeated on the same position");
+        rt.step(&mut m, &mut out); // pos 0 -> 1
+        assert!(!rt.check_loop(&m));
+        rt.step(&mut m, &mut out); // wraps again
+        assert!(rt.check_loop(&m), "each wrap reports");
+    }
+
+    /// A `Seek` also moves the position backwards. Reporting that as a loop would
+    /// rewind the MIDI cursors spuriously and replay cues after every rewind.
+    #[test]
+    fn a_seek_is_not_mistaken_for_a_loop_wrap() {
+        let mut m = mixer();
+        let mut rt = RtAudio::new();
+        rt.apply(&mut m, RtCommand::Start);
+        let mut out = [0i32; 2];
+        rt.step(&mut m, &mut out);
+        assert!(!rt.check_loop(&m));
+
+        rt.apply(&mut m, RtCommand::Seek(0));
+        assert!(
+            !rt.check_loop(&m),
+            "a seek re-baselines rather than reporting a wrap"
+        );
+    }
+
+    /// A stopped transport must not report wraps — nothing is advancing.
+    #[test]
+    fn check_loop_is_silent_while_stopped() {
+        let mut m = mixer();
+        let mut rt = RtAudio::new();
+        let mut out = [0i32; 2];
+        rt.step(&mut m, &mut out);
+        assert!(!rt.check_loop(&m), "not playing, so no wrap to report");
     }
 
     #[test]

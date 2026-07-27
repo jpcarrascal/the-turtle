@@ -34,6 +34,10 @@ pub struct PreloadedSong {
     /// Longest pair length in frames; shorter pairs are zero-padded by the mixer.
     pub frames: usize,
     pub pairs: Vec<StemPair>,
+    /// `[song] loop` — repeat instead of ending (§14). Carried on the *song*, not
+    /// the mixer's configuration, so switching songs switches the behaviour with
+    /// it rather than leaving a stale flag behind.
+    pub looping: bool,
 }
 
 /// Why a stem failed to load. `thiserror` derives the `Display`/`Error` impls
@@ -81,6 +85,7 @@ pub fn load_song(
         sample_rate: expected_rate,
         frames,
         pairs,
+        looping: song.song.looping,
     })
 }
 
@@ -135,6 +140,7 @@ fn load_pair(index: u8, path: &Path, expected_rate: u32) -> Result<StemPair, Ste
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -174,6 +180,41 @@ file = "{file}"
 "#
         );
         Song::from_toml_str(&toml).unwrap()
+    }
+
+    /// `loop = true` must reach the **preloaded** song, because that is what a
+    /// song switch hands to the RT thread. A flag that stopped at the config layer
+    /// would loop the first song and then silently not loop the next one — the
+    /// kind of bug that only shows up mid-set.
+    #[test]
+    fn the_loop_flag_survives_into_the_preloaded_song() {
+        let path = temp_wav("loopflag");
+        write_wav(&path, 2, 48_000, 24, &[0, 0, 0, 0]);
+        let base = path.parent().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+
+        let mut song = song_with_pair(file);
+        assert!(!song.song.looping, "default is off, so existing songs are unaffected");
+        assert!(!load_song(&song, base, 48_000).unwrap().looping);
+
+        song.song.looping = true;
+        assert!(
+            load_song(&song, base, 48_000).unwrap().looping,
+            "loop = true must survive loading"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The TOML key is `loop`, not `looping` — the field is renamed because `loop`
+    /// is a Rust keyword, and getting that backwards would silently ignore the
+    /// setting in every real show file.
+    #[test]
+    fn the_toml_key_is_loop() {
+        let song = Song::from_toml_str(
+            "[song]\nname=\"t\"\nbpm=120.0\nlength_samples=4\nloop = true\n",
+        )
+        .unwrap();
+        assert!(song.song.looping, "`loop = true` should set it");
     }
 
     #[test]
