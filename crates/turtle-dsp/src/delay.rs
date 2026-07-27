@@ -54,6 +54,20 @@ use crate::biquad::{Biquad, FilterType};
 /// controller. ~150 ms is in the range analogue tape units actually move.
 pub const GLIDE_MS: f32 = 150.0;
 
+/// Below this magnitude, what is written back into the buffer is flushed to zero.
+///
+/// A decaying tail multiplies by `feedback` on every pass, so it heads toward zero
+/// asymptotically and eventually reaches **denormal** floats, which are
+/// dramatically slow to compute on some CPUs — on the RT thread, of all places.
+/// This matters more now that the tail keeps running while stopped (§6): with
+/// nothing to terminate it, a quiet delay would sit in denormal territory
+/// indefinitely rather than for a moment.
+///
+/// 1e-20 is ~-400 dBFS — utterly inaudible, and eighteen orders of magnitude above
+/// where f32 denormals begin (~1.2e-38), so the buffer drains to true zeros well
+/// before the slow path is ever reached.
+const DENORMAL_FLOOR: f32 = 1e-20;
+
 /// A feedback delay with a dry/wet mix, a gliding (tape-style) delay time, and an
 /// optional lowpass **on its output**.
 ///
@@ -259,7 +273,14 @@ impl Delay {
         // Feedback is taken *before* the filter, so the loop stays clean and each
         // repeat is a faithful copy — the filter colours what comes out, not what
         // circulates.
-        self.buf[self.write] = x + delayed * self.feedback;
+        let write_back = x + delayed * self.feedback;
+        // Flush a vanishing tail to true zero rather than letting it decay into
+        // denormals — see `DENORMAL_FLOOR`.
+        self.buf[self.write] = if write_back.abs() < DENORMAL_FLOOR {
+            0.0
+        } else {
+            write_back
+        };
         // Same reasoning as above: a compare beats a division.
         self.write += 1;
         if self.write >= len {
@@ -607,5 +628,30 @@ mod tests {
             last_window_energy > 1e-9,
             "the tail died too fast — is the filter back in the loop? {last_window_energy}"
         );
+    }
+
+    /// A decaying tail must reach true zero, not sit forever in denormal floats.
+    ///
+    /// This matters because the tail now keeps running while the transport is
+    /// stopped (§6) with nothing to terminate it — so a quiet delay would compute
+    /// with denormals indefinitely on the RT thread rather than momentarily.
+    #[test]
+    fn a_decaying_tail_flushes_to_true_zero() {
+        let mut d = settled(64, 8);
+        d.set_mix(1.0);
+        d.set_feedback(0.5); // halves each pass, so it decays quickly
+
+        // One impulse, then silence for a long time.
+        d.process(1.0);
+        for _ in 0..20_000 {
+            d.process(0.0);
+        }
+
+        // Exactly zero, and therefore never denormal. `!= 0.0` values below the
+        // f32 normal minimum would be the failure this guards against.
+        for _ in 0..64 {
+            let y = d.process(0.0);
+            assert_eq!(y, 0.0, "the tail should have flushed to true zero");
+        }
     }
 }

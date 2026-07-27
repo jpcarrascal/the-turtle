@@ -294,6 +294,36 @@ exact whole number of bars, which Ableton's bounce already gives you.
 `turtled play` is a fixed-duration tool and stops after one pass even for a
 looping song; use `turtled control` (or the service) to hear it repeat.
 
+## The delay tail after Stop (§6)
+
+Stopping the transport no longer cuts the delay dead. The stems stop and the
+position freezes, but the delay keeps recirculating, so whatever was ringing decays
+away naturally.
+
+**How long it lasts is the feedback knob.** There is deliberately no automatic
+cut-off: at high feedback the tail sustains indefinitely, and bringing feedback
+down is how you end it. That was a deliberate choice — a delay that silences itself
+after some threshold takes away a performance gesture.
+
+To kill it instantly, **press Stop a second time**. That is already the panic
+gesture (`transport.rs`: first Stop = clean release + rewind, second = panic), and
+the explicit panic binding does the same thing — they route to the same action, so
+there is one rule rather than two. A third Stop is a no-op.
+
+Two asymmetries worth knowing:
+
+- **MIDI stops immediately, audio rings.** Stop emits note-offs, so lights and
+  pedals do not echo. Only audio has a tail. That is intended.
+- **`turtle status` will say `stopped` while sound is still coming out.** The
+  transport really has stopped; the tail is audio, not playback, and the position
+  does not advance while it rings.
+
+One limitation: **a song switch clears the tail.** The delay belongs to the song —
+it is tempo-synced to that song's BPM — so switching songs (including a gapless
+auto-advance) starts with an empty delay. Keeping a tail across a song change would
+mean separating the delay's buffer from its timing, which is a real cost for a case
+that may never come up in practice.
+
 ## Preflight: `turtle doctor` (§10)
 
 Everything below this point adds a "run this and check the output" step. `doctor`

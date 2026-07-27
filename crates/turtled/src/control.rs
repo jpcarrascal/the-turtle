@@ -797,6 +797,14 @@ fn dispatch_rt(
                 println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }
         }
+        // Nothing for the control thread to track: the RT thread just empties the
+        // delay. Logged because "why did my tail stop?" is worth being able to
+        // answer from a -v capture.
+        RtCommand::ClearDelay => {
+            if verbose {
+                println!("[panic] delay cleared wall={:.3}s", epoch.elapsed().as_secs_f64());
+            }
+        }
         // Rewind: realign the output cursors with the audio.
         RtCommand::Seek(pos) => {
             view.position = pos;
