@@ -134,6 +134,7 @@ pub fn run(
     song: Option<&str>,
     verbose: bool,
     tuning: crate::sched::Tuning,
+    wait_devices: std::time::Duration,
 ) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -152,8 +153,15 @@ pub fn run(
     let Playable { show, mut mixer, frames, song_dir } = load_playable(bundle, song)?;
     let rate = show.show.playback_rate;
 
-    let audio = AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize)
-        .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
+    // Same bounded wait as the control path (§12): a device that is a second late
+    // should not be a failure.
+    let audio = crate::retry::open_with_retry(
+        &format!("audio device '{}'", show.audio.device),
+        wait_devices,
+        || AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize),
+        |msg| println!("{msg}"),
+    )
+    .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
 
     // MIDI output, best-effort: destinations whose port can't be opened are just
     // logged, so a bad/placeholder MIDI port never blocks audio playback.
