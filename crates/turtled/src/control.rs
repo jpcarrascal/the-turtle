@@ -393,7 +393,9 @@ pub fn run(
     sd.ready(&format!("armed \"{}\"", show.show.name));
     println!("[systemd] {}", notify::describe(&sd));
 
-    std::thread::scope(|s| {
+    // The closure's value is this function's result: a failed audio device has to
+    // propagate out as an error so `main` exits non-zero and systemd restarts us.
+    let outcome: Result<(), String> = std::thread::scope(|s| {
         // Same ownership split as the play path: move the !Sync audio + mixer +
         // rx into the audio thread; share atomic-backed clock/running by ref.
         let clock = &clock;
@@ -587,6 +589,34 @@ pub fn run(
             // The RT thread reached the end of the current song.
             while let Ok(event) = events_rx.pop() {
                 match event {
+                    // Recovery inside the RT thread already failed, so the device
+                    // is gone rather than late. Exit deliberately: with no audio
+                    // there is no show, and staying up would leave systemd, the
+                    // watchdog and `turtle status` all reporting health (the
+                    // watchdog ping comes from *this* loop, which is still fine).
+                    // Restarting is the recovery — since PR #29 the daemon waits for
+                    // the device to come back, so a yanked USB cable now costs a few
+                    // seconds of silence instead of the rest of the set.
+                    RtEvent::AudioFailed { errno } => {
+                        let err = std::io::Error::from_raw_os_error(errno);
+                        eprintln!(
+                            "error: audio device '{}' failed and could not be recovered: {err}",
+                            show.audio.device
+                        );
+                        eprintln!(
+                            "       there is no audio from this point, so exiting rather than \
+                             appearing healthy; systemd will restart and wait for the device."
+                        );
+                        // A deliberate exit, so systemd does not read it as a crash.
+                        sd.stopping("audio device failed — restarting");
+                        // The audio thread has already stopped, but be explicit:
+                        // leaving the scope joins it, and a set flag would hang.
+                        running.store(false, std::sync::atomic::Ordering::Release);
+                        return Err(format!(
+                            "audio device '{}' failed: {err}",
+                            show.audio.device
+                        ));
+                    }
                     RtEvent::EndReached => {
                         let was_playing = eng.state() == State::Playing;
                         let cmds = eng.handle(Command::EndReached, &mut midi_out);
@@ -680,12 +710,10 @@ pub fn run(
 
             std::thread::sleep(Duration::from_millis(1));
         }
-        // The loop runs until the process is signalled (Ctrl-C); there is no
-        // clean-exit path yet, so the audio thread's `running` flag stays set.
+        // Otherwise the loop runs until the process is signalled (Ctrl-C).
     });
 
-    #[allow(unreachable_code)]
-    Ok(())
+    outcome
 }
 
 /// The control thread's view of what the audio RT thread is doing, kept in

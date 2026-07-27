@@ -147,10 +147,24 @@ pub fn run_audio(
             let _ = events.push(crate::engine::RtEvent::EndReached);
         }
 
-        // `write_period` already recovers from xruns internally; a hard error
-        // here means the device is gone, so we stop the loop.
-        // TODO: report the error via the RT log ring (§13) rather than silently.
-        if audio.write_period(&buf).is_err() {
+        // `write_period` already recovers from xruns internally (try_recover), so
+        // an error here means recovery itself failed — the device is gone, not
+        // merely late. There is nothing this thread can do about that.
+        //
+        // What it must NOT do is leave quietly. Until this reported the failure,
+        // the audio thread would simply return: the process stayed alive, systemd
+        // saw a healthy unit, `turtle status` kept answering, and the watchdog kept
+        // being satisfied — because the ping comes from the *control* loop, which
+        // was still perfectly fine. The result was a daemon with no audio at all,
+        // indefinitely, and nothing anywhere saying so. §12 requires the opposite
+        // ("never stop audio"), and a silent stop is the worst version of failing.
+        if let Err(e) = audio.write_period(&buf) {
+            // `errno`, not a message: this is the RT thread and it must not
+            // allocate. The control thread turns it into text.
+            let _ = events.push(crate::engine::RtEvent::AudioFailed { errno: e.errno() });
+            // Also clear `running`, so any loop watching it (the `play` path's
+            // scheduler) notices too rather than spinning against dead audio.
+            running.store(false, Ordering::Release);
             break;
         }
     }

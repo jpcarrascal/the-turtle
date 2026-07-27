@@ -190,7 +190,7 @@ pub fn run(
     // This one-shot path never swaps songs or needs `EndReached`, but
     // `run_audio` still expects both channel halves — give it unread ones.
     let (_song_tx, mut song_rx) = song_channel(2);
-    let (mut events_tx, _events_rx) = rt_event_channel(8);
+    let (mut events_tx, mut events_rx) = rt_event_channel(8);
     // Shared flag so this thread can ask the audio loop to exit.
     let running = AtomicBool::new(true);
     // Shared monotonic reference for the clock timestamps.
@@ -207,7 +207,7 @@ pub fn run(
     // `audio`, ...) without `'static` — the scope guarantees the thread joins
     // before they drop. NOTE: v1 uses a normal-priority thread; the design's big
     // xrun-proof buffers (§3.1) make this fine. SCHED_FIFO is a later hardening.
-    std::thread::scope(|s| {
+    let outcome: Option<std::io::Error> = std::thread::scope(|s| {
         // `AlsaAudio` wraps a raw ALSA handle: it is `Send` (safe to hand to one
         // other thread) but `!Sync` (a `&` to it can't be shared across threads).
         // So MOVE `audio`/`mixer`/`rx` into the audio thread and borrow them
@@ -243,7 +243,17 @@ pub fn run(
         // audio thread publishes, and dispatch each destination's due events.
         let _ = tx.push(RtCommand::Start);
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs_f64(secs) {
+        // `running` is in the condition so a dead audio thread ends playback
+        // instead of ticking out the full duration and then printing "done."
+        let mut audio_error = None;
+        while started.elapsed() < Duration::from_secs_f64(secs)
+            && running.load(Ordering::Acquire)
+        {
+            while let Ok(event) = events_rx.pop() {
+                if let crate::engine::RtEvent::AudioFailed { errno } = event {
+                    audio_error = Some(std::io::Error::from_raw_os_error(errno));
+                }
+            }
             let wall_s = epoch.elapsed().as_secs_f64();
             let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
             for (port, sched) in schedulers.iter_mut().enumerate() {
@@ -268,9 +278,22 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(1));
         }
         running.store(false, Ordering::Release);
+        // Drain once more after the loop. The loop's own condition watches
+        // `running`, which the audio thread clears *as* it reports the failure — so
+        // exiting on that flag skips the drain inside the body and the event would
+        // be missed entirely. (It was: this printed "done." and exited 0.)
+        while let Ok(event) = events_rx.pop() {
+            if let crate::engine::RtEvent::AudioFailed { errno } = event {
+                audio_error = Some(std::io::Error::from_raw_os_error(errno));
+            }
+        }
         // Leaving the scope joins the audio thread.
+        audio_error
     });
 
+    if let Some(err) = outcome {
+        return Err(format!("audio device '{}' failed: {err}", show.audio.device));
+    }
     println!("done.");
     Ok(())
 }
