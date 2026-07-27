@@ -487,6 +487,31 @@ impl Mixer {
         self.limiter_r = Limiter::default_master(sr);
     }
 
+    /// Render only the delay's tail: no stems, no transport advance (§6).
+    ///
+    /// Called instead of [`Mixer::render`] while the transport is stopped, so a
+    /// delay ringing at the moment of Stop decays away naturally rather than being
+    /// cut off mid-echo. The bus is fed silence and recirculates on its own
+    /// feedback, so how long it lasts is whatever the feedback knob says — at high
+    /// feedback, indefinitely, and turning feedback down is how you end it.
+    ///
+    /// The master limiter still runs, so the tail is limited consistently with the
+    /// playback it came from.
+    pub fn render_tail(&mut self, out: &mut [i32]) {
+        let frames = out.len() / 2;
+        for f in 0..frames {
+            let (wet_l, wet_r) = self.delay_bus.process(0.0, 0.0);
+            out[2 * f] = to_i32(self.limiter_l.process(wet_l));
+            out[2 * f + 1] = to_i32(self.limiter_r.process(wet_r));
+        }
+    }
+
+    /// Discard the delay's contents immediately (panic, §6/§8).
+    pub fn clear_delay(&mut self) {
+        self.delay_bus.left.reset();
+        self.delay_bus.right.reset();
+    }
+
     /// Render one period into `out`, an interleaved `L, R, L, R, …` buffer whose
     /// length is `frames * 2`. Advances the transport by `frames`.
     /// Wraps the read position when the song loops (§14).

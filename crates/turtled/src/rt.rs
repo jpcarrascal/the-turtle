@@ -64,6 +64,7 @@ impl RtAudio {
             }
             RtCommand::ToggleMute(pair) => mixer.toggle_pair_mute(pair),
             RtCommand::SetDsp(pair, param, value) => mixer.set_dsp_param(pair, param, value),
+            RtCommand::ClearDelay => mixer.clear_delay(),
         }
     }
 
@@ -106,8 +107,11 @@ impl RtAudio {
         if self.playing {
             mixer.render(out);
         } else {
-            // `fill` writes the whole slice in one call — silence, no allocation.
-            out.fill(0);
+            // Stopped is not silent: the delay keeps recirculating so its tail rings
+            // out instead of being cut off mid-echo (§6). The transport does not
+            // advance and no stems are read — only the delay bus and the master
+            // limiter run. A second Stop (or the panic binding) clears it.
+            mixer.render_tail(out);
         }
         pos
     }
@@ -261,6 +265,73 @@ mod tests {
 
     /// A looping mixer wraps, and that wrap must be reported exactly once so the
     /// control thread rewinds the MIDI cursors.
+    /// The point of tail-on-stop: a delay ringing when Stop arrives must keep
+    /// sounding rather than being cut off mid-echo. Previously `step` wrote silence
+    /// when stopped, so the tail did not even decay — it froze.
+    #[test]
+    fn a_ringing_delay_keeps_sounding_after_stop() {
+        use crate::control_map::DspParam;
+
+        // A song loud enough to feed the delay, with a short delay time so an echo
+        // is in flight within one buffer.
+        // The shortest division is a sixteenth = 6000 samples at 120 BPM, so the
+        // render has to be longer than that or the echo has not come back yet and
+        // the "tail" would be measured before it exists.
+        let pair = StemPair { index: 0, samples: vec![0.6; 16_000], frames: 8_000 };
+        let song = PreloadedSong {
+            name: "t".into(),
+            sample_rate: 48_000,
+            frames: 8_000,
+            pairs: vec![pair],
+            looping: false,
+            bpm: 120.0,
+        };
+        let mut m = Mixer::new(song, 48_000);
+        m.set_dsp_param(0, DspParam::Send, 127);
+        m.set_dsp_param(0, DspParam::DelayReturn, 127);
+        m.set_dsp_param(0, DspParam::DelayFeedback, 100);
+        m.set_dsp_param(0, DspParam::DelayTime, 0); // shortest division
+
+        let mut rt = RtAudio::new();
+        rt.apply(&mut m, RtCommand::Start);
+        let mut out = vec![0i32; 8_000 * 2];
+        rt.step(&mut m, &mut out); // long enough for the delay to be ringing
+
+        // Now stop, and render again: this must NOT be silence.
+        rt.apply(&mut m, RtCommand::Stop);
+        let mut tail = vec![0i32; 8_000 * 2];
+        rt.step(&mut m, &mut tail);
+        let peak = tail.iter().map(|v| v.abs()).max().unwrap();
+        assert!(peak > 0, "the delay tail should still be sounding after Stop");
+
+        // And a panic empties it.
+        rt.apply(&mut m, RtCommand::ClearDelay);
+        let mut after_panic = vec![0i32; 8_000 * 2];
+        rt.step(&mut m, &mut after_panic);
+        assert!(
+            after_panic.iter().all(|&v| v == 0),
+            "panic should silence the tail immediately"
+        );
+    }
+
+    /// Stopping must not advance the transport, even though the delay keeps
+    /// running — the tail is audio, not playback.
+    #[test]
+    fn rendering_a_tail_does_not_move_the_transport() {
+        let mut m = mixer();
+        let mut rt = RtAudio::new();
+        rt.apply(&mut m, RtCommand::Start);
+        let mut out = [0i32; 2];
+        rt.step(&mut m, &mut out);
+        let pos = m.position();
+
+        rt.apply(&mut m, RtCommand::Stop);
+        for _ in 0..10 {
+            rt.step(&mut m, &mut out);
+        }
+        assert_eq!(m.position(), pos, "a tail must not advance the transport");
+    }
+
     #[test]
     fn check_loop_reports_each_wrap_once() {
         let pair = StemPair { index: 0, samples: vec![0.5, 0.5, 0.5, 0.5], frames: 2 };

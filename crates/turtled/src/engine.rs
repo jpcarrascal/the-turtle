@@ -28,6 +28,12 @@ pub enum RtCommand {
     /// Set a live DSP param on pair `index` to the raw `0..=127` CC value
     /// (§6), independent of transport state.
     SetDsp(usize, DspParam, u8),
+    /// Silence the delay bus immediately, discarding whatever tail is ringing.
+    ///
+    /// Sent on `Action::Panic`, which is reached both by a **second Stop** and by
+    /// the explicit panic binding — `transport.rs` routes them to the same action,
+    /// so one rule covers both gestures (and the future GPIO button).
+    ClearDelay,
 }
 
 pub type RtProducer = Producer<RtCommand>;
@@ -196,7 +202,12 @@ impl Engine {
                 Action::StopPlayback => rt.push(RtCommand::Stop),
                 Action::SeekToZero => rt.push(RtCommand::Seek(0)),
                 Action::ReleaseNotes => self.emit_release(midi),
-                Action::Panic => self.emit_panic(midi),
+                Action::Panic => {
+                    self.emit_panic(midi);
+                    // Panic means everything stops, audio included: without this the
+                    // delay tail would keep ringing after an all-notes-off.
+                    rt.push(RtCommand::ClearDelay);
+                }
             }
         }
         rt
