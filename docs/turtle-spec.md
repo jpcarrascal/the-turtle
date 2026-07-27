@@ -131,8 +131,10 @@ Shared, once:
 - **a lowpass on the delay's output** — cutoff and Q — so every repeat is coloured
   identically: a tone control for the wet signal. (A feedback-loop placement, where
   repeats darken cumulatively, was tried and rejected on taste.) Outside the loop
-  resonance cannot destabilise the delay; its gain is still compensated so the
-  resonance knob changes colour rather than level.
+  resonance cannot destabilise the delay, and there is deliberately no resonant-gain
+  compensation — a lowpass's passband gain is 1.0 whatever `Q` is, so compensating
+  attenuated the whole signal to offset a narrow peak, and made the top of the
+  cutoff sweep jump by up to 20 dB where the filter bypasses.
 - **master:** output gain + optional limiter
 
 Every parameter is driven **only** by a live incoming CC mapping (foot controller /

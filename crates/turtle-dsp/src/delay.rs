@@ -79,7 +79,8 @@ const DENORMAL_FLOOR: f32 = 1e-20;
 ///
 /// One consequence worth knowing: out of the loop, resonance can no longer
 /// multiply the loop gain, so the delay cannot be driven unstable by the filter
-/// knobs. That was a real hazard in the feedback version.
+/// knobs. That was a real hazard in the feedback version, and it is why there is no
+/// gain compensation here — see [`Delay::set_output_filter`].
 #[derive(Debug, Clone)]
 pub struct Delay {
     buf: Vec<f32>,
@@ -110,10 +111,6 @@ pub struct Delay {
     /// entirely when so: an identity biquad still costs 5 multiplies and 4 adds
     /// per sample per channel, which is not nothing on an RT path.
     filter_live: bool,
-    /// Compensation for the filter's resonant gain — see
-    /// [`Delay::set_feedback_filter`]. Without it, resonance multiplies the loop
-    /// gain and the delay can run away.
-    filter_gain_comp: f32,
     sample_rate: f32,
 }
 
@@ -136,7 +133,6 @@ impl Delay {
             mix: 0.0,
             output_filter: Biquad::identity(),
             filter_live: false,
-            filter_gain_comp: 1.0,
             sample_rate,
         }
     }
@@ -200,24 +196,26 @@ impl Delay {
     /// the coefficients, so an adjustable-resonance filter is exactly as cheap as
     /// a fixed one. There is no cheaper "fixed frequency" version worth having.
     ///
-    /// # Why the resonant gain is still compensated
+    /// # There is deliberately no resonant-gain compensation
     ///
-    /// A resonant lowpass has **gain** at its cutoff — roughly `Q` for `Q > 1`, so
-    /// up to about +20 dB at the maximum resonance. On the output that cannot
-    /// destabilise anything (it is outside the loop), so this is no longer a safety
-    /// measure. It is kept for a usability reason: without it, sweeping resonance
-    /// also swings the delay's level, so the resonance knob and the return knob
-    /// fight each other, and a hard-resonant setting slams the master limiter and
-    /// squashes the whole mix.
+    /// An earlier version scaled the output by `1/Q`, on the theory that a resonant
+    /// lowpass peaks at about `Q` and would otherwise make the resonance knob shift
+    /// the delay's level. That was wrong twice over, and both showed up in use.
     ///
-    /// Scaling by `1/Q` keeps resonance a *colour* control at a roughly constant
-    /// level, which is what a separate return level implies. Drop this if raw
-    /// resonance is preferred — it is a taste call now, not a correctness one.
+    /// It over-corrected by an order of magnitude. A lowpass's **passband** gain is
+    /// 1.0 whatever `Q` is — resonance boosts only a narrow band near the cutoff —
+    /// so dividing the *whole* signal by `Q` attenuated everything by up to 20 dB to
+    /// offset a peak that affects a small slice of the spectrum. For broadband
+    /// material the real level rise from resonance is a few dB.
+    ///
+    /// And it made the top of the cutoff sweep discontinuous. CC 127 maps exactly
+    /// onto the maximum cutoff, which bypasses the filter — so the compensation
+    /// vanished in one step and the level jumped by exactly `Q`, up to +20 dB. That
+    /// is what a "large jump in volume, like the filter had suddenly turned off"
+    /// turns out to be: the filter had suddenly turned off.
     pub fn set_output_filter(&mut self, cutoff_hz: f32, q: f32) {
         self.output_filter
             .set(FilterType::Lowpass, cutoff_hz, q, self.sample_rate);
-        // An RBJ lowpass peaks at about `Q` at its cutoff.
-        self.filter_gain_comp = 1.0 / q.max(1.0);
         self.filter_live = true;
     }
 
@@ -225,7 +223,6 @@ impl Delay {
     pub fn clear_output_filter(&mut self) {
         self.output_filter = Biquad::identity();
         self.filter_live = false;
-        self.filter_gain_comp = 1.0;
     }
 
     /// Clear the delay buffer.
@@ -291,8 +288,7 @@ impl Delay {
         // when transparent rather than running an identity biquad, which still
         // costs 5 multiplies and 4 adds per sample per channel.
         let wet = if self.filter_live {
-            self.output_filter
-                .process(delayed * self.filter_gain_comp)
+            self.output_filter.process(delayed)
         } else {
             delayed
         };
