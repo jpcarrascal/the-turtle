@@ -216,6 +216,7 @@ mod tests {
             frames: 2,
             pairs: vec![pair],
             looping: false,
+            bpm: 120.0,
         };
         Mixer::new(song, 48_000)
     }
@@ -269,6 +270,7 @@ mod tests {
             frames: 2,
             pairs: vec![pair],
             looping: true,
+            bpm: 120.0,
         };
         let mut m = Mixer::new(song, 48_000);
         let mut rt = RtAudio::new();

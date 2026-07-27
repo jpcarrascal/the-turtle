@@ -280,8 +280,8 @@ prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [72, 73, 74, 75] }
 dsp_pair0_cutoff = { type = "cc", cc = 20 }
-dsp_pair0_delay_time = { type = "cc", cc = 30 }
-dsp_pair1_delay_time = { type = "cc", cc = 30 }
+dsp_pair0_send = { type = "cc", cc = 30 }
+dsp_pair1_send = { type = "cc", cc = 30 }
 [[setlist]]
 pc = 0
 song = "01-opener"
@@ -370,12 +370,12 @@ song = "01-opener"
     fn dsp_cc_shared_by_two_pairs_fans_out_to_both() {
         let mut e = engine();
         let mut midi = RecordingMidi::default();
-        // CC 30 drives both dsp_pair0_delay_time and dsp_pair1_delay_time.
+        // CC 30 drives both dsp_pair0_send and dsp_pair1_send.
         assert_eq!(
             e.handle_midi(0xB0, 30, 40, &mut midi),
             vec![
-                RtCommand::SetDsp(0, DspParam::DelayTime, 40),
-                RtCommand::SetDsp(1, DspParam::DelayTime, 40),
+                RtCommand::SetDsp(0, DspParam::Send, 40),
+                RtCommand::SetDsp(1, DspParam::Send, 40),
             ]
         );
     }
@@ -405,8 +405,8 @@ song = "01-opener"
         assert_eq!(
             e.take_last_decoded(),
             vec![
-                Decoded::Dsp(0, DspParam::DelayTime, 40),
-                Decoded::Dsp(1, DspParam::DelayTime, 40),
+                Decoded::Dsp(0, DspParam::Send, 40),
+                Decoded::Dsp(1, DspParam::Send, 40),
             ]
         );
     }

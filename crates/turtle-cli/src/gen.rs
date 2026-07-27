@@ -220,9 +220,13 @@ mute  = { type = "note", notes = [12, 11, 13, 75] }
 dsp_pair0_gain = { type = "cc", cc = 0 }
 dsp_pair0_cutoff = { type = "cc", cc = 4 }
 dsp_pair0_resonance = { type = "cc", cc = 8 }
-dsp_pair0_delay_time = { type = "cc", cc = 12 }
-dsp_pair0_delay_feedback = { type = "cc", cc = 13 }
-dsp_pair0_delay_mix = { type = "cc", cc = 14 }
+# The delay is one shared bus fed by per-pair sends (§6).
+dsp_pair0_send = { type = "cc", cc = 15 }
+dsp_delay_time = { type = "cc", cc = 12 }
+dsp_delay_feedback = { type = "cc", cc = 13 }
+dsp_delay_return = { type = "cc", cc = 14 }
+dsp_delay_cutoff = { type = "cc", cc = 16 }
+dsp_delay_resonance = { type = "cc", cc = 17 }
 
 [[setlist]]
 pc = 0
