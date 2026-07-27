@@ -26,6 +26,12 @@ pub struct Show {
     pub control: Control,
     #[serde(default)]
     pub setlist: Vec<SetlistEntry>,
+    /// Logical MIDI port aliases (§5/§7.1): alias -> ALSA card id, so a
+    /// destination can say `port = "CME:1"` instead of repeating a full
+    /// `hw:CARD=...` address. See [`crate::ports`]. Optional: a show that writes
+    /// full ALSA addresses needs no table at all.
+    #[serde(default)]
+    pub ports: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -232,6 +238,15 @@ impl Show {
             if seen_names.insert(&d.name, ()).is_some() {
                 p.push(format!("duplicate destination name {:?}", d.name));
             }
+            // Catch an unresolvable port label here rather than at showtime: a
+            // typo'd alias is a config error, and `turtle validate` is where
+            // config errors should surface.
+            if let Err(e) = self.resolve_port(&d.port) {
+                p.push(format!("destination {}: {e}", d.name));
+            }
+        }
+        if let Err(e) = self.resolved_input_port() {
+            p.push(format!("control.input_port: {e}"));
         }
 
         // Named control bindings, each with its expected arity.
@@ -257,6 +272,31 @@ impl Show {
 
     fn playback_rate(&self) -> u32 {
         self.show.playback_rate
+    }
+
+    /// Resolve one `port`/`input_port` value against this show's `[ports]` table.
+    ///
+    /// The single place any consumer should turn a configured port into something
+    /// to hand ALSA, so `turtled` and `turtle doctor` cannot disagree about what a
+    /// label means.
+    pub fn resolve_port(&self, spec: &str) -> Result<String, crate::ports::PortError> {
+        crate::ports::resolve(spec, &self.ports)
+    }
+
+    /// Every destination's resolved ALSA address, in order.
+    ///
+    /// Fails on the first unresolvable one; `validate` reports them all at once,
+    /// so callers that have validated can treat this as infallible in practice.
+    pub fn resolved_destination_ports(&self) -> Result<Vec<String>, crate::ports::PortError> {
+        self.destinations
+            .iter()
+            .map(|d| self.resolve_port(&d.port))
+            .collect()
+    }
+
+    /// The resolved control-input address.
+    pub fn resolved_input_port(&self) -> Result<String, crate::ports::PortError> {
+        self.resolve_port(&self.control.input_port)
     }
 }
 
@@ -352,6 +392,9 @@ rewind_on_stop = true
 device = "hw:CARD=HXStomp"
 buffer_frames = 1024
 
+[ports]
+CME = "H4MIDIWC"
+
 [[destinations]]
 name = "lights"
 port = "CME:1"
@@ -370,7 +413,7 @@ port = "CME:4"
 offset_ms = 0.0
 
 [control]
-input_port   = "CME:in"
+input_port   = "CME:1"
 select_channel = 1
 start   = { type = "note", note = 60 }
 stop    = { type = "note", note = 61 }
@@ -407,6 +450,96 @@ file  = "stems/pair2.wav"
 filter = "lp"
 "#;
 
+    /// End-to-end: a `[ports]` table in a real show.toml must produce the ALSA
+    /// addresses `turtled` will open, for both destinations and the control input.
+    /// The unit tests in `ports` cover the rules; this covers the wiring.
+    #[test]
+    fn a_ports_table_resolves_destinations_and_the_control_input() {
+        let toml = r#"
+[show]
+name = "T"
+playback_rate = 48000
+
+[audio]
+device = "hw:CARD=L6"
+
+[ports]
+CME = "H4MIDIWC"
+
+[[destinations]]
+name = "lights"
+port = "CME:1"
+[[destinations]]
+name = "pedals"
+port = "CME:4"
+[[destinations]]
+name = "raw"
+port = "hw:CARD=L6,DEV=0,SUBDEV=2"
+
+[control]
+input_port = "CME:2"
+select_channel = 1
+start = { type = "note", note = 60 }
+stop  = { type = "note", note = 61 }
+next  = { type = "note", note = 62 }
+prev  = { type = "note", note = 63 }
+panic = { type = "note", note = 65 }
+mute  = { type = "note", notes = [72, 73, 74, 75] }
+"#;
+        let show: Show = toml::from_str(toml).expect("parses");
+        show.validate().expect("valid");
+
+        assert_eq!(
+            show.resolved_destination_ports().unwrap(),
+            vec![
+                "hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0",
+                "hw:CARD=H4MIDIWC,DEV=0,SUBDEV=3",
+                // An explicit address alongside labels must survive untouched.
+                "hw:CARD=L6,DEV=0,SUBDEV=2",
+            ]
+        );
+        assert_eq!(
+            show.resolved_input_port().unwrap(),
+            "hw:CARD=H4MIDIWC,DEV=0,SUBDEV=1"
+        );
+    }
+
+    /// A typo'd alias must fail `turtle validate`, not wait until showtime and
+    /// surface as an ALSA "No such device".
+    #[test]
+    fn an_unresolvable_port_fails_validation() {
+        let toml = r#"
+[show]
+name = "T"
+playback_rate = 48000
+
+[audio]
+device = "hw:CARD=L6"
+
+[ports]
+CME = "H4MIDIWC"
+
+[[destinations]]
+name = "lights"
+port = "CEM:1"
+
+[control]
+input_port = "CME:1"
+select_channel = 1
+start = { type = "note", note = 60 }
+stop  = { type = "note", note = 61 }
+next  = { type = "note", note = 62 }
+prev  = { type = "note", note = 63 }
+panic = { type = "note", note = 65 }
+mute  = { type = "note", notes = [72, 73, 74, 75] }
+"#;
+        let show: Show = toml::from_str(toml).expect("parses");
+        let err = show.validate().unwrap_err().to_string();
+        assert!(err.contains("destination lights"), "{err}");
+        assert!(err.contains("CEM"), "must name the bad alias: {err}");
+        assert!(err.contains("known aliases: CME"), "must list valid ones: {err}");
+    }
+
     #[test]
     fn parses_spec_show() {
         let show = Show::from_toml_str(SHOW_TOML).expect("parse");
@@ -430,11 +563,14 @@ name = "x"
 playback_rate = 48000
 [audio]
 device = "hw:0"
+[ports]
+CME = "H4MIDIWC"
+
 [[destinations]]
 name = "lights"
 port = "CME:1"
 [control]
-input_port = "CME:in"
+input_port = "CME:1"
 select_channel = 1
 start = { type = "note", note = 60 }
 stop  = { type = "note", note = 61 }

@@ -157,7 +157,11 @@ pub fn run(
 
     // MIDI output, best-effort: destinations whose port can't be opened are just
     // logged, so a bad/placeholder MIDI port never blocks audio playback.
-    let midi_names: Vec<String> = show.destinations.iter().map(|d| d.port.clone()).collect();
+    // Logical labels (`"CME:1"`) resolve to ALSA addresses here; raw addresses
+    // pass through unchanged (§5/§7.1).
+    let midi_names: Vec<String> = show
+        .resolved_destination_ports()
+        .map_err(|e| format!("destination port: {e}"))?;
     let (mut midi, failed) = AlsaMidi::open(&midi_names);
     for name in &failed {
         eprintln!("warning: MIDI out '{name}' unavailable; its events will be logged only");
@@ -299,7 +303,7 @@ mod tests {
             dir.join("show.toml"),
             "[show]\nname = \"B\"\nplayback_rate = 48000\n\
              [audio]\ndevice = \"hw:0\"\n\
-             [[destinations]]\nname = \"lights\"\nport = \"CME:1\"\n\
+             [ports]\nCME = \"H4MIDIWC\"\n\n[[destinations]]\nname = \"lights\"\nport = \"CME:1\"\n\
              [control]\ninput_port = \"x\"\nselect_channel = 1\n\
              start = { type = \"note\", note = 60 }\n\
              stop = { type = \"note\", note = 61 }\n\

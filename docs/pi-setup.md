@@ -90,12 +90,15 @@ playback_rate = 48000
 [audio]
 device = "hw:CARD=HXStomp"
 
+[ports]
+CME = "H4MIDIWC"          # your card id, from `turtle ports`
+
 [[destinations]]
 name = "lights"
 port = "CME:1"
 
 [control]
-input_port = "CME:in"
+input_port = "CME:1"
 select_channel = 1
 start = { type = "note", note = 60 }
 stop  = { type = "note", note = 61 }
@@ -202,6 +205,48 @@ rather than trusting it:
 ```bash
 turtle ports --toml
 ```
+
+### Logical port labels (`[ports]`)
+
+Writing full ALSA addresses on every destination works, but it repeats the card id
+everywhere and leaks sound-system addressing into what should describe a *show*.
+The `[ports]` table (§5/§7.1) gives them short names:
+
+```toml
+[ports]
+CME = "H4MIDIWC"          # alias -> card id, from `turtle ports`
+
+[[destinations]]
+name = "lights"
+port = "CME:1"            # -> hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0
+
+[control]
+input_port = "CME:1"      # ports are duplex; direction follows how it is used
+```
+
+`CME:1` is the port the hardware calls "Port 1" and `turtle ports` lists first —
+**1-based, matching the label on the box** rather than the `SUBDEV` number beneath
+it. Swap to a different interface and only the `[ports]` line changes.
+
+Three things worth knowing:
+
+- **Raw addresses still work.** Anything ALSA already understands passes through
+  untouched, so existing show files need no migration. You can mix both.
+- **Typos fail at `turtle validate`**, not at showtime:
+  ```
+  destination lights: port "CEM:1": no [ports] entry named "CEM" (known aliases: CME)
+  ```
+- **`turtle doctor` shows the resolution**, so a label is never opaque:
+  ```
+  ok   destination "lights": CME:1 -> hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0
+  ```
+
+The mapping is arithmetic — `:n` becomes `DEV=0,SUBDEV=n-1` — rather than a lookup
+against the live hardware. That keeps it pure, so `turtle validate` can check a
+show file on a laptop with no soundcard, and the rules are the same everywhere. It
+assumes one subdevice per port on device 0, which is how both interfaces on this
+rig enumerate. If a device does not fit that shape, write its full address in
+`port` — no new syntax needed.
 
 ## Preflight: `turtle doctor` (§10)
 

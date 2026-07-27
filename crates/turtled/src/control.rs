@@ -254,12 +254,25 @@ pub fn run(
         .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
     // Non-blocking rawmidi input (the `true`): the one control loop polls input
     // *and* dispatches timed MIDI output, so a blocking read would starve the
-    // scheduler. `input_port` must be a real ALSA name (`amidi -l`).
-    let midi_in = Rawmidi::new(&show.control.input_port, Direction::Capture, true)
-        .map_err(|e| format!("open midi in '{}': {e}", show.control.input_port))?;
+    // scheduler. Resolved first, so `input_port` may be either a logical label
+    // (`"CME:1"`, via the `[ports]` table) or a raw ALSA name (§5/§7.1).
+    let input_port = show
+        .resolved_input_port()
+        .map_err(|e| format!("control.input_port: {e}"))?;
+    let midi_in = Rawmidi::new(&input_port, Direction::Capture, true)
+        // Report both spellings: the label is what you wrote, the address is what
+        // failed, and with a logical label those differ.
+        .map_err(|e| {
+            format!(
+                "open midi in '{}' (resolved to '{input_port}'): {e}",
+                show.control.input_port
+            )
+        })?;
 
     // MIDI output for the scheduler (best-effort, like the play path).
-    let midi_names: Vec<String> = show.destinations.iter().map(|d| d.port.clone()).collect();
+    let midi_names: Vec<String> = show
+        .resolved_destination_ports()
+        .map_err(|e| format!("destination port: {e}"))?;
     let (mut midi_out, failed) = AlsaMidi::open(&midi_names);
     for name in &failed {
         eprintln!("warning: MIDI out '{name}' unavailable; its events will be logged only");
@@ -348,7 +361,7 @@ pub fn run(
         "armed \"{}\" on {}; drive it from {} or `turtle` on {} (Ctrl-C to quit)",
         show.show.name,
         show.audio.device,
-        show.control.input_port,
+        input_port,
         socket_path.display()
     );
 
@@ -810,7 +823,7 @@ mod tests {
             dir.join("show.toml"),
             "[show]\nname = \"B\"\nplayback_rate = 48000\n\
              [audio]\ndevice = \"hw:0\"\n\
-             [[destinations]]\nname = \"lights\"\nport = \"CME:1\"\n\
+             [ports]\nCME = \"H4MIDIWC\"\n\n[[destinations]]\nname = \"lights\"\nport = \"CME:1\"\n\
              [control]\ninput_port = \"x\"\nselect_channel = 1\n\
              start = { type = \"note\", note = 60 }\n\
              stop = { type = \"note\", note = 61 }\n\

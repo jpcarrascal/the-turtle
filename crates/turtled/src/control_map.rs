@@ -163,11 +163,14 @@ name = "x"
 playback_rate = 48000
 [audio]
 device = "hw:0"
+[ports]
+CME = "H4MIDIWC"
+
 [[destinations]]
 name = "lights"
 port = "CME:1"
 [control]
-input_port = "CME:in"
+input_port = "CME:1"
 select_channel = 1
 start = { type = "note", note = 60 }
 stop  = { type = "note", note = 61 }
@@ -277,11 +280,14 @@ name = "x"
 playback_rate = 48000
 [audio]
 device = "hw:0"
+[ports]
+CME = "H4MIDIWC"
+
 [[destinations]]
 name = "lights"
 port = "CME:1"
 [control]
-input_port = "CME:in"
+input_port = "CME:1"
 select_channel = 1
 transport_channel = 2
 dsp_channel = 3

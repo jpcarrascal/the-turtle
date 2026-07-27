@@ -157,6 +157,9 @@ rewind_on_stop = true          # true = Stop resets song pointer to 0; false = p
 device = "hw:CARD=HXStomp"
 buffer_frames = 1024           # large = xrun-proof; latency irrelevant
 
+[ports]                        # logical alias -> ALSA card id (`turtle ports`)
+CME = "H4MIDIWC"               # so "CME:1".."CME:4" address its four ports
+
 [[destinations]]               # logical destination -> physical MIDI port + offset
 name = "lights"
 port = "CME:1"
@@ -175,7 +178,7 @@ port = "CME:4"
 offset_ms = 0.0
 
 [control]                      # incoming foot-controller map (all remappable)
-input_port   = "CME:in"
+input_port   = "CME:1"         # ports are duplex; direction follows use
 select_channel = 1             # Program Change selects song
 start   = { type = "note", note = 60 }
 stop    = { type = "note", note = 61 }
