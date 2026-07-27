@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod model;
+pub mod ports;
 pub mod proto;
 pub mod timeline;
 pub mod timing;

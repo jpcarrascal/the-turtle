@@ -169,7 +169,7 @@ pub fn run(show_path: Option<&str>, socket: &Path) -> Report {
     if let Some((show, path)) = &show {
         report.section("stems", check_stems(show, path));
         report.section("audio", crate::probe::check_audio(&show.audio.device, show.show.playback_rate));
-        report.section("midi", crate::probe::check_midi(&show.destinations, &show.control.input_port));
+        report.section("midi", check_midi_with_resolution(show));
     }
 
     report.section("realtime", crate::probe::check_realtime());
@@ -387,6 +387,67 @@ fn check_daemon(socket: &Path, checked_show: Option<&Path>) -> Vec<Check> {
             "expected if you have not started it yet; otherwise: systemctl status turtled",
         )],
     }
+}
+
+/// Resolve the show's logical port labels, then probe the resolved addresses.
+///
+/// Resolution is reported explicitly rather than done silently: with a `[ports]`
+/// table, what you wrote (`"CME:1"`) and what ALSA is handed
+/// (`hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0`) are different strings, and a preflight that
+/// only showed one of them would be useless for exactly the mistakes the table
+/// introduces.
+fn check_midi_with_resolution(show: &turtle_core::Show) -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    // Resolution failures are config errors, reported here rather than probed —
+    // there is no address to open.
+    let mut resolved: Vec<turtle_core::model::Destination> = Vec::new();
+    for d in &show.destinations {
+        match show.resolve_port(&d.port) {
+            Ok(addr) => {
+                if addr != d.port {
+                    checks.push(Check::ok(format!(
+                        "destination \"{}\": {} -> {}",
+                        d.name, d.port, addr
+                    )));
+                }
+                resolved.push(turtle_core::model::Destination {
+                    name: d.name.clone(),
+                    port: addr,
+                    offset_ms: d.offset_ms,
+                });
+            }
+            Err(e) => checks.push(Check::fail(
+                format!("destination \"{}\": {e}", d.name),
+                "`turtle ports` lists the card ids for the [ports] table",
+            )),
+        }
+    }
+
+    let input = match show.resolved_input_port() {
+        Ok(addr) => {
+            if addr != show.control.input_port {
+                checks.push(Check::ok(format!(
+                    "control input: {} -> {}",
+                    show.control.input_port, addr
+                )));
+            }
+            addr
+        }
+        Err(e) => {
+            checks.push(Check::fail(
+                format!("control.input_port: {e}"),
+                "`turtle ports` lists the card ids for the [ports] table",
+            ));
+            // Nothing to probe; return what we have rather than probing a
+            // string we know is wrong.
+            checks.extend(crate::probe::check_midi(&resolved, ""));
+            return checks;
+        }
+    };
+
+    checks.extend(crate::probe::check_midi(&resolved, &input));
+    checks
 }
 
 /// Warn when the bundle we just inspected is not the one the daemon is running.

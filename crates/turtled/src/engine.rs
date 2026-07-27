@@ -231,6 +231,9 @@ auto_advance = false
 rewind_on_stop = true
 [audio]
 device = "hw:0"
+[ports]
+CME = "H4MIDIWC"
+
 [[destinations]]
 name = "lights"
 port = "CME:1"
@@ -238,7 +241,7 @@ port = "CME:1"
 name = "pedals"
 port = "CME:2"
 [control]
-input_port = "CME:in"
+input_port = "CME:1"
 select_channel = 1
 start = { type = "note", note = 60 }
 stop  = { type = "note", note = 61 }
