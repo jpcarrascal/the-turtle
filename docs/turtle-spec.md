@@ -128,9 +128,11 @@ Shared, once:
   any value between a dotted eighth and a quarter is simply wrong against the
   beat. Changing it *glides* the read tap (tape-style pitch bend) rather than
   clicking.
-- **a lowpass inside the delay's feedback loop** — cutoff and Q — so repeats
-  darken cumulatively. Its resonant gain is compensated, or a high-Q, high-feedback
-  setting would make the loop unstable.
+- **a lowpass on the delay's output** — cutoff and Q — so every repeat is coloured
+  identically: a tone control for the wet signal. (A feedback-loop placement, where
+  repeats darken cumulatively, was tried and rejected on taste.) Outside the loop
+  resonance cannot destabilise the delay; its gain is still compensated so the
+  resonance knob changes colour rather than level.
 - **master:** output gain + optional limiter
 
 Every parameter is driven **only** by a live incoming CC mapping (foot controller /

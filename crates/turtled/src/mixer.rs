@@ -192,8 +192,8 @@ struct DelayBus {
     return_r: Gain,
     /// Selected note division, kept so a tempo change could recompute the time.
     division: DelayDivision,
-    /// Filter state, kept so cutoff and Q can be set independently by separate
-    /// CCs without either resetting the other.
+    /// Output-filter state, kept so cutoff and Q can be set independently by
+    /// separate CCs without either resetting the other.
     cutoff_hz: f32,
     q: f32,
     filter_live: bool,
@@ -258,20 +258,20 @@ impl DelayBus {
         self.right.set_feedback(feedback);
     }
 
-    /// Recompute the feedback filter from the current cutoff and Q.
+    /// Recompute the output filter from the current cutoff and Q.
     ///
     /// At the top of its range the filter is doing nothing audible, so it is
     /// cleared rather than left running — that restores the bit-exact passthrough
     /// and skips two biquads per sample.
     fn apply_filter(&mut self) {
         if self.cutoff_hz >= MAX_CUTOFF_HZ {
-            self.left.clear_feedback_filter();
-            self.right.clear_feedback_filter();
+            self.left.clear_output_filter();
+            self.right.clear_output_filter();
             self.filter_live = false;
             return;
         }
-        self.left.set_feedback_filter(self.cutoff_hz, self.q);
-        self.right.set_feedback_filter(self.cutoff_hz, self.q);
+        self.left.set_output_filter(self.cutoff_hz, self.q);
+        self.right.set_output_filter(self.cutoff_hz, self.q);
         self.filter_live = true;
     }
 
