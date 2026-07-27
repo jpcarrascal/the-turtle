@@ -199,6 +199,7 @@ pub fn run(
     // the ALSA imports stay out of the non-Linux build), which means the
     // signature cannot see the short `sched` path.
     tuning: crate::sched::Tuning,
+    wait_devices: std::time::Duration,
 ) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
@@ -217,7 +218,7 @@ pub fn run(
     use crate::engine::{rt_channel, rt_event_channel, Engine, RtEvent};
     use crate::mixer::song_channel;
     use crate::play::{dispatch_pos, load_playable, load_schedulers, Playable};
-    use crate::{notify, rt, sched, socket};
+    use crate::{notify, retry, rt, sched, socket};
 
     // Resolve both thread priorities up front, so the ordering invariant
     // (audio > midi) is established in one place rather than at two spawn sites.
@@ -250,8 +251,20 @@ pub fn run(
     // since it is a property of the song, not the show.
     let mut duration_s = frames as f64 / rate as f64;
 
-    let audio = AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize)
-        .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
+    // Wait for the device rather than exiting: at boot USB enumeration races the
+    // service, and on a restart the outgoing process may still hold it (§12).
+    let audio = retry::open_with_retry(
+        &format!("audio device '{}'", show.audio.device),
+        wait_devices,
+        || AlsaAudio::open(&show.audio.device, rate, show.audio.buffer_frames as usize),
+        |msg| {
+            println!("{msg}");
+            // Also the systemd status line, so a slow start reads as "waiting for
+            // the interface" rather than an unexplained delay.
+            sd.status(msg);
+        },
+    )
+    .map_err(|e| format!("open audio '{}': {e}", show.audio.device))?;
     // Non-blocking rawmidi input (the `true`): the one control loop polls input
     // *and* dispatches timed MIDI output, so a blocking read would starve the
     // scheduler. Resolved first, so `input_port` may be either a logical label
@@ -259,7 +272,15 @@ pub fn run(
     let input_port = show
         .resolved_input_port()
         .map_err(|e| format!("control.input_port: {e}"))?;
-    let midi_in = Rawmidi::new(&input_port, Direction::Capture, true)
+    let midi_in = retry::open_with_retry(
+        &format!("MIDI input '{input_port}'"),
+        wait_devices,
+        || Rawmidi::new(&input_port, Direction::Capture, true),
+        |msg| {
+            println!("{msg}");
+            sd.status(msg);
+        },
+    )
         // Report both spellings: the label is what you wrote, the address is what
         // failed, and with a logical label those differ.
         .map_err(|e| {

@@ -495,6 +495,55 @@ before the stems are loaded or the transport is armed. `turtled` instead sends
 until the show is genuinely ready, and a start-up failure reads as a failed start
 rather than "started, then crashed".
 
+### Waiting for devices at startup
+
+`turtled` waits up to **15 seconds** for its audio and MIDI devices before giving
+up. This is not politeness — it fixes a real failure:
+
+```
+13:09:47  Cannot get card index for L6 ... No such device (19)
+13:09:47  Main process exited, code=exited, status=1/FAILURE
+13:09:48  Scheduled restart job, restart counter is at 1697.
+13:09:48  armed "Tone Test" on hw:L6            <- succeeded one second later
+```
+
+A device open used to be fatal, and `Restart=always` has no ceiling, so a device
+that was merely *late* became an unbounded crash-loop at one attempt per second.
+Two ways that happens: at boot, USB enumeration races the service (`After=sound.target`
+means *some* sound device exists, not that your interface has appeared); and on a
+restart, the outgoing process may not have released the device yet.
+
+It recovers either way, which is why it went unnoticed for so long — but it floods
+the journal, and each loop is a failed `READY=1`, so `systemctl start` reports a
+failure for a daemon that is about to be fine.
+
+In the journal a late device now costs one line:
+
+```
+waiting up to 15s for audio device 'hw:L6': ... 'No such device (19)'
+```
+
+`systemctl status` shows the same text while it waits, so a slow start explains
+itself. To change or disable the window:
+
+```bash
+turtled control <bundle> --wait-devices 30   # be more patient
+turtled control <bundle> --wait-devices 0    # fail immediately (the old behaviour)
+```
+
+`turtle doctor` reports the restart count, so you never have to find a number like
+1697 by reading the journal:
+
+```
+service
+  ok   turtled.service active (result: success)
+  warn 12 automatic restart(s) — the daemon has exited unexpectedly at least once
+       -> journalctl -u turtled -b | grep -i 'exited\|failed' to see why
+```
+
+The count is per-run: a clean `systemctl stop`/`start` resets it, so a non-zero
+value describes the *current* run rather than all history.
+
 ### The watchdog is the part worth understanding
 
 `Restart=always` can only notice a process that *exited*. A deadlocked audio

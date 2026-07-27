@@ -178,6 +178,11 @@ pub fn run(show_path: Option<&str>, socket: &Path) -> Report {
         "daemon",
         check_daemon(socket, show.as_ref().map(|(_, p)| p.as_path())),
     );
+    // Absent entirely when there is no systemd unit, rather than reporting a
+    // non-problem on a dev box.
+    if let Some(checks) = check_service() {
+        report.section("service", checks);
+    }
     report
 }
 
@@ -457,6 +462,83 @@ fn check_midi_with_resolution(show: &turtle_core::Show) -> Vec<Check> {
 
     checks.extend(crate::probe::check_midi(&resolved, &input));
     checks
+}
+
+/// What systemd thinks of the unit — in particular, how many times it has been
+/// restarted automatically.
+///
+/// This exists because a restart count reached **1697** on the dev rig without
+/// anyone noticing. `Restart=always` with no ceiling (deliberate: a show must not
+/// stay down) means a device that is missing produces an unbounded crash-loop that
+/// *eventually succeeds*, so the daemon looks healthy while the journal fills up.
+/// `NRestarts` is the one number that reveals it, and nobody reads it unprompted.
+///
+/// Returns `None` when there is no systemd or no such unit, so the section is
+/// simply absent rather than reporting a non-problem on a dev box.
+fn check_service() -> Option<Vec<Check>> {
+    let out = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "turtled.service",
+            "--property=NRestarts",
+            "--property=ActiveState",
+            "--property=Result",
+            "--property=LoadState",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}="))) 
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    // Not installed as a service: nothing to say.
+    if field("LoadState").as_deref() != Some("loaded") {
+        return None;
+    }
+
+    let mut checks = Vec::new();
+    let state = field("ActiveState").unwrap_or_else(|| "unknown".into());
+    let result = field("Result").unwrap_or_else(|| "unknown".into());
+    let restarts: u64 = field("NRestarts").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    checks.push(match state.as_str() {
+        "active" => Check::ok(format!("turtled.service {state} (result: {result})")),
+        // Inactive is not a fault — you may have stopped it on purpose — but it is
+        // worth stating plainly, because it is indistinguishable from "broken" if
+        // you are wondering why the transport does not respond.
+        "inactive" => Check::warn(
+            format!("turtled.service is {state} — not running"),
+            "sudo systemctl start turtled",
+        ),
+        _ => Check::warn(
+            format!("turtled.service is {state} (result: {result})"),
+            "journalctl -u turtled -b -n 30",
+        ),
+    });
+
+    // A warning, not a failure: the count is cumulative and may be entirely
+    // historical, and per this module`s rules only "the show cannot play" fails.
+    if restarts > 0 {
+        checks.push(Check::warn(
+            format!(
+                "{restarts} automatic restart(s) — the daemon has exited unexpectedly \
+                 {}",
+                if restarts >= 50 { "many times" } else { "at least once" }
+            ),
+            "journalctl -u turtled -b | grep -i 'exited\\|failed' to see why; \
+             `systemctl reset-failed turtled` clears the count once fixed",
+        ));
+    } else {
+        checks.push(Check::ok("no automatic restarts"));
+    }
+    Some(checks)
 }
 
 /// Warn when the bundle we just inspected is not the one the daemon is running.

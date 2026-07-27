@@ -44,6 +44,7 @@ mod mixer;
 mod notes;
 mod notify;
 mod play;
+mod retry;
 mod rt;
 mod sched;
 mod scheduler;
@@ -89,6 +90,10 @@ fn main() -> ExitCode {
                 sched::AUDIO_PRIORITY
             );
             eprintln!(
+                "  --wait-devices <s>   seconds to wait for audio/MIDI to appear (default {}, 0 off)",
+                retry::DEFAULT_WAIT.as_secs()
+            );
+            eprintln!(
                 "  --audio-cpu <n>      pin the audio thread to a CPU; 'auto' (default) uses an"
             );
             eprintln!(
@@ -120,6 +125,9 @@ struct CmdOpts {
     rt_priority: Option<u8>,
     /// Which CPU to pin the audio thread to (§12).
     audio_cpu: CpuChoice,
+    /// How long to wait for the audio/MIDI devices to appear before giving up
+    /// (§12). `0` restores the old fail-immediately behaviour.
+    wait_devices: std::time::Duration,
 }
 
 /// How the audio thread's CPU is chosen.
@@ -182,6 +190,7 @@ impl CmdOpts {
         // Auto: use a reserved core if `isolcpus` gave us one, otherwise leave
         // placement to the scheduler (§12).
         let mut audio_cpu = CpuChoice::Auto;
+        let mut wait_devices = retry::DEFAULT_WAIT;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-v" | "--verbose" => verbose = true,
@@ -198,6 +207,15 @@ impl CmdOpts {
                     // 0 is the documented "don't touch scheduling" sentinel, so
                     // it maps to None rather than to an invalid priority.
                     rt_priority = (n > 0).then_some(n);
+                }
+                "--wait-devices" => {
+                    let raw = args
+                        .next()
+                        .ok_or("--wait-devices needs a number of seconds (0 to disable)")?;
+                    let secs: u64 = raw.parse().map_err(|_| {
+                        format!("--wait-devices: '{raw}' is not a number of seconds")
+                    })?;
+                    wait_devices = std::time::Duration::from_secs(secs);
                 }
                 "--audio-cpu" => {
                     let raw = args
@@ -216,6 +234,7 @@ impl CmdOpts {
             socket,
             rt_priority,
             audio_cpu,
+            wait_devices,
         })
     }
 }
@@ -249,6 +268,7 @@ fn control_command(opts: CmdOpts) -> ExitCode {
             opts.verbose,
             std::path::Path::new(&socket),
             tuning,
+            opts.wait_devices,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -259,7 +279,7 @@ fn control_command(opts: CmdOpts) -> ExitCode {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&bundle, &opts.song, opts.verbose, &socket, tuning);
+        let _ = (&bundle, &opts.song, opts.verbose, &socket, tuning, opts.wait_devices);
         eprintln!(
             "control requires Linux/ALSA (this host is {})",
             std::env::consts::OS
@@ -282,6 +302,7 @@ fn play_command(opts: CmdOpts) -> ExitCode {
             opts.song.as_deref(),
             opts.verbose,
             tuning,
+            opts.wait_devices,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -294,7 +315,7 @@ fn play_command(opts: CmdOpts) -> ExitCode {
     {
         // The audio runtime is Linux-only; keep the args "used" so the dev-Mac
         // build stays warning-free.
-        let _ = (&bundle, &opts.song, opts.verbose, tuning);
+        let _ = (&bundle, &opts.song, opts.verbose, tuning, opts.wait_devices);
         eprintln!(
             "play requires Linux/ALSA (this host is {})",
             std::env::consts::OS
@@ -426,6 +447,36 @@ mod tests {
     fn explicit_none_never_pins_and_fixed_never_consults_the_kernel() {
         assert_eq!(CpuChoice::None.resolve(), None);
         assert_eq!(CpuChoice::Fixed(2).resolve(), Some(2));
+    }
+
+    /// Waiting for devices is the default (§12): a USB interface that enumerates a
+    /// second after boot must not fail the show.
+    #[test]
+    fn waiting_for_devices_is_on_by_default() {
+        assert_eq!(parse(&["bundle"]).unwrap().wait_devices, retry::DEFAULT_WAIT);
+    }
+
+    /// `0` must restore the exact pre-existing fail-immediately behaviour, so the
+    /// change can be A/B'd and scripted around.
+    #[test]
+    fn wait_devices_zero_disables_waiting() {
+        let opts = parse(&["bundle", "--wait-devices", "0"]).unwrap();
+        assert_eq!(opts.wait_devices, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn wait_devices_accepts_an_explicit_number_of_seconds() {
+        let opts = parse(&["bundle", "--wait-devices", "45"]).unwrap();
+        assert_eq!(opts.wait_devices, std::time::Duration::from_secs(45));
+    }
+
+    /// A typo must be loud rather than silently falling back to the default — the
+    /// whole point of passing it is to change the behaviour.
+    #[test]
+    fn a_non_numeric_wait_devices_is_an_error() {
+        let err = parse(&["bundle", "--wait-devices", "soon"]).unwrap_err();
+        assert!(err.contains("not a number of seconds"), "{err}");
+        assert!(parse(&["bundle", "--wait-devices"]).is_err());
     }
 
     /// Flags are position-independent and must not be mistaken for positionals.
