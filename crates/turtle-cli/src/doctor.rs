@@ -343,7 +343,16 @@ fn check_daemon(socket: &Path, checked_show: Option<&Path>) -> Vec<Check> {
     if !socket.exists() {
         return vec![Check::warn(
             format!("no socket at {} — daemon not running", socket.display()),
-            "expected if you have not started it yet; otherwise: systemctl status turtled",
+            // Name the service path explicitly. With the service stopped,
+            // `RuntimeDirectory=` has removed /run/turtle, so the socket search
+            // falls through to the /tmp default — which is accurate but points at
+            // a path a service operator never uses, and would send them looking in
+            // the wrong place.
+            format!(
+                "expected if you have not started it yet. Running as a service? Its socket is \
+                 {} and exists only while it runs: systemctl status turtled",
+                turtle_core::proto::SYSTEM_SOCKET_PATH
+            ),
         )];
     }
 
@@ -658,6 +667,14 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].level, Level::Warn);
         assert!(checks[0].detail.contains("not running"), "{:?}", checks[0]);
+        // The hint must name the service socket, not only the path searched —
+        // with the service stopped they differ, and only one is where an
+        // operator should look.
+        let hint = checks[0].hint.as_deref().unwrap();
+        assert!(
+            hint.contains(turtle_core::proto::SYSTEM_SOCKET_PATH),
+            "hint should name the service socket: {hint}"
+        );
     }
 
     /// A socket that exists but refuses *us* is a running daemon we cannot drive,
