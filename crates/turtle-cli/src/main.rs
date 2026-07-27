@@ -145,7 +145,8 @@ fn gen_tone(args: &[String]) -> ExitCode {
     // `--loop` anywhere after the path: it is a flag, not a positional, so it
     // must not shift `seconds`/`hz`.
     let looping = args.iter().any(|a| a == "--loop");
-    match gen::gen_tone(Path::new(out), seconds, hz, looping) {
+    let force = args.iter().any(|a| a == "--force");
+    match gen::gen_tone(Path::new(out), seconds, hz, looping, force) {
         Ok(()) => {
             let mode = if looping { " looping" } else { "" };
             println!("wrote{mode} tone bundle to {out} ({seconds}s @ {hz} Hz)");
@@ -216,8 +217,9 @@ fn usage() {
     eprintln!("  validate <show.toml>          bundle validation");
     eprintln!("  doctor [<bundle|show.toml>]    preflight: devices, RT limits, tuning");
     eprintln!("  ports [--toml]                 list devices with their stable ALSA names");
-    eprintln!("  gen-tone <out-dir> [s] [hz] [--loop]");
-    eprintln!("                                write a playable test bundle");
+    eprintln!("  gen-tone <out-dir> [s] [hz] [--loop] [--force]");
+    eprintln!("                                write a playable test bundle;");
+    eprintln!("                                --force overwrites an existing one");
     eprintln!();
     eprintln!("control socket (needs a running turtled):");
     eprintln!("  status                        transport state, song, position");

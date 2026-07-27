@@ -276,8 +276,14 @@ What changes while a song loops:
 To try it without editing anything:
 
 ```bash
-turtle gen-tone ~/Loop.turtle 4 440 --loop
+turtle gen-tone /media/shows/Loop.turtle 4 440 --loop
 ```
+
+then point its `show.toml` at your devices. **Re-running `gen-tone` over an
+existing bundle is refused**, because it rewrites `show.toml` and `song.toml` from
+templates and would silently discard those device settings — the failure would
+show up much later as a device that will not open. Pass `--force` if you really do
+want to start over.
 
 The seam is sample-accurate: the wrap happens **inside** the audio buffer, not at
 its boundary. Wrapping only at buffer boundaries would quantise the loop point to

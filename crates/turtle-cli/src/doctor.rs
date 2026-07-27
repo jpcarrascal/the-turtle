@@ -683,7 +683,7 @@ mod tests {
         // layout breaks this test rather than silently breaking doctor.
         let root = std::env::temp_dir().join(format!("turtle-stems-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
-        crate::gen::gen_tone(&root, 0.25, 440.0, false).expect("generate a test bundle");
+        crate::gen::gen_tone(&root, 0.25, 440.0, false, false).expect("generate a test bundle");
 
         let show = turtle_core::Show::load(root.join("show.toml")).unwrap();
         let checks = check_stems(&show, &root.join("show.toml"));
