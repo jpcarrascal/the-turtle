@@ -125,6 +125,18 @@ pub enum Response {
 pub struct Status {
     /// `show.toml`'s show name.
     pub show: String,
+    /// The bundle path the daemon actually loaded, canonicalised.
+    ///
+    /// Reported so a client can tell whether the files it is inspecting are the
+    /// ones being played. That is not hypothetical: a stale copy of a bundle in
+    /// `$HOME` alongside the real one under `/media/shows` produced a long and
+    /// confusing debugging session, because every tool was truthful about a
+    /// different file.
+    ///
+    /// `#[serde(default)]` so a `turtle` older than this field can still parse a
+    /// newer daemon's reply rather than failing to deserialise outright.
+    #[serde(default)]
+    pub bundle: Option<String>,
     /// Transport state (§8).
     pub state: State,
     /// Song-directory name of the current (armed/playing) song.
@@ -290,6 +302,7 @@ mod tests {
     fn status_response_flattens_next_to_its_tag() {
         let status = Status {
             show: "Tone".into(),
+            bundle: Some("/media/shows/Tone.turtle".into()),
             state: State::Playing,
             song: Some("tone".into()),
             armed_next: None,
