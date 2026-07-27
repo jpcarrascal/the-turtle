@@ -121,7 +121,7 @@ impl ChannelChain {
             q: DEFAULT_Q,
             target_q: DEFAULT_Q,
             filter_coeff: one_pole_coeff(FILTER_SMOOTH_MS, sample_rate),
-            delay: Delay::new(DELAY_MAX_SECONDS * sample_rate as usize),
+            delay: Delay::new(DELAY_MAX_SECONDS * sample_rate as usize, sample_rate),
             sample_rate,
         }
     }
@@ -744,5 +744,68 @@ mod tests {
         let left: Vec<i32> = out.iter().step_by(2).copied().collect();
         assert!(left.iter().all(|v| v.signum() == 1), "{left:?}");
         assert!(m.position() < 1 || m.position() == 0, "pos wrapped: {}", m.position());
+    }
+
+    /// Report how much faster than real time the mixer renders, so the §6 DSP
+    /// rearchitecture can be judged on measurements rather than flop-counting.
+    ///
+    /// Not an assertion about speed — a threshold here would be a flaky test on
+    /// whatever machine CI happens to use. It prints, and the number is only
+    /// meaningful on the target hardware:
+    ///
+    /// ```text
+    /// cargo test --release -p turtled -- --nocapture mixer::tests::render_throughput
+    /// ```
+    ///
+    /// Run it on the Pi before and after a DSP change. The figure to watch is the
+    /// realtime factor: 20x means one core spends 5% of its time mixing.
+    #[test]
+    fn render_throughput_realtime_factor() {
+        use std::time::Instant;
+
+        // A full-width song: 4 stereo pairs, the worst case the engine supports.
+        let rate = 48_000usize;
+        let secs = 2;
+        let pairs: Vec<StemPair> = (0..4u8)
+            .map(|i| pair(i, [0.25, -0.25].repeat(rate * secs)))
+            .collect();
+        let mut m = Mixer::new(song(pairs), rate as u32);
+
+        // Every block engaged: gain, filter, and delay all doing real work, since
+        // the transparent defaults would otherwise measure the cheap path.
+        for p in 0..4usize {
+            m.set_dsp_param(p, DspParam::Gain, 100);
+            m.set_dsp_param(p, DspParam::Cutoff, 64);
+            m.set_dsp_param(p, DspParam::Resonance, 80);
+            m.set_dsp_param(p, DspParam::DelayTime, 40);
+            m.set_dsp_param(p, DspParam::DelayFeedback, 80);
+            m.set_dsp_param(p, DspParam::DelayMix, 64);
+        }
+
+        let period = 1024usize;
+        let periods = (rate * secs) / period;
+        let mut out = vec![0i32; period * 2];
+        // One untimed period first, so page-faulting the buffers in does not land
+        // in the measurement.
+        m.render(&mut out);
+
+        let start = Instant::now();
+        for _ in 0..periods {
+            m.render(&mut out);
+        }
+        let elapsed = start.elapsed();
+
+        let audio_secs = (periods * period) as f64 / rate as f64;
+        let factor = audio_secs / elapsed.as_secs_f64();
+        eprintln!(
+            "render: {:.1} s of audio in {:.1} ms = {factor:.1}x realtime \
+             ({:.2}% of one core), 4 pairs @ {rate} Hz, {period}-frame periods",
+            audio_secs,
+            elapsed.as_secs_f64() * 1000.0,
+            100.0 / factor
+        );
+        // The only assertion: it must at least keep up, or the design is broken
+        // on this machine regardless of headroom.
+        assert!(factor > 1.0, "slower than realtime: {factor:.2}x");
     }
 }
