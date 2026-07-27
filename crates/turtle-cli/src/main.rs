@@ -7,8 +7,9 @@
 //!     `monitor`) speak the JSON line protocol in [`turtle_core::proto`] to a
 //!     running `turtled` over its Unix socket.
 //!
-//! `doctor` is the third kind: it checks the *machine* (devices, RT limits, CPU
-//! tuning) rather than the daemon, so it works with or without one running.
+//! `doctor` and `ports` are the third kind: they inspect the *machine* (devices,
+//! RT limits, CPU tuning) rather than the daemon, so they work with or without one
+//! running.
 //!
 //! Still to come per §10: `calibrate` and `test` — each its own workflow.
 
@@ -20,6 +21,7 @@ use turtle_core::proto::{Request, Response, DEFAULT_SOCKET_PATH, SYSTEM_SOCKET_P
 mod client;
 mod doctor;
 mod gen;
+mod ports;
 mod probe;
 
 fn main() -> ExitCode {
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
         Some("gen-tone") => gen_tone(&rest[1..]),
         Some("validate") => validate(&rest[1..]),
         Some("doctor") => run_doctor(rest.get(1).map(String::as_str), &socket),
+        Some("ports") => run_ports(rest.get(1).map(String::as_str) == Some("--toml")),
         Some("status") => socket_status(&socket),
         Some("monitor") => match client::monitor(&socket) {
             Ok(()) => ExitCode::SUCCESS,
@@ -185,12 +188,30 @@ fn run_doctor(show: Option<&str>, socket: &Path) -> ExitCode {
     }
 }
 
+/// `turtle ports [--toml]`: list devices with their stable ALSA names.
+fn run_ports(toml: bool) -> ExitCode {
+    let listing = ports::enumerate();
+    if toml {
+        print!("{}", listing.to_toml_snippet());
+    } else {
+        println!("{listing}");
+    }
+    // Not being able to enumerate (a non-Linux host) is a failure: the caller
+    // asked a question we could not answer, and a script should notice.
+    if listing.unavailable.is_some() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn usage() {
     eprintln!("turtle <command> [--socket <path>]");
     eprintln!();
     eprintln!("offline (no daemon):");
     eprintln!("  validate <show.toml>          bundle validation");
     eprintln!("  doctor [<bundle|show.toml>]    preflight: devices, RT limits, tuning");
+    eprintln!("  ports [--toml]                 list devices with their stable ALSA names");
     eprintln!("  gen-tone <out-dir> [s] [hz]   write a playable test bundle");
     eprintln!();
     eprintln!("control socket (needs a running turtled):");

@@ -17,6 +17,12 @@ midly = "0.5"
 
 # `doctor` probes real ALSA devices and reads RT rlimits (spec §10). Linux-only,
 # mirroring turtled: on the dev Mac these checks report "unknown" instead.
+[dev-dependencies]
+# The `ports --toml` snippet must parse as real TOML, so the test parses it
+# rather than eyeballing the string. Dev-only: the CLI itself never parses TOML
+# (turtle-core does that).
+toml = "0.8"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
 libc = "0.2"
