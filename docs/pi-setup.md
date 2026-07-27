@@ -6,8 +6,10 @@ priorities](#real-time-thread-priorities-3),
 [running it as a service](#running-as-a-service-12), and
 [CPU tuning](#cpu-tuning-governor-threadirqs-isolcpus-12).
 
-**Shortcut:** once built, [`turtle doctor`](#preflight-turtle-doctor-10) checks most
-of what the sections below tell you to verify by hand.
+**Shortcuts:** [`turtle ports`](#finding-your-device-names-turtle-ports) prints the
+device strings to put in `show.toml`, and
+[`turtle doctor`](#preflight-turtle-doctor-10) checks most of what the sections
+below tell you to verify by hand.
 
 Everything from "real-time priorities" onwards is **optional tuning** — the show
 plays without any of it. Do the read-only rootfs step last of all, since it makes
@@ -143,6 +145,53 @@ sudo apt install -y libasound2-dev
 
 Still to come before it is show-ready: resolving logical port labels
 (`"CME:1"`) to ALSA `hw:` device names, and GPIO (§8.1).
+
+## Finding your device names: `turtle ports`
+
+Before editing `show.toml`, get the device strings from the box itself:
+
+```bash
+turtle ports
+```
+
+```
+Paste these into show.toml. They are stable across reboots and
+replugs, unlike the hw:<index> form that `amidi -l` prints.
+
+audio  ([audio] device)
+  hw:CARD=L6            ZOOM Corporation L6 at usb-0000:01:00.0-1.2
+
+midi   ([control] input_port, [[destinations]] port)
+  H4MIDIWC — CME Pro H4MIDI-WC at usb-0000:01:00.0-1.3
+    IO  H4MIDI-WC Port 1       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0
+    IO  H4MIDI-WC Port 2       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=1
+    IO  H4MIDI-WC Port 3       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=2
+    IO  H4MIDI-WC Port 4       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=3
+  L6 — ZOOM Corporation L6 at usb-0000:01:00.0-1.2
+    IO  L6 MIDI I/O Port       hw:CARD=L6,DEV=0,SUBDEV=0
+```
+
+**Use these, not the `hw:1,0,0` form `amidi -l` prints.** ALSA assigns card
+*indices* in enumeration order, so an index-based name silently comes to mean a
+different device after a replug or a reboot in a different order — and since
+`turtled` treats a missing MIDI input as fatal, a config that worked yesterday
+stops the show from starting today with nothing to blame. Card *ids* never move.
+
+Two details this saves you working out by hand:
+
+- **The port name beside each string.** `SUBDEV=0` on its own does not tell you it
+  is the socket labelled "Port 1" on the box.
+- **`SUBDEV` is always included.** It defaults to `-1` ("any"), so an unqualified
+  `hw:CARD=H4MIDIWC` on a four-port interface gives whichever port ALSA picks
+  first — which works right up until it doesn't.
+
+`--toml` prints a ready-to-paste starting config. It guesses that your first MIDI
+port is both the control input and the first destination, and says so — check it
+rather than trusting it:
+
+```bash
+turtle ports --toml
+```
 
 ## Preflight: `turtle doctor` (§10)
 
