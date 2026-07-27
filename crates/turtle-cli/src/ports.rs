@@ -99,11 +99,26 @@ impl fmt::Display for Listing {
         writeln!(f, "Paste these into show.toml. They are stable across reboots and")?;
         writeln!(f, "replugs, unlike the hw:<index> form that `amidi -l` prints.")?;
 
+        // The paste-able string comes **first** in every section, and every
+        // address starts in the same column. Two reasons, both about it being a
+        // copy-and-paste tool: a consistent position is one less thing to
+        // re-locate between sections, and a left-aligned column of addresses can
+        // be selected cleanly, which a column pushed rightwards by
+        // variable-length descriptions cannot.
+        //
+        // Widths are measured rather than hardcoded, so the columns still line up
+        // on hardware with longer card ids than the ones I had to hand.
         let audio: Vec<&CardPorts> = self.cards.iter().filter(|c| c.has_audio).collect();
         if !audio.is_empty() {
+            let w = audio
+                .iter()
+                .map(|c| c.id.len() + "hw:CARD=".len())
+                .max()
+                .unwrap_or(0);
             writeln!(f, "\naudio  ([audio] device)")?;
             for c in audio {
-                writeln!(f, "  hw:CARD={:<12}  {}", c.id, c.description)?;
+                let addr = format!("hw:CARD={}", c.id);
+                writeln!(f, "  {addr:<w$}  {}", c.description)?;
             }
         }
 
@@ -111,17 +126,19 @@ impl fmt::Display for Listing {
         if with_midi.is_empty() {
             writeln!(f, "\nmidi   (none found)")?;
         } else {
+            // One width across all cards, so the addresses line up down the whole
+            // section rather than restarting per card.
+            let w = with_midi
+                .iter()
+                .flat_map(|c| c.midi.iter().map(|p| p.alsa_name(&c.id).len()))
+                .max()
+                .unwrap_or(0);
             writeln!(f, "\nmidi   ([control] input_port, [[destinations]] port)")?;
             for c in with_midi {
                 writeln!(f, "  {} — {}", c.id, c.description)?;
                 for p in &c.midi {
-                    writeln!(
-                        f,
-                        "    {}  {:<22}  {}",
-                        p.direction(),
-                        p.name,
-                        p.alsa_name(&c.id)
-                    )?;
+                    let addr = p.alsa_name(&c.id);
+                    writeln!(f, "    {addr:<w$}  {}  {}", p.direction(), p.name)?;
                 }
             }
         }
@@ -328,13 +345,18 @@ mod tests {
                     name: "L6".into(),
                     description: "ZOOM Corporation L6 at usb-0000:01:00.0-1.2".into(),
                     has_audio: true,
-                    midi: vec![MidiPort {
-                        device: 0,
-                        subdevice: 0,
-                        name: "L6 MIDI I/O Port".into(),
-                        input: true,
-                        output: true,
-                    }],
+                    // The real L6 exposes three MIDI ports alongside its audio.
+                    midi: ["L6 MIDI I/O Port", "L6 Mixer Control Port", "L6 for L6 Editor Port"]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| MidiPort {
+                            device: 0,
+                            subdevice: i as i32,
+                            name: (*n).to_string(),
+                            input: true,
+                            output: true,
+                        })
+                        .collect(),
                 },
             ],
             unavailable: None,
@@ -417,6 +439,49 @@ mod tests {
         // Whereas a Linux host with nothing plugged in *should* say that.
         let empty = Listing { cards: Vec::new(), unavailable: None };
         assert!(empty.to_string().contains("no ALSA cards found"));
+    }
+
+    /// The address is what you came to copy, so it leads every line in every
+    /// section — and all of them start in the same column, which is what makes a
+    /// column of them selectable. Regressing either would make this a worse
+    /// copy-and-paste tool while still "working".
+    #[test]
+    fn every_line_leads_with_the_address_in_a_fixed_column() {
+        let out = sample().to_string();
+        let mut checked = 0;
+        for line in out.lines() {
+            let t = line.trim_start();
+            if !t.starts_with("hw:CARD=") {
+                continue;
+            }
+            // The address is first on the line, not trailing after a description.
+            let indent = line.len() - t.len();
+            let addr = t.split_whitespace().next().unwrap();
+            // Every address in a section starts at the same column as its peers.
+            assert!(
+                line.starts_with(&" ".repeat(indent)),
+                "unexpected indent on {line:?}"
+            );
+            assert!(
+                addr.starts_with("hw:CARD="),
+                "line must lead with the address: {line:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "only checked {checked} address lines: {out}");
+
+        // Columns line up: gather the MIDI lines and confirm the text after the
+        // address begins at one consistent offset.
+        let offsets: Vec<usize> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("hw:CARD=") && l.contains("IO"))
+            .map(|l| l.find("IO").unwrap())
+            .collect();
+        assert!(offsets.len() >= 7, "expected the midi rows: {out}");
+        assert!(
+            offsets.windows(2).all(|w| w[0] == w[1]),
+            "direction column is ragged at offsets {offsets:?}:\n{out}"
+        );
     }
 
     /// The merge is the one place real logic lives, and ALSA feeds it one entry

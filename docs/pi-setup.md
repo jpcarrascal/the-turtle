@@ -159,17 +159,27 @@ Paste these into show.toml. They are stable across reboots and
 replugs, unlike the hw:<index> form that `amidi -l` prints.
 
 audio  ([audio] device)
-  hw:CARD=L6            ZOOM Corporation L6 at usb-0000:01:00.0-1.2
+  hw:CARD=Headphones  bcm2835 Headphones
+  hw:CARD=vc4hdmi0    vc4-hdmi-0
+  hw:CARD=vc4hdmi1    vc4-hdmi-1
+  hw:CARD=L6          ZOOM Corporation L6 at usb-0000:01:00.0-1.2, high speed
 
 midi   ([control] input_port, [[destinations]] port)
-  H4MIDIWC — CME Pro H4MIDI-WC at usb-0000:01:00.0-1.3
-    IO  H4MIDI-WC Port 1       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0
-    IO  H4MIDI-WC Port 2       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=1
-    IO  H4MIDI-WC Port 3       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=2
-    IO  H4MIDI-WC Port 4       hw:CARD=H4MIDIWC,DEV=0,SUBDEV=3
-  L6 — ZOOM Corporation L6 at usb-0000:01:00.0-1.2
-    IO  L6 MIDI I/O Port       hw:CARD=L6,DEV=0,SUBDEV=0
+  L6 — ZOOM Corporation L6 at usb-0000:01:00.0-1.2, high speed
+    hw:CARD=L6,DEV=0,SUBDEV=0        IO  L6 MIDI I/O Port
+    hw:CARD=L6,DEV=0,SUBDEV=1        IO  L6 Mixer Control Port
+    hw:CARD=L6,DEV=0,SUBDEV=2        IO  L6 for L6 Editor Port
+  H4MIDIWC — CME Pro H4MIDI-WC at usb-0000:01:00.0-1.3, full speed
+    hw:CARD=H4MIDIWC,DEV=0,SUBDEV=0  IO  H4MIDI-WC Port 1
+    hw:CARD=H4MIDIWC,DEV=0,SUBDEV=1  IO  H4MIDI-WC Port 2
+    hw:CARD=H4MIDIWC,DEV=0,SUBDEV=2  IO  H4MIDI-WC Port 3
+    hw:CARD=H4MIDIWC,DEV=0,SUBDEV=3  IO  H4MIDI-WC Port 4
 ```
+
+Note the audio list includes the Pi's own headphone jack and HDMI outputs. Those
+are real playback devices, so they are listed rather than filtered — but the spec
+(§2) rules out the 3.5 mm PWM output, so on this box the USB interface is the one
+you want.
 
 **Use these, not the `hw:1,0,0` form `amidi -l` prints.** ALSA assigns card
 *indices* in enumeration order, so an index-based name silently comes to mean a
