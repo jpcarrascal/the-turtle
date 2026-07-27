@@ -207,7 +207,11 @@ impl DelayBus {
         // rather than fixed: a whole note at 60 BPM is 4 seconds, twice the old
         // hardcoded 2 s cap, while a fast song needs far less. The mixer is built
         // per song, so this costs nothing to get exactly right.
-        let capacity = DelayDivision::longest().to_samples(bpm, sample_rate) as usize + 1;
+        // `+ 2`, not `+ 1`: the tap reads `i` and `i + 1` to interpolate, so `Delay`
+        // clamps it to `len - 2`. Sized one short, the longest division came out a
+        // sample early — inaudible, but it means the longest note is not actually
+        // reachable, and a test caught it as an exact-equality failure.
+        let capacity = DelayDivision::longest().to_samples(bpm, sample_rate) as usize + 2;
         let sr = sample_rate as f32;
         let mut bus = DelayBus {
             left: Delay::new(capacity, sr),
@@ -222,6 +226,13 @@ impl DelayBus {
             sample_rate,
         };
         bus.apply_division();
+        // Fully wet, and this is load-bearing: `Delay` defaults `mix` to 0.0, which
+        // returns the input *undelayed*. On a send/return bus that is not a subtle
+        // mistake — the delay becomes a wire, so raising a send just doubles the dry
+        // signal and every other delay control appears dead. Exactly what happened
+        // on the first Pi test of this PR.
+        bus.left.set_mix(1.0);
+        bus.right.set_mix(1.0);
         bus
     }
 
@@ -267,9 +278,9 @@ impl DelayBus {
     /// One frame: feed the summed sends in, get the delayed return out.
     #[inline]
     fn process(&mut self, send_l: f32, send_r: f32) -> (f32, f32) {
-        // `mix` stays at 1.0 on the bus: this is a send/return, so the delay's
-        // output *is* the wet signal and the dry path bypasses it entirely.
-        // Blending here as well would attenuate the return for no reason.
+        // Fully wet (set in `new`): this is a send/return, so the delay's output
+        // *is* the wet signal and the dry path bypasses it entirely. Blending here
+        // as well would attenuate the return for no reason.
         let wet_l = self.left.process(send_l);
         let wet_r = self.right.process(send_r);
         (self.return_l.process(wet_l), self.return_r.process(wet_r))
@@ -806,32 +817,104 @@ mod tests {
         );
     }
 
-    /// The shared bus, end to end: a pair's send feeds the one delay, and its
-    /// output comes back at the tempo-synced time. Replaces the old test for
-    /// per-pair insert delays, which no longer exist.
+/// The shared bus, end to end: a pair's send feeds the one delay and the echo
+    /// comes back at the tempo-synced time.
+    ///
+    /// Three things this test learned the hard way, each a real property of the
+    /// system rather than a testing detail:
+    ///
+    ///  - The first version asserted only that nothing arrived *early*, and skipped
+    ///    the sample where the bug lived — so it passed while the bus returned the
+    ///    send undelayed (`mix` defaulted to 0.0, making the delay a wire).
+    ///  - An impulse at sample 0 is 240x too quiet, because the send's 5 ms
+    ///    smoothing ramp has not opened yet.
+    ///  - Setting a division *glides* the tap over 150 ms (§6, tape-style). An
+    ///    impulse fired during the glide emerges at a shifted position — correct
+    ///    behaviour, but it means a test of the steady-state delay time has to let
+    ///    the glide settle first.
     #[test]
     fn a_pair_send_feeds_the_shared_delay_at_the_synced_time() {
-        // 120 BPM: a quarter note is exactly 24000 samples at 48 kHz.
-        let frames = 48_000;
-        let mut samples = vec![0.0f32; frames * 2];
-        samples[0] = 1.0; // a single impulse in the left channel
-        samples[1] = 1.0;
-        let s = song(vec![pair(0, samples)]);
-        let mut m = Mixer::new(s, 48_000);
+        // 120 BPM: an eighth note is exactly 12000 samples at 48 kHz.
+        let division = DelayDivision::Eighth.to_samples(120.0, 48_000) as usize;
+        assert_eq!(division, 12_000, "sanity: the division maths");
+        // Clear of both the send ramp (240 samples) and the tap glide (7200).
+        let impulse_at = 12_000usize;
+        let frames = impulse_at + division * 2;
 
-        m.set_dsp_param(0, DspParam::Send, 100); // unity send
-        m.set_dsp_param(0, DspParam::DelayReturn, 100); // unity return
+        let mut samples = vec![0.0f32; frames * 2];
+        samples[impulse_at * 2] = 1.0;
+        samples[impulse_at * 2 + 1] = 1.0;
+        let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+
+        m.set_dsp_param(0, DspParam::Send, 100); // unity
+        m.set_dsp_param(0, DspParam::DelayReturn, 100); // unity
         m.set_dsp_param(0, DspParam::DelayFeedback, 0); // one echo only
-        m.set_dsp_param(0, DspParam::DelayTime, 127); // longest: a whole note
+        m.set_dsp_param(0, DspParam::DelayTime, 32); // eighth-note band
 
         let mut out = vec![0i32; frames * 2];
         m.render(&mut out);
+        let at = |frame: usize| out[frame * 2].abs();
 
-        // A whole note at 120 BPM is 96000 samples, past the end of this render:
-        // nothing should have come back yet, and nothing should be lost either.
+        // The echo arrives at the synced sample, at a level near the input.
+        let echo = at(impulse_at + division);
         assert!(
-            out.iter().skip(2).all(|&v| v.abs() < to_i32(0.01).abs().max(1)),
-            "no echo should arrive before a whole note has elapsed"
+            echo > to_i32(0.5).abs(),
+            "expected a strong echo at +{division}, got {echo}"
+        );
+
+        // And it is genuinely *delayed*: the gap between impulse and echo is quiet.
+        // With the `mix` bug the send returned at the impulse instead, leaving this
+        // region silent and the echo position empty — the inverse of this.
+        let midpoint = at(impulse_at + division / 2);
+        assert!(
+            midpoint < echo / 100,
+            "the gap before the echo should be quiet: {midpoint} vs echo {echo}"
+        );
+    }
+
+    /// Changing the division must move where the echo lands — the control that
+    /// appeared dead on the Pi. Checked in the settled state, so this measures the
+    /// delay time rather than the glide.
+    #[test]
+    fn changing_the_division_moves_the_echo() {
+        // Past the 150 ms tap glide, so the tap has arrived before the impulse.
+        let impulse_at = 12_000usize;
+        // Long enough for the *longest* division to come back: a whole note at
+        // 120 BPM is 96000 samples, so a shorter render would find only the end of
+        // the buffer and report a bogus position.
+        let frames = impulse_at + DelayDivision::Whole.to_samples(120.0, 48_000) as usize + 2_000;
+
+        let echo_offset = |cc: u8| -> usize {
+            let mut samples = vec![0.0f32; frames * 2];
+            samples[impulse_at * 2] = 1.0;
+            samples[impulse_at * 2 + 1] = 1.0;
+            let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+            m.set_dsp_param(0, DspParam::Send, 100);
+            m.set_dsp_param(0, DspParam::DelayReturn, 100);
+            m.set_dsp_param(0, DspParam::DelayFeedback, 0);
+            m.set_dsp_param(0, DspParam::DelayTime, cc);
+            let mut out = vec![0i32; frames * 2];
+            m.render(&mut out);
+            // The loudest frame after the dry impulse has passed is the echo.
+            out.iter()
+                .step_by(2)
+                .enumerate()
+                .skip(impulse_at + 100)
+                .max_by_key(|(_, v)| v.abs())
+                .map(|(i, _)| i - impulse_at)
+                .unwrap()
+        };
+
+        // Exactly on the division, now that the glide has settled.
+        assert_eq!(
+            echo_offset(0),
+            DelayDivision::Sixteenth.to_samples(120.0, 48_000) as usize,
+            "CC 0 should be a sixteenth"
+        );
+        assert_eq!(
+            echo_offset(127),
+            DelayDivision::Whole.to_samples(120.0, 48_000) as usize,
+            "CC 127 should be a whole note"
         );
     }
 
