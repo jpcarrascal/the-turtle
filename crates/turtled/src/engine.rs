@@ -44,6 +44,13 @@ pub fn rt_channel(capacity: usize) -> (RtProducer, RtConsumer) {
 pub enum RtEvent {
     /// The mixer just rendered past the end of the current song.
     EndReached,
+    /// The audio device failed in a way `try_recover` could not fix, so the RT
+    /// loop has stopped. The daemon has no audio from this moment on.
+    ///
+    /// Carries a bare `errno` rather than a message because this is constructed
+    /// **on the RT thread**, which must not allocate (§3) — formatting is the
+    /// control thread's job.
+    AudioFailed { errno: i32 },
 }
 
 pub type RtEventProducer = Producer<RtEvent>;
@@ -211,6 +218,23 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure event has to survive the lock-free RT->control channel like any
+    /// other. Cheap, but it pins the thing that would silently break the report:
+    /// `RtEvent` must stay `Copy` and allocation-free, because it is constructed on
+    /// the audio thread (§3). A variant carrying a `String` would compile and then
+    /// allocate on the RT path.
+    #[test]
+    fn an_audio_failure_event_crosses_the_rt_boundary() {
+        let (mut tx, mut rx) = rt_event_channel(4);
+        tx.push(RtEvent::AudioFailed { errno: 19 }).unwrap();
+        tx.push(RtEvent::EndReached).unwrap();
+        assert_eq!(rx.pop().unwrap(), RtEvent::AudioFailed { errno: 19 });
+        assert_eq!(rx.pop().unwrap(), RtEvent::EndReached);
+        // Copy, not Clone-with-allocation: this is what keeps the push RT-safe.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<RtEvent>();
+    }
 
     /// A MIDI sink that records everything sent, for assertions.
     #[derive(Default)]
