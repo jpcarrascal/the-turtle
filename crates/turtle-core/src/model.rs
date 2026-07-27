@@ -16,6 +16,32 @@ use crate::error::Error;
 // show.toml
 // ---------------------------------------------------------------------------
 
+/// Per-pair `dsp_pair{0..=3}_{param}` control-map parameters (§6).
+///
+/// Lives here, with the rest of the config schema, so `validate` can reject a
+/// misspelled or obsolete key. `turtled`'s decoder has a matching `match`, and a
+/// test there asserts every name in these lists parses — that is what stops the
+/// two from drifting apart.
+pub const DSP_PAIR_PARAMS: [&str; 4] = ["gain", "cutoff", "resonance", "send"];
+
+/// Shared-delay-bus `dsp_delay_{param}` control-map parameters (§6). No pair
+/// index: there is one delay.
+pub const DSP_DELAY_PARAMS: [&str; 5] = ["time", "feedback", "return", "cutoff", "resonance"];
+
+/// Is this a control-map `dsp_*` key the engine actually understands?
+pub fn is_valid_dsp_key(key: &str) -> bool {
+    if let Some(param) = key.strip_prefix("dsp_delay_") {
+        return DSP_DELAY_PARAMS.contains(&param);
+    }
+    let Some(rest) = key.strip_prefix("dsp_pair") else {
+        return false;
+    };
+    let Some((pair, param)) = rest.split_once('_') else {
+        return false;
+    };
+    matches!(pair.parse::<usize>(), Ok(p) if p <= 3) && DSP_PAIR_PARAMS.contains(&param)
+}
+
 /// Top-level `show.toml`: setlist, routing, and global playback config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Show {
@@ -73,8 +99,9 @@ pub struct Destination {
 
 /// Incoming foot-controller map (§7.1). All entries are remappable.
 ///
-/// `dsp` captures the open-ended `dsp_*` CC controls (e.g. `dsp_cutoff`,
-/// `dsp_delay_mix`) via `#[serde(flatten)]`.
+/// `dsp` captures the open-ended `dsp_*` CC controls (e.g. `dsp_pair0_cutoff`,
+/// `dsp_delay_return`) via `#[serde(flatten)]`. `validate` rejects any key that
+/// is not one the engine understands — see [`is_valid_dsp_key`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Control {
     pub input_port: String,
@@ -265,6 +292,18 @@ impl Show {
         self.control.mute.check("control.mute", &mut p);
         for (key, b) in &self.control.dsp {
             b.check(key, &mut p);
+            // An unknown `dsp_*` key is rejected rather than ignored. Silently
+            // ignoring it is how a stale config leaves a pedal mysteriously dead
+            // with nothing to blame — and the §6 rearchitecture renamed several,
+            // so this is exactly the moment that matters.
+            if !crate::model::is_valid_dsp_key(key) {
+                p.push(format!(
+                    "unknown control binding {key:?}: expected dsp_pair<0-3>_<{}> \
+                     or dsp_delay_<{}>",
+                    DSP_PAIR_PARAMS.join("|"),
+                    DSP_DELAY_PARAMS.join("|")
+                ));
+            }
         }
 
         let mut seen_pc = BTreeMap::new();
@@ -428,8 +467,8 @@ next    = { type = "note", note = 62 }
 prev    = { type = "note", note = 63 }
 panic   = { type = "note", note = 65 }
 mute    = { type = "note", notes = [72, 73, 74, 75] }
-dsp_cutoff = { type = "cc", cc = 20 }
-dsp_delay_mix = { type = "cc", cc = 21 }
+dsp_pair0_cutoff = { type = "cc", cc = 20 }
+dsp_delay_return = { type = "cc", cc = 21 }
 
 [[setlist]]
 pc = 0
@@ -547,6 +586,31 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(err.contains("known aliases: CME"), "must list valid ones: {err}");
     }
 
+    /// The §6 rearchitecture renamed several `dsp_*` keys. A stale show.toml must
+    /// fail `turtle validate` with the offending key named — silently ignoring it
+    /// leaves a pedal mysteriously dead, which is the worst way to find out.
+    #[test]
+    fn obsolete_and_misspelled_dsp_keys_are_rejected() {
+        for bad in [
+            "dsp_pair0_delay_time",  // pre-rearchitecture: delay is a bus now
+            "dsp_pair0_delay_mix",
+            "dsp_cutoff",            // no pair index
+            "dsp_pair4_gain",        // pair out of range
+            "dsp_pair0_wobble",      // not a parameter
+            "dsp_delay_mix",         // renamed to dsp_delay_return
+        ] {
+            assert!(!is_valid_dsp_key(bad), "{bad} should be rejected");
+        }
+        for good in [
+            "dsp_pair0_gain",
+            "dsp_pair3_send",
+            "dsp_delay_time",
+            "dsp_delay_resonance",
+        ] {
+            assert!(is_valid_dsp_key(good), "{good} should be accepted");
+        }
+    }
+
     #[test]
     fn parses_spec_show() {
         let show = Show::from_toml_str(SHOW_TOML).expect("parse");
@@ -557,7 +621,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert_eq!(show.control.mute.notes.as_deref(), Some(&[72, 73, 74, 75][..]));
         // The two dsp_* keys land in the flattened map.
         assert_eq!(show.control.dsp.len(), 2);
-        assert_eq!(show.control.dsp["dsp_cutoff"].cc, Some(20));
+        assert_eq!(show.control.dsp["dsp_pair0_cutoff"].cc, Some(20));
         assert_eq!(show.setlist.len(), 2);
         show.validate().expect("valid");
     }

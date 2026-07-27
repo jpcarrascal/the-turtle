@@ -23,12 +23,28 @@ use turtle_core::Command;
 /// `dsp_pair{N}_{param}` control-map key (e.g. `dsp_pair0_cutoff`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DspParam {
+    // --- per-pair: `dsp_pair{0..=3}_{param}` ---
     Gain,
     Cutoff,
     Resonance,
+    /// How much of this pair is sent to the shared delay bus (§6).
+    Send,
+
+    // --- the shared delay bus: `dsp_delay_{param}`, no pair ---
+    //
+    // These carry a pair index through the same plumbing as the per-pair
+    // parameters because that keeps `RtCommand` unchanged and `Copy`, but the
+    // index is meaningless for them: there is one delay. `Mixer::set_dsp_param`
+    // handles them before it looks the pair up.
+    /// Note division (tempo-synced), not a free millisecond value.
     DelayTime,
     DelayFeedback,
-    DelayMix,
+    /// How much of the delay's output reaches the master.
+    DelayReturn,
+    /// Cutoff of the lowpass inside the feedback loop.
+    DelayCutoff,
+    /// Q of that lowpass.
+    DelayResonance,
 }
 
 /// Extract the 1-based MIDI channel from a status byte.
@@ -103,8 +119,8 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
 
 /// Decode an incoming CC against every `[control]` `dsp_*` binding, returning
 /// every `(pair, param, raw 0..=127 value)` it drives. More than one binding
-/// can share a CC number — e.g. mapping the same pedal to `dsp_pair0_delay_time`
-/// through `dsp_pair3_delay_time` fans one move out to all four pairs — so
+/// can share a CC number — e.g. mapping the same pedal to `dsp_pair0_send`
+/// through `dsp_pair3_send` fans one move out to all four pairs — so
 /// this returns *all* matches, not just the first. Live DSP is CC-only (§6)
 /// and, like mute, bypasses the transport state machine entirely — a knob
 /// move is valid in any state.
@@ -134,6 +150,22 @@ pub fn decode_dsp(control: &Control, status: u8, d1: u8, d2: u8) -> Vec<(usize, 
 /// is silently ignored by [`decode_dsp`] — consistent with how [`decode`]
 /// already ignores unmapped notes/CCs rather than erroring at runtime.
 fn parse_dsp_key(key: &str) -> Option<(usize, DspParam)> {
+    // The shared delay bus has no pair: `dsp_delay_feedback`, not
+    // `dsp_pair0_delay_feedback`. Matched first, because `dsp_pair...` would
+    // never match these and they would otherwise fall through as unknown.
+    if let Some(param) = key.strip_prefix("dsp_delay_") {
+        let param = match param {
+            "time" => DspParam::DelayTime,
+            "feedback" => DspParam::DelayFeedback,
+            "return" => DspParam::DelayReturn,
+            "cutoff" => DspParam::DelayCutoff,
+            "resonance" => DspParam::DelayResonance,
+            _ => return None,
+        };
+        // Pair 0 is a placeholder the mixer ignores for bus parameters.
+        return Some((0, param));
+    }
+
     let rest = key.strip_prefix("dsp_pair")?;
     let (pair_str, param_str) = rest.split_once('_')?;
     let pair: usize = pair_str.parse().ok()?;
@@ -144,9 +176,7 @@ fn parse_dsp_key(key: &str) -> Option<(usize, DspParam)> {
         "gain" => DspParam::Gain,
         "cutoff" => DspParam::Cutoff,
         "resonance" => DspParam::Resonance,
-        "delay_time" => DspParam::DelayTime,
-        "delay_feedback" => DspParam::DelayFeedback,
-        "delay_mix" => DspParam::DelayMix,
+        "send" => DspParam::Send,
         _ => return None,
     };
     Some((pair, param))
@@ -179,11 +209,11 @@ prev  = { type = "note", note = 63 }
 panic = { type = "note", note = 65 }
 mute  = { type = "note", notes = [72, 73, 74, 75] }
 dsp_pair0_cutoff = { type = "cc", cc = 20 }
-dsp_pair0_delay_mix = { type = "cc", cc = 21 }
+dsp_delay_return = { type = "cc", cc = 21 }
 dsp_pair1_resonance = { type = "cc", cc = 22 }
-dsp_pair0_delay_time = { type = "cc", cc = 30 }
-dsp_pair1_delay_time = { type = "cc", cc = 30 }
-dsp_pair2_delay_time = { type = "cc", cc = 30 }
+dsp_pair0_send = { type = "cc", cc = 30 }
+dsp_pair1_send = { type = "cc", cc = 30 }
+dsp_pair2_send = { type = "cc", cc = 30 }
 "#;
 
     fn control() -> Control {
@@ -243,7 +273,7 @@ dsp_pair2_delay_time = { type = "cc", cc = 30 }
         );
         assert_eq!(
             decode_dsp(&c, 0xB0, 21, 100),
-            vec![(0, DspParam::DelayMix, 100)]
+            vec![(0, DspParam::DelayReturn, 100)]
         );
         assert_eq!(
             decode_dsp(&c, 0xB0, 22, 10),
@@ -253,15 +283,15 @@ dsp_pair2_delay_time = { type = "cc", cc = 30 }
 
     #[test]
     fn fans_one_cc_out_to_every_binding_that_shares_it() {
-        // CC 30 drives dsp_pair{0,1,2}_delay_time — one pedal move should
+        // CC 30 drives dsp_pair{0,1,2}_send — one pedal move should
         // update all three pairs, not just the lexicographically-first key.
         let c = control();
         assert_eq!(
             decode_dsp(&c, 0xB0, 30, 50),
             vec![
-                (0, DspParam::DelayTime, 50),
-                (1, DspParam::DelayTime, 50),
-                (2, DspParam::DelayTime, 50),
+                (0, DspParam::Send, 50),
+                (1, DspParam::Send, 50),
+                (2, DspParam::Send, 50),
             ]
         );
     }
@@ -338,17 +368,68 @@ dsp_pair0_cutoff = { type = "cc", cc = 20 }
 
     #[test]
     fn parses_dsp_key_convention() {
+        // Per-pair keys carry their index.
         assert_eq!(parse_dsp_key("dsp_pair0_gain"), Some((0, DspParam::Gain)));
-        assert_eq!(
-            parse_dsp_key("dsp_pair3_delay_time"),
-            Some((3, DspParam::DelayTime))
-        );
-        assert_eq!(
-            parse_dsp_key("dsp_pair2_delay_feedback"),
-            Some((2, DspParam::DelayFeedback))
-        );
+        assert_eq!(parse_dsp_key("dsp_pair3_send"), Some((3, DspParam::Send)));
         assert_eq!(parse_dsp_key("dsp_pair4_gain"), None); // pair out of 0..=3 range
         assert_eq!(parse_dsp_key("dsp_pair0_unknown"), None); // unknown param
-        assert_eq!(parse_dsp_key("dsp_cutoff"), None); // old global-style key, no pair
+    }
+
+    /// The shared delay bus has no pair in its key — there is one delay. The
+    /// index they parse to is a placeholder the mixer ignores.
+    #[test]
+    fn delay_bus_keys_have_no_pair_index() {
+        for (key, param) in [
+            ("dsp_delay_time", DspParam::DelayTime),
+            ("dsp_delay_feedback", DspParam::DelayFeedback),
+            ("dsp_delay_return", DspParam::DelayReturn),
+            ("dsp_delay_cutoff", DspParam::DelayCutoff),
+            ("dsp_delay_resonance", DspParam::DelayResonance),
+        ] {
+            assert_eq!(parse_dsp_key(key), Some((0, param)), "{key}");
+        }
+        assert_eq!(parse_dsp_key("dsp_delay_unknown"), None);
+    }
+
+    /// The decoder here and `turtle-core`'s validator both encode the key
+    /// grammar, and they must agree: a key the validator accepts but the decoder
+    /// drops is a binding that passes `turtle validate` and then does nothing.
+    #[test]
+    fn every_key_the_validator_accepts_is_one_the_decoder_understands() {
+        use turtle_core::model::{DSP_DELAY_PARAMS, DSP_PAIR_PARAMS};
+
+        for pair in 0..=3 {
+            for param in DSP_PAIR_PARAMS {
+                let key = format!("dsp_pair{pair}_{param}");
+                assert!(
+                    turtle_core::model::is_valid_dsp_key(&key),
+                    "{key} rejected by the validator"
+                );
+                assert!(parse_dsp_key(&key).is_some(), "{key} dropped by the decoder");
+            }
+        }
+        for param in DSP_DELAY_PARAMS {
+            let key = format!("dsp_delay_{param}");
+            assert!(
+                turtle_core::model::is_valid_dsp_key(&key),
+                "{key} rejected by the validator"
+            );
+            assert!(parse_dsp_key(&key).is_some(), "{key} dropped by the decoder");
+        }
+    }
+
+    /// The pre-rearchitecture keys are gone. They must fail to parse rather than
+    /// silently doing nothing, so a stale show.toml is caught at validate time
+    /// instead of leaving a pedal mysteriously dead (§6).
+    #[test]
+    fn the_old_per_pair_delay_keys_no_longer_parse() {
+        for old in [
+            "dsp_pair0_delay_time",
+            "dsp_pair0_delay_feedback",
+            "dsp_pair0_delay_mix",
+        ] {
+            assert_eq!(parse_dsp_key(old), None, "{old} should no longer parse");
+        }
+        assert_eq!(parse_dsp_key("dsp_cutoff"), None); // global-style key, no pair
     }
 }

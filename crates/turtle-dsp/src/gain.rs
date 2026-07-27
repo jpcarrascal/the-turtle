@@ -30,6 +30,18 @@ impl Gain {
         self.target = gain.max(0.0);
     }
 
+    /// Jump straight to `gain`, with no ramp.
+    ///
+    /// For *initial* values, where smoothing is not just unnecessary but wrong:
+    /// `new` starts at unity, so a send or delay return constructed silent would
+    /// otherwise ramp *down* from unity and be audible for the first few
+    /// milliseconds of every song. A delay bus that is supposed to be transparent
+    /// until you touch a knob would announce itself at the top of the set.
+    pub fn set_immediate(&mut self, gain: f32) {
+        self.target = gain.max(0.0);
+        self.current = self.target;
+    }
+
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
     }
@@ -65,5 +77,23 @@ mod tests {
             y = g.process(1.0);
         }
         assert!(y.abs() < 1e-3, "muted output should approach 0, got {y}");
+    }
+
+    /// `new` starts at unity, so anything that should begin silent has to say so
+    /// immediately rather than ramping down into it — otherwise it is audible for
+    /// the smoothing time. Found when the delay bus leaked at the start of a song.
+    #[test]
+    fn set_immediate_starts_silent_with_no_ramp() {
+        let mut g = Gain::new(48_000.0, 5.0);
+        g.set_immediate(0.0);
+        // Silent from the very first sample, not after a ramp.
+        for _ in 0..10 {
+            assert_eq!(g.process(1.0), 0.0);
+        }
+
+        // And it does not disable smoothing for later changes.
+        g.set_target(1.0);
+        let first = g.process(1.0);
+        assert!(first > 0.0 && first < 1.0, "later changes still ramp: {first}");
     }
 }

@@ -22,6 +22,8 @@
 use rtrb::{Consumer, Producer, RingBuffer};
 use turtle_dsp::{one_pole_coeff, Biquad, Delay, FilterType, Gain, Limiter};
 
+use turtle_core::timing::DelayDivision;
+
 use crate::control_map::DspParam;
 use crate::stems::PreloadedSong;
 
@@ -44,9 +46,9 @@ const GAIN_SMOOTH_MS: f32 = 5.0;
 /// while its internal state (z1/z2) is non-zero, producing an audible click
 /// per jump. Same order of magnitude as `GAIN_SMOOTH_MS`.
 const FILTER_SMOOTH_MS: f32 = 5.0;
-/// Headroom for the delay line: enough for any musical delay time (§6). Also
-/// the ceiling a `DelayTime` CC maps to (127 -> exactly this many seconds).
-const DELAY_MAX_SECONDS: usize = 2;
+/// The division a fresh delay bus starts on, before any CC has selected one.
+/// A quarter note is the least surprising default.
+const DEFAULT_DIVISION: DelayDivision = DelayDivision::Quarter;
 /// Cutoff CC range (§6): 20 Hz-20 kHz, mapped log/exponentially since that's
 /// how frequency is perceived. 20 kHz doubles as the transparent default
 /// (near-inaudible filtering) so an untouched pair stays a passthrough.
@@ -104,7 +106,10 @@ struct ChannelChain {
     target_q: f32,
     /// Per-sample smoothing coefficient for `cutoff_hz`/`q`, from `FILTER_SMOOTH_MS`.
     filter_coeff: f32,
-    delay: Delay,
+    /// Level fed to the shared delay bus (§6). Post-gain and post-filter, so a
+    /// muted pair stops feeding the delay and its existing tail rings out —
+    /// mute should mean "this pair is silent", including its echoes.
+    send: Gain,
     sample_rate: f32,
 }
 
@@ -121,15 +126,20 @@ impl ChannelChain {
             q: DEFAULT_Q,
             target_q: DEFAULT_Q,
             filter_coeff: one_pole_coeff(FILTER_SMOOTH_MS, sample_rate),
-            delay: Delay::new(DELAY_MAX_SECONDS * sample_rate as usize, sample_rate),
+            // Silent until a send CC is touched, so the delay is inaudible by
+            // default exactly like the rest of the chain (§6).
+            send: silent_gain(sample_rate),
             sample_rate,
         }
     }
 
-    /// One sample through gain -> biquad -> delay. `&mut self` because each
-    /// stage advances its internal state.
+    /// One sample through gain -> biquad, returning `(dry, to_delay_bus)`.
+    ///
+    /// The send is taken **after** gain and filter, so what goes to the delay is
+    /// the pair as you hear it — muted means muted, and a filter sweep is echoed
+    /// as swept. `&mut self` because each stage advances its internal state.
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
+    fn process(&mut self, x: f32) -> (f32, f32) {
         let g = self.gain.process(x);
         if self.filter_live {
             self.cutoff_hz += (self.target_cutoff_hz - self.cutoff_hz) * self.filter_coeff;
@@ -137,7 +147,7 @@ impl ChannelChain {
             self.recompute_biquad();
         }
         let f = self.biquad.process(g);
-        self.delay.process(f)
+        (f, self.send.process(f))
     }
 
     /// Recompute the biquad from the current `filter_type`/`cutoff_hz`/`q`.
@@ -153,7 +163,6 @@ impl ChannelChain {
     /// its time/feedback/mix across a seek).
     fn reset(&mut self) {
         self.biquad.reset();
-        self.delay.reset();
     }
 }
 
@@ -161,6 +170,137 @@ impl ChannelChain {
 struct PairChain {
     left: ChannelChain,
     right: ChannelChain,
+}
+
+/// The one shared stereo delay every pair sends into (§6).
+///
+/// Replaces the four independent per-pair insert delays. That was the wrong shape
+/// twice over: musically, four uncorrelated echoes is rarely what anyone wants
+/// from a delay, and structurally it meant eight delay lines — 3 MB of
+/// continuously-streaming ring buffer on a Pi 4 whose L2 cache is 1 MB. Two lines
+/// fit far better, and the CPU saved pays for the feedback filter several times.
+struct DelayBus {
+    left: Delay,
+    right: Delay,
+    /// Return level: how much of the delay output reaches the master (§6). The
+    /// dry signal is never attenuated by this — sends control what goes *in*.
+    ///
+    /// Two of them, one per channel, because `Gain::process` advances its own
+    /// smoothing each call: sharing one across L and R would ramp it twice as
+    /// fast as configured.
+    return_l: Gain,
+    return_r: Gain,
+    /// Selected note division, kept so a tempo change could recompute the time.
+    division: DelayDivision,
+    /// Filter state, kept so cutoff and Q can be set independently by separate
+    /// CCs without either resetting the other.
+    cutoff_hz: f32,
+    q: f32,
+    filter_live: bool,
+    bpm: f64,
+    sample_rate: u32,
+}
+
+impl DelayBus {
+    fn new(bpm: f64, sample_rate: u32) -> Self {
+        // Sized for the longest division at *this song's* tempo, computed at load
+        // rather than fixed: a whole note at 60 BPM is 4 seconds, twice the old
+        // hardcoded 2 s cap, while a fast song needs far less. The mixer is built
+        // per song, so this costs nothing to get exactly right.
+        // `+ 2`, not `+ 1`: the tap reads `i` and `i + 1` to interpolate, so `Delay`
+        // clamps it to `len - 2`. Sized one short, the longest division came out a
+        // sample early — inaudible, but it means the longest note is not actually
+        // reachable, and a test caught it as an exact-equality failure.
+        let capacity = DelayDivision::longest().to_samples(bpm, sample_rate) as usize + 2;
+        let sr = sample_rate as f32;
+        let mut bus = DelayBus {
+            left: Delay::new(capacity, sr),
+            right: Delay::new(capacity, sr),
+            return_l: silent_gain(sr),
+            return_r: silent_gain(sr),
+            division: DEFAULT_DIVISION,
+            cutoff_hz: MAX_CUTOFF_HZ,
+            q: DEFAULT_Q,
+            filter_live: false,
+            bpm,
+            sample_rate,
+        };
+        bus.apply_division();
+        // Fully wet, and this is load-bearing: `Delay` defaults `mix` to 0.0, which
+        // returns the input *undelayed*. On a send/return bus that is not a subtle
+        // mistake — the delay becomes a wire, so raising a send just doubles the dry
+        // signal and every other delay control appears dead. Exactly what happened
+        // on the first Pi test of this PR.
+        bus.left.set_mix(1.0);
+        bus.right.set_mix(1.0);
+        bus
+    }
+
+    /// Push the current division's sample count into both delay lines.
+    fn apply_division(&mut self) {
+        let samples = self.division.to_samples(self.bpm, self.sample_rate) as usize;
+        self.left.set_delay_samples(samples);
+        self.right.set_delay_samples(samples);
+    }
+
+    fn set_division(&mut self, division: DelayDivision) {
+        // Nothing to do if the pedal has not crossed a band boundary — and
+        // re-setting the same time would restart the tape glide pointlessly.
+        if division == self.division {
+            return;
+        }
+        self.division = division;
+        self.apply_division();
+    }
+
+    fn set_feedback(&mut self, feedback: f32) {
+        self.left.set_feedback(feedback);
+        self.right.set_feedback(feedback);
+    }
+
+    /// Recompute the feedback filter from the current cutoff and Q.
+    ///
+    /// At the top of its range the filter is doing nothing audible, so it is
+    /// cleared rather than left running — that restores the bit-exact passthrough
+    /// and skips two biquads per sample.
+    fn apply_filter(&mut self) {
+        if self.cutoff_hz >= MAX_CUTOFF_HZ {
+            self.left.clear_feedback_filter();
+            self.right.clear_feedback_filter();
+            self.filter_live = false;
+            return;
+        }
+        self.left.set_feedback_filter(self.cutoff_hz, self.q);
+        self.right.set_feedback_filter(self.cutoff_hz, self.q);
+        self.filter_live = true;
+    }
+
+    /// One frame: feed the summed sends in, get the delayed return out.
+    #[inline]
+    fn process(&mut self, send_l: f32, send_r: f32) -> (f32, f32) {
+        // Fully wet (set in `new`): this is a send/return, so the delay's output
+        // *is* the wet signal and the dry path bypasses it entirely. Blending here
+        // as well would attenuate the return for no reason.
+        let wet_l = self.left.process(send_l);
+        let wet_r = self.right.process(send_r);
+        (self.return_l.process(wet_l), self.return_r.process(wet_r))
+    }
+
+    fn set_return(&mut self, level: f32) {
+        self.return_l.set_target(level);
+        self.return_r.set_target(level);
+    }
+}
+
+/// A `Gain` that starts silent — the default for sends and the delay return, so
+/// the delay is inaudible until a knob is touched (§6's transparent defaults).
+fn silent_gain(sample_rate: f32) -> Gain {
+    let mut g = Gain::new(sample_rate, GAIN_SMOOTH_MS);
+    // `set_immediate`, not `set_target`: `Gain::new` starts at unity, so a target
+    // of zero would *ramp down* from unity and leak the delay bus for the first
+    // few milliseconds of every song.
+    g.set_immediate(0.0);
+    g
 }
 
 /// Reads preloaded stems at the transport position and mixes them down to a
@@ -175,6 +315,8 @@ pub struct Mixer {
     // `turtle-dsp::Limiter` is mono today.
     limiter_l: Limiter,
     limiter_r: Limiter,
+    /// The one shared delay every pair sends into (§6).
+    delay_bus: DelayBus,
     sample_rate: u32,
     /// Current playback position in frames (samples per channel) from song start.
     pos: u64,
@@ -196,6 +338,7 @@ impl Mixer {
             })
             .collect();
         Mixer {
+            delay_bus: DelayBus::new(song.bpm, sample_rate),
             song,
             pairs,
             limiter_l: Limiter::default_master(sr),
@@ -244,10 +387,43 @@ impl Mixer {
     /// channels. Out-of-range `pair` (e.g. a CC for a pair the current song
     /// doesn't have) is a silent no-op, matching `toggle_pair_mute`.
     pub fn set_dsp_param(&mut self, pair: usize, param: DspParam, value: u8) {
+        let v = value as f32 / 127.0;
+
+        // Bus parameters first: there is one shared delay, so these carry no pair
+        // and must not be dropped by the out-of-range check below. `pair` is
+        // ignored for them by design — see `DspParam`.
+        match param {
+            DspParam::DelayTime => {
+                self.delay_bus.set_division(DelayDivision::from_cc(value));
+                return;
+            }
+            DspParam::DelayFeedback => {
+                self.delay_bus.set_feedback(v);
+                return;
+            }
+            DspParam::DelayReturn => {
+                self.delay_bus.set_return(gain_from_cc(value));
+                return;
+            }
+            DspParam::DelayCutoff => {
+                // Same exponential taper as the per-pair filter, so both sweeps
+                // feel the same under a pedal.
+                self.delay_bus.cutoff_hz =
+                    MIN_CUTOFF_HZ * (MAX_CUTOFF_HZ / MIN_CUTOFF_HZ).powf(v);
+                self.delay_bus.apply_filter();
+                return;
+            }
+            DspParam::DelayResonance => {
+                self.delay_bus.q = MIN_Q + v * (MAX_Q - MIN_Q);
+                self.delay_bus.apply_filter();
+                return;
+            }
+            _ => {}
+        }
+
         let Some(p) = self.pairs.get_mut(pair) else {
             return;
         };
-        let v = value as f32 / 127.0;
         match param {
             DspParam::Gain => {
                 let gain = gain_from_cc(value);
@@ -273,21 +449,20 @@ impl Mixer {
                 p.right.target_q = q;
                 p.right.filter_live = true;
             }
-            DspParam::DelayTime => {
-                let samples = (v * DELAY_MAX_SECONDS as f32 * self.sample_rate as f32) as usize;
-                p.left.delay.set_delay_samples(samples);
-                p.right.delay.set_delay_samples(samples);
+            DspParam::Send => {
+                // Same taper as `Gain` so a send at CC 100 is unity, matching the
+                // pair fader and making "send it at the level you hear it" the
+                // natural centre position.
+                let level = gain_from_cc(value);
+                p.left.send.set_target(level);
+                p.right.send.set_target(level);
             }
-            // `Delay::set_feedback`/`set_mix` already clamp to their safe
-            // range, so the normalized 0..=1 CC value passes straight through.
-            DspParam::DelayFeedback => {
-                p.left.delay.set_feedback(v);
-                p.right.delay.set_feedback(v);
-            }
-            DspParam::DelayMix => {
-                p.left.delay.set_mix(v);
-                p.right.delay.set_mix(v);
-            }
+            // Bus parameters are handled before the pair lookup above.
+            DspParam::DelayTime
+            | DspParam::DelayFeedback
+            | DspParam::DelayReturn
+            | DspParam::DelayCutoff
+            | DspParam::DelayResonance => unreachable!("handled as bus params"),
         }
     }
 
@@ -338,6 +513,9 @@ impl Mixer {
             // Sum every pair's contribution for this frame.
             let mut acc_l = 0.0f32;
             let mut acc_r = 0.0f32;
+            // What this frame contributes to the shared delay bus.
+            let mut send_l = 0.0f32;
+            let mut send_r = 0.0f32;
             // `zip` walks the stem data and its matching DSP chain together;
             // `iter_mut` on the chains because `process` mutates their state.
             for (stem, chain) in self.song.pairs.iter().zip(self.pairs.iter_mut()) {
@@ -348,9 +526,17 @@ impl Mixer {
                 } else {
                     (0.0, 0.0)
                 };
-                acc_l += chain.left.process(l);
-                acc_r += chain.right.process(r);
+                let (dry_l, to_delay_l) = chain.left.process(l);
+                let (dry_r, to_delay_r) = chain.right.process(r);
+                acc_l += dry_l;
+                acc_r += dry_r;
+                send_l += to_delay_l;
+                send_r += to_delay_r;
             }
+            // One delay for all four pairs, fed by the summed sends (§6).
+            let (wet_l, wet_r) = self.delay_bus.process(send_l, send_r);
+            acc_l += wet_l;
+            acc_r += wet_r;
             // Master limiter, then map to the device's i32 sample format.
             out[2 * f] = to_i32(self.limiter_l.process(acc_l));
             out[2 * f + 1] = to_i32(self.limiter_r.process(acc_r));
@@ -382,7 +568,14 @@ mod tests {
 
     fn song(pairs: Vec<StemPair>) -> PreloadedSong {
         let frames = pairs.iter().map(|p| p.frames).max().unwrap_or(0);
-        PreloadedSong { name: "t".into(), sample_rate: 48_000, frames, pairs, looping: false }
+        PreloadedSong {
+            name: "t".into(),
+            sample_rate: 48_000,
+            frames,
+            pairs,
+            looping: false,
+            bpm: 120.0,
+        }
     }
 
     /// The same, but flagged `loop = true`.
@@ -624,35 +817,127 @@ mod tests {
         );
     }
 
+/// The shared bus, end to end: a pair's send feeds the one delay and the echo
+    /// comes back at the tempo-synced time.
+    ///
+    /// Three things this test learned the hard way, each a real property of the
+    /// system rather than a testing detail:
+    ///
+    ///  - The first version asserted only that nothing arrived *early*, and skipped
+    ///    the sample where the bug lived — so it passed while the bus returned the
+    ///    send undelayed (`mix` defaulted to 0.0, making the delay a wire).
+    ///  - An impulse at sample 0 is 240x too quiet, because the send's 5 ms
+    ///    smoothing ramp has not opened yet.
+    ///  - Setting a division *glides* the tap over 150 ms (§6, tape-style). An
+    ///    impulse fired during the glide emerges at a shifted position — correct
+    ///    behaviour, but it means a test of the steady-state delay time has to let
+    ///    the glide settle first.
     #[test]
-    fn dsp_delay_time_places_the_echo_at_the_cc_mapped_sample() {
-        // An impulse (well below the limiter ceiling) at frame 0, silence after.
-        let frames = 2_000;
+    fn a_pair_send_feeds_the_shared_delay_at_the_synced_time() {
+        // 120 BPM: an eighth note is exactly 12000 samples at 48 kHz.
+        let division = DelayDivision::Eighth.to_samples(120.0, 48_000) as usize;
+        assert_eq!(division, 12_000, "sanity: the division maths");
+        // Clear of both the send ramp (240 samples) and the tap glide (7200).
+        let impulse_at = 12_000usize;
+        let frames = impulse_at + division * 2;
+
         let mut samples = vec![0.0f32; frames * 2];
-        samples[0] = 0.5;
-        samples[1] = 0.5;
-        let s = song(vec![pair(0, samples)]);
-        let mut m = Mixer::new(s, 48_000);
-        m.set_dsp_param(0, DspParam::DelayMix, 127); // fully wet
-        m.set_dsp_param(0, DspParam::DelayFeedback, 0); // single echo, no repeats
-        let cc_value = 1u8;
-        m.set_dsp_param(0, DspParam::DelayTime, cc_value);
-        let v = cc_value as f32 / 127.0;
-        let expected_samples = (v * DELAY_MAX_SECONDS as f32 * 48_000.0) as usize;
-        assert!(
-            expected_samples < frames,
-            "test needs to render past the tap"
-        );
+        samples[impulse_at * 2] = 1.0;
+        samples[impulse_at * 2 + 1] = 1.0;
+        let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+
+        m.set_dsp_param(0, DspParam::Send, 100); // unity
+        m.set_dsp_param(0, DspParam::DelayReturn, 100); // unity
+        m.set_dsp_param(0, DspParam::DelayFeedback, 0); // one echo only
+        m.set_dsp_param(0, DspParam::DelayTime, 32); // eighth-note band
 
         let mut out = vec![0i32; frames * 2];
         m.render(&mut out);
-        assert_eq!(
-            out[0],
-            to_i32(0.0),
-            "fully wet: nothing sounds before the tap"
+        let at = |frame: usize| out[frame * 2].abs();
+
+        // The echo arrives at the synced sample, at a level near the input.
+        let echo = at(impulse_at + division);
+        assert!(
+            echo > to_i32(0.5).abs(),
+            "expected a strong echo at +{division}, got {echo}"
         );
-        assert_eq!(out[expected_samples * 2], to_i32(0.5));
-        assert_eq!(out[expected_samples * 2 + 1], to_i32(0.5));
+
+        // And it is genuinely *delayed*: the gap between impulse and echo is quiet.
+        // With the `mix` bug the send returned at the impulse instead, leaving this
+        // region silent and the echo position empty — the inverse of this.
+        let midpoint = at(impulse_at + division / 2);
+        assert!(
+            midpoint < echo / 100,
+            "the gap before the echo should be quiet: {midpoint} vs echo {echo}"
+        );
+    }
+
+    /// Changing the division must move where the echo lands — the control that
+    /// appeared dead on the Pi. Checked in the settled state, so this measures the
+    /// delay time rather than the glide.
+    #[test]
+    fn changing_the_division_moves_the_echo() {
+        // Past the 150 ms tap glide, so the tap has arrived before the impulse.
+        let impulse_at = 12_000usize;
+        // Long enough for the *longest* division to come back: a whole note at
+        // 120 BPM is 96000 samples, so a shorter render would find only the end of
+        // the buffer and report a bogus position.
+        let frames = impulse_at + DelayDivision::Whole.to_samples(120.0, 48_000) as usize + 2_000;
+
+        let echo_offset = |cc: u8| -> usize {
+            let mut samples = vec![0.0f32; frames * 2];
+            samples[impulse_at * 2] = 1.0;
+            samples[impulse_at * 2 + 1] = 1.0;
+            let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+            m.set_dsp_param(0, DspParam::Send, 100);
+            m.set_dsp_param(0, DspParam::DelayReturn, 100);
+            m.set_dsp_param(0, DspParam::DelayFeedback, 0);
+            m.set_dsp_param(0, DspParam::DelayTime, cc);
+            let mut out = vec![0i32; frames * 2];
+            m.render(&mut out);
+            // The loudest frame after the dry impulse has passed is the echo.
+            out.iter()
+                .step_by(2)
+                .enumerate()
+                .skip(impulse_at + 100)
+                .max_by_key(|(_, v)| v.abs())
+                .map(|(i, _)| i - impulse_at)
+                .unwrap()
+        };
+
+        // Exactly on the division, now that the glide has settled.
+        assert_eq!(
+            echo_offset(0),
+            DelayDivision::Sixteenth.to_samples(120.0, 48_000) as usize,
+            "CC 0 should be a sixteenth"
+        );
+        assert_eq!(
+            echo_offset(127),
+            DelayDivision::Whole.to_samples(120.0, 48_000) as usize,
+            "CC 127 should be a whole note"
+        );
+    }
+
+    /// The bus is transparent until asked for: with no send and no return, the
+    /// output must be bit-identical to the dry signal (§6's transparent default).
+    #[test]
+    fn the_delay_bus_is_silent_until_a_send_is_raised() {
+        let frames = 64;
+        let mut samples = vec![0.0f32; frames * 2];
+        for (i, v) in samples.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 0.3 } else { -0.3 };
+        }
+        let mut with_bus = Mixer::new(song(vec![pair(0, samples.clone())]), 48_000);
+        let mut plain = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+        // `plain` gets a send but no return; `with_bus` gets neither. Both must
+        // equal the dry signal, since a send with nothing returning is inaudible.
+        plain.set_dsp_param(0, DspParam::Send, 127);
+
+        let mut a = vec![0i32; frames * 2];
+        let mut b = vec![0i32; frames * 2];
+        with_bus.render(&mut a);
+        plain.render(&mut b);
+        assert_eq!(a, b, "a send with no return must be inaudible");
     }
 
     #[test]
@@ -777,10 +1062,16 @@ mod tests {
             m.set_dsp_param(p, DspParam::Gain, 100);
             m.set_dsp_param(p, DspParam::Cutoff, 64);
             m.set_dsp_param(p, DspParam::Resonance, 80);
-            m.set_dsp_param(p, DspParam::DelayTime, 40);
-            m.set_dsp_param(p, DspParam::DelayFeedback, 80);
-            m.set_dsp_param(p, DspParam::DelayMix, 64);
+            m.set_dsp_param(p, DspParam::Send, 90);
         }
+
+        // The shared bus, fully engaged including the feedback filter — the
+        // configuration this rearchitecture exists to make affordable.
+        m.set_dsp_param(0, DspParam::DelayTime, 40);
+        m.set_dsp_param(0, DspParam::DelayFeedback, 80);
+        m.set_dsp_param(0, DspParam::DelayReturn, 64);
+        m.set_dsp_param(0, DspParam::DelayCutoff, 70);
+        m.set_dsp_param(0, DspParam::DelayResonance, 60);
 
         let period = 1024usize;
         let periods = (rate * secs) / period;

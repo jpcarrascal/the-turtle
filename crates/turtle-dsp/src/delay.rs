@@ -27,6 +27,10 @@
 //! is almost always in the cache line the first one just pulled in. One nearly-free
 //! read and about three extra flops, with no fade state and no branching.
 //!
+//! The feedback-path lowpass (§6) lives here too — see
+//! [`Delay::set_feedback_filter`] for why it is in the loop rather than on the
+//! output.
+//!
 //! # Why the glide is linear, not exponential
 //!
 //! The rest of this codebase smooths parameters with a one-pole (`Gain`, the live
@@ -42,6 +46,8 @@
 //! behaviour, since it gives a steady detune during the move rather than a swoop
 //! that eases out.
 
+use crate::biquad::{Biquad, FilterType};
+
 /// How long the read tap takes to glide to a new delay time.
 ///
 /// Sets the character of the pitch bend: much faster and a time change is a
@@ -49,7 +55,14 @@
 /// controller. ~150 ms is in the range analogue tape units actually move.
 pub const GLIDE_MS: f32 = 150.0;
 
-/// A feedback delay with a dry/wet mix and a gliding (tape-style) delay time.
+/// A feedback delay with a dry/wet mix, a gliding (tape-style) delay time, and an
+/// optional lowpass **inside the feedback loop**.
+///
+/// The filter's placement is the musically important part: in the loop, every
+/// repeat passes through it again, so successive echoes darken cumulatively — how
+/// a tape or bucket-brigade echo behaves. On the *output* instead, all repeats
+/// would be filtered identically, which is a tone control rather than an echo
+/// character.
 #[derive(Debug, Clone)]
 pub struct Delay {
     buf: Vec<f32>,
@@ -73,6 +86,17 @@ pub struct Delay {
     time_set: bool,
     feedback: f32,
     mix: f32,
+    /// Applied to the signal being fed back, so repeats darken cumulatively.
+    feedback_filter: Biquad,
+    /// Whether the filter does anything. Transparent by default, and skipped
+    /// entirely when so: an identity biquad still costs 5 multiplies and 4 adds
+    /// per sample per channel, which is not nothing on an RT path.
+    filter_live: bool,
+    /// Compensation for the filter's resonant gain — see
+    /// [`Delay::set_feedback_filter`]. Without it, resonance multiplies the loop
+    /// gain and the delay can run away.
+    filter_gain_comp: f32,
+    sample_rate: f32,
 }
 
 impl Delay {
@@ -92,6 +116,10 @@ impl Delay {
             time_set: false,
             feedback: 0.0,
             mix: 0.0,
+            feedback_filter: Biquad::identity(),
+            filter_live: false,
+            filter_gain_comp: 1.0,
+            sample_rate,
         }
     }
 
@@ -147,6 +175,42 @@ impl Delay {
         self.mix = mix.clamp(0.0, 1.0);
     }
 
+    /// Set the lowpass in the feedback path: repeats darken cumulatively (§6).
+    ///
+    /// Coefficients are recomputed here, off the per-sample path — a CC move costs
+    /// one recompute, not one per sample. **`Q` is free** to run: it only changes
+    /// the coefficients, so an adjustable-resonance filter is exactly as cheap as
+    /// a fixed one. There is no cheaper "fixed frequency" version worth having.
+    ///
+    /// # Why the resonant gain is compensated
+    ///
+    /// A resonant lowpass has **gain** at its cutoff — roughly `Q` for `Q > 1`.
+    /// Inside a feedback loop that multiplies the loop gain, so a perfectly
+    /// reasonable-looking pair of knob positions (Q 8, feedback 0.95) gives a loop
+    /// gain near 7.6 at the resonant frequency and the delay grows without bound.
+    /// A test caught exactly that, at a setting a performer could plausibly dial
+    /// in — and an unbounded howl mid-set is not an acceptable failure mode.
+    ///
+    /// So the fed-back signal is scaled by `1/Q` (for `Q > 1`), which keeps the
+    /// worst-case loop gain at or below `feedback` whatever the resonance. The
+    /// cost is that high resonance makes the repeats quieter as well as more
+    /// peaked, which is the correct trade: the knob stays expressive and the
+    /// system stays stable.
+    pub fn set_feedback_filter(&mut self, cutoff_hz: f32, q: f32) {
+        self.feedback_filter
+            .set(FilterType::Lowpass, cutoff_hz, q, self.sample_rate);
+        // An RBJ lowpass peaks at about `Q` at its cutoff.
+        self.filter_gain_comp = 1.0 / q.max(1.0);
+        self.filter_live = true;
+    }
+
+    /// Remove the feedback filter, restoring bit-exact passthrough.
+    pub fn clear_feedback_filter(&mut self) {
+        self.feedback_filter = Biquad::identity();
+        self.filter_live = false;
+        self.filter_gain_comp = 1.0;
+    }
+
     /// Clear the delay buffer.
     pub fn reset(&mut self) {
         self.buf.iter_mut().for_each(|s| *s = 0.0);
@@ -189,7 +253,15 @@ impl Delay {
         // fraction interpolates from `a` toward `b` as the tap moves back.
         let delayed = a + (b - a) * frac;
 
-        self.buf[self.write] = x + delayed * self.feedback;
+        // The filter sits *inside* the loop, so each pass darkens the signal
+        // again. Skipped when transparent rather than running an identity biquad.
+        let fed_back = if self.filter_live {
+            self.feedback_filter
+                .process(delayed * self.feedback * self.filter_gain_comp)
+        } else {
+            delayed * self.feedback
+        };
+        self.buf[self.write] = x + fed_back;
         // Same reasoning as above: a compare beats a division.
         self.write += 1;
         if self.write >= len {
@@ -415,6 +487,99 @@ mod tests {
         }
         for i in (0..40).filter(|i| i % 8 == 0).skip(1) {
             assert_eq!(outs[i + 3], 1.0, "marker at {i} should return at {}", i + 3);
+        }
+    }
+
+    /// The filter must be *in the loop*: each repeat passes through it again, so
+    /// successive echoes get progressively darker. On the output they would all be
+    /// filtered identically, which is a tone control, not an echo character.
+    #[test]
+    fn the_feedback_filter_darkens_each_repeat_further() {
+        // High feedback so several repeats survive to be compared.
+        let mut d = settled(48_000, 100);
+        d.set_mix(1.0);
+        d.set_feedback(0.9);
+        d.set_feedback_filter(1_000.0, 0.707);
+
+        // Compare against the same delay with no filter. Energy per repeat window,
+        // not a single sample: the filter *smears* each impulse, so point-sampling
+        // measures where the peak moved rather than how much survived.
+        let mut plain = settled(48_000, 100);
+        plain.set_mix(1.0);
+        plain.set_feedback(0.9);
+
+        let energy = |d: &mut Delay| -> Vec<f32> {
+            let mut windows = vec![0.0f32; 5];
+            for i in 0..500 {
+                let x = if i == 0 { 1.0 } else { 0.0 };
+                let y = d.process(x);
+                windows[i / 100] += y * y;
+            }
+            windows
+        };
+        let filtered = energy(&mut d);
+        let unfiltered = energy(&mut plain);
+
+        // The FIRST echo is identical, and that is the topology working: the
+        // filter is in the *feedback* path, so the signal reaching the output the
+        // first time round has not passed through it yet. Only the repeats that
+        // have been fed back are coloured. On the output instead, every repeat
+        // including this one would be filtered equally.
+        assert_eq!(
+            filtered[1], unfiltered[1],
+            "the first echo passes the filter only on its way back, not on its way out"
+        );
+
+        // Every *subsequent* repeat carries less energy, and the gap widens
+        // because the loss compounds with each pass through the loop.
+        for w in 2..5 {
+            assert!(
+                filtered[w] < unfiltered[w],
+                "repeat {w} should be darker with the filter: {filtered:?} vs {unfiltered:?}"
+            );
+        }
+        let early_ratio = filtered[2] / unfiltered[2];
+        let late_ratio = filtered[4] / unfiltered[4];
+        assert!(
+            late_ratio < early_ratio,
+            "the loss must compound across repeats: {early_ratio} then {late_ratio}"
+        );
+    }
+
+    /// Transparent until asked for: an identity biquad is not free, so the
+    /// untouched case must skip it entirely and stay bit-exact.
+    #[test]
+    fn the_feedback_filter_is_bit_exact_passthrough_until_set() {
+        let mut plain = settled(64, 4);
+        plain.set_mix(1.0);
+        plain.set_feedback(0.5);
+
+        let mut cleared = settled(64, 4);
+        cleared.set_mix(1.0);
+        cleared.set_feedback(0.5);
+        cleared.set_feedback_filter(1_000.0, 0.707);
+        cleared.clear_feedback_filter();
+
+        // Bit-for-bit identical: clearing must restore the untouched path exactly,
+        // not merely something close.
+        for i in 0..200 {
+            let x = if i == 0 { 0.7 } else { 0.0 };
+            assert_eq!(plain.process(x), cleared.process(x), "diverged at {i}");
+        }
+    }
+
+    /// Q changes the sound but must not change stability or cost — it only moves
+    /// coefficients, which is why adjustable resonance is free.
+    #[test]
+    fn a_resonant_feedback_filter_stays_stable() {
+        let mut d = settled(4_800, 480);
+        d.set_mix(1.0);
+        d.set_feedback(0.95);
+        d.set_feedback_filter(800.0, 8.0); // high Q, high feedback
+        for i in 0..48_000 {
+            let x = if i % 4_800 == 0 { 0.5 } else { 0.0 };
+            let y = d.process(x);
+            assert!(y.is_finite() && y.abs() < 50.0, "runaway at {i}: {y}");
         }
     }
 }

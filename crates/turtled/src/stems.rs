@@ -34,6 +34,10 @@ pub struct PreloadedSong {
     /// Longest pair length in frames; shorter pairs are zero-padded by the mixer.
     pub frames: usize,
     pub pairs: Vec<StemPair>,
+    /// Nominal tempo, for the tempo-synced delay (§6). Carried on the song for
+    /// the same reason as `looping`: switching songs must switch the tempo the
+    /// delay syncs to, or the echoes stay locked to the previous song's grid.
+    pub bpm: f64,
     /// `[song] loop` — repeat instead of ending (§14). Carried on the *song*, not
     /// the mixer's configuration, so switching songs switches the behaviour with
     /// it rather than leaving a stale flag behind.
@@ -86,6 +90,7 @@ pub fn load_song(
         frames,
         pairs,
         looping: song.song.looping,
+        bpm: song.song.bpm,
     })
 }
 

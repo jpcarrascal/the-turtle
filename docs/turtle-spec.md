@@ -113,10 +113,24 @@ milliseconds — well within tolerance for kick-synced lighting and pedal/video 
 
 Fixed, preallocated per-pair chain (fixed topology = RT-deterministic):
 
-- **gain + mute** (per pair)
+Per pair:
+
+- **gain + mute**
 - **one biquad** — type per pair (LP/HP/BP); params cutoff, resonance
-- **one delay** — time (free ms or tempo-synced to the song's nominal BPM × division),
-  feedback, mix
+- **a send** into the shared delay, taken post-gain and post-filter (so a muted
+  pair stops feeding the delay and its tail rings out)
+
+Shared, once:
+
+- **one stereo delay** on a send/return, not four per-pair inserts. Time is
+  **tempo-synced** to the song's nominal BPM as a note division (1/1 down to
+  1/16, with dots) rather than a free millisecond value — a stepped list, because
+  any value between a dotted eighth and a quarter is simply wrong against the
+  beat. Changing it *glides* the read tap (tape-style pitch bend) rather than
+  clicking.
+- **a lowpass inside the delay's feedback loop** — cutoff and Q — so repeats
+  darken cumulatively. Its resonant gain is compensated, or a high-Q, high-feedback
+  setting would make the loop unstable.
 - **master:** output gain + optional limiter
 
 Every parameter is driven **only** by a live incoming CC mapping (foot controller /
@@ -186,8 +200,8 @@ next    = { type = "note", note = 62 }
 prev    = { type = "note", note = 63 }
 panic   = { type = "note", note = 65 }   # note 64 free (Restart removed; Start restarts)
 mute    = { type = "note", notes = [72, 73, 74, 75] }   # per-pair toggle
-dsp_cutoff = { type = "cc", cc = 20 }
-dsp_delay_mix = { type = "cc", cc = 21 }
+dsp_pair0_cutoff = { type = "cc", cc = 20 }
+dsp_delay_return = { type = "cc", cc = 21 }
 
 [[setlist]]                    # ordered songs, each bound to a selection PC number
 pc = 0
