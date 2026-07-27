@@ -1124,4 +1124,68 @@ mod tests {
         // on this machine regardless of headroom.
         assert!(factor > 1.0, "slower than realtime: {factor:.2}x");
     }
+
+    /// The cutoff sweep must be continuous at the very top, including the step onto
+    /// CC 127 where the filter bypasses.
+    ///
+    /// Reported from the Pi: "the last step of the filter (126 to 127) makes a large
+    /// jump in volume, like if the filter had been suddenly turned off." It had —
+    /// CC 127 maps exactly onto `MAX_CUTOFF_HZ`, which clears the filter, and the
+    /// `1/Q` output compensation then vanished in one step. At maximum resonance
+    /// that was +20 dB.
+    ///
+    /// The first version of this test measured *total* output and passed even with
+    /// the bug reinstated: the dry signal dominates and masks a 10x change in the
+    /// wet path. It now measures a window where the dry has already stopped and only
+    /// the echo is sounding, which is the only way to see the delay's own level.
+    #[test]
+    fn the_top_of_the_cutoff_sweep_has_no_level_jump() {
+        // A burst that ENDS well before the echo returns, so the measurement window
+        // contains the delay's output and nothing else.
+        let echo_at = DelayDivision::Sixteenth.to_samples(120.0, 48_000) as usize; // 6000
+        let burst = 2_000usize;
+        let frames = echo_at + burst * 3;
+
+        let wet_energy = |cutoff_cc: u8| -> f64 {
+            let mut samples = vec![0.0f32; frames * 2];
+            for i in 0..burst {
+                // Broadband-ish, so the filter has something to act on.
+                let t = i as f32;
+                let v = 0.3 * ((t * 0.31).sin() + (t * 0.017).sin()) * 0.5;
+                samples[i * 2] = v;
+                samples[i * 2 + 1] = v;
+            }
+            let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+            m.set_dsp_param(0, DspParam::Send, 100);
+            m.set_dsp_param(0, DspParam::DelayReturn, 100);
+            m.set_dsp_param(0, DspParam::DelayFeedback, 0); // one echo, no repeats
+            m.set_dsp_param(0, DspParam::DelayTime, 0); // shortest division
+            m.set_dsp_param(0, DspParam::DelayResonance, 127); // maximum Q
+            m.set_dsp_param(0, DspParam::DelayCutoff, cutoff_cc);
+
+            let mut out = vec![0i32; frames * 2];
+            m.render(&mut out);
+
+            // Only the echo lives here: the burst finished at `burst`, and the echo
+            // spans `echo_at ..= echo_at + burst`.
+            out.iter()
+                .skip(echo_at * 2)
+                .take(burst * 2)
+                .map(|&v| {
+                    let f = v as f64 / i32::MAX as f64;
+                    f * f
+                })
+                .sum()
+        };
+
+        let at_126 = wet_energy(126);
+        let at_127 = wet_energy(127);
+        assert!(at_126 > 1e-9, "the echo should be audible at CC 126: {at_126}");
+        let ratio = (at_127 / at_126).sqrt(); // amplitude ratio
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "the 126->127 step should be a small change, not a cliff: \
+             amplitude ratio {ratio:.2} (energies {at_126:.9} -> {at_127:.9})"
+        );
+    }
 }
