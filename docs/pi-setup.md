@@ -294,6 +294,31 @@ exact whole number of bars, which Ableton's bounce already gives you.
 `turtled play` is a fixed-duration tool and stops after one pass even for a
 looping song; use `turtled control` (or the service) to hear it repeat.
 
+## Delay starting values (§6)
+
+The shared delay comes up ready to use rather than blank, so raising a send is
+enough to hear it — no dialling in feedback, return, cutoff and Q first. Override in
+`show.toml` if you want different ones:
+
+```toml
+[delay]
+time      = "1/4"   # note division: "1/16" ... "1/1", dots as "1/4."
+feedback  = 64      # CC value, ~half
+return    = 100     # CC value; the gain taper puts unity at 100
+cutoff    = 89      # CC value, ~2.5 kHz (the sweep is exponential)
+resonance = 0       # CC value; 0 is the floor, no resonant peak
+```
+
+Two things worth knowing:
+
+- **The continuous controls are CC values, not percentages or Hz.** That is
+  deliberate: a default and a live pedal move then go through the *identical*
+  mapping, so they cannot drift apart. `time` is the exception, written as a note
+  division because it is a discrete musical choice rather than a swept control.
+- **Sends still default to zero, so the delay is silent** until you send something
+  to it. Its settings are live; the delay itself is opt-in. A show that never
+  touches a send never hears it.
+
 ## The delay tail after Stop (§6)
 
 Stopping the transport no longer cuts the delay dead. The stems stop and the

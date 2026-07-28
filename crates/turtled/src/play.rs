@@ -58,6 +58,9 @@ pub fn load_playable(bundle: &Path, song: Option<&str>) -> Result<Playable, Stri
         stems::load_song(&song, &song_dir, rate).map_err(|e| format!("stems: {e}"))?;
     let frames = preloaded.frames as u64;
     let mut mixer = Mixer::new(preloaded, rate);
+    // The show's `[delay]` table, if it has one; otherwise this re-applies the same
+    // built-in defaults the mixer already has (§6).
+    mixer.apply_delay_defaults(&show.delay);
 
     // Apply each pair's fixed filter topology from song.toml's `[dsp.pairN]`
     // (§6); live CC then drives cutoff/resonance within that topology. Keys

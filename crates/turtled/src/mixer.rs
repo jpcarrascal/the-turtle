@@ -22,6 +22,7 @@
 use rtrb::{Consumer, Producer, RingBuffer};
 use turtle_dsp::{one_pole_coeff, Biquad, Delay, FilterType, Gain, Limiter};
 
+use turtle_core::model::DelayDefaults;
 use turtle_core::timing::DelayDivision;
 
 use crate::control_map::DspParam;
@@ -233,6 +234,11 @@ impl DelayBus {
         // on the first Pi test of this PR.
         bus.left.set_mix(1.0);
         bus.right.set_mix(1.0);
+        // Immediately usable rather than all-zero (§6): the built-in defaults give
+        // half feedback, unity return, and a gently darkened echo, so raising a send
+        // is enough to hear a delay. Sends stay at zero, so nothing is audible until
+        // one is raised — the delay is opt-in, its *settings* just are not blank.
+        bus.apply_defaults(&DelayDefaults::default());
         bus
     }
 
@@ -249,6 +255,14 @@ impl DelayBus {
         if division == self.division {
             return;
         }
+        self.division = division;
+        self.apply_division();
+    }
+
+    /// Set the division unconditionally, for applying defaults at construction
+    /// where the value may equal the field's initial one and the early-out in
+    /// [`DelayBus::set_division`] would skip it.
+    fn force_division(&mut self, division: DelayDivision) {
         self.division = division;
         self.apply_division();
     }
@@ -289,6 +303,18 @@ impl DelayBus {
         let wet_l = self.left.process(send_l);
         let wet_r = self.right.process(send_r);
         (self.return_l.process(wet_l), self.return_r.process(wet_r))
+    }
+
+    /// Apply a set of starting values (§6), through the same CC mapping a live
+    /// pedal move uses — there is deliberately no second conversion path.
+    fn apply_defaults(&mut self, d: &DelayDefaults) {
+        self.force_division(d.time);
+        self.set_feedback(d.feedback as f32 / 127.0);
+        self.set_return(gain_from_cc(d.r#return));
+        self.cutoff_hz = MIN_CUTOFF_HZ * (MAX_CUTOFF_HZ / MIN_CUTOFF_HZ)
+            .powf(d.cutoff as f32 / 127.0);
+        self.q = MIN_Q + (d.resonance as f32 / 127.0) * (MAX_Q - MIN_Q);
+        self.apply_filter();
     }
 
     fn set_return(&mut self, level: f32) {
@@ -509,6 +535,15 @@ impl Mixer {
             out[2 * f] = to_i32(self.limiter_l.process(wet_l));
             out[2 * f + 1] = to_i32(self.limiter_r.process(wet_r));
         }
+    }
+
+    /// Apply the show's `[delay]` starting values (§6).
+    ///
+    /// Separate from `Mixer::new` rather than a constructor argument: the mixer is
+    /// built in ~30 places (mostly tests) that have no `Show` to hand, and they
+    /// should all get the same built-in defaults. This applies the *overrides*.
+    pub fn apply_delay_defaults(&mut self, defaults: &DelayDefaults) {
+        self.delay_bus.apply_defaults(defaults);
     }
 
     /// Discard the delay's contents immediately (panic, §6/§8).
@@ -880,6 +915,10 @@ mod tests {
         m.set_dsp_param(0, DspParam::DelayReturn, 100); // unity
         m.set_dsp_param(0, DspParam::DelayFeedback, 0); // one echo only
         m.set_dsp_param(0, DspParam::DelayTime, 32); // eighth-note band
+        // Open the filter: the default cutoff (~2.5 kHz) would swallow most of a
+        // broadband impulse, and this test is about *when* the echo lands, not what
+        // the filter does to it.
+        m.set_dsp_param(0, DspParam::DelayCutoff, 127);
 
         let mut out = vec![0i32; frames * 2];
         m.render(&mut out);
@@ -923,6 +962,8 @@ mod tests {
             m.set_dsp_param(0, DspParam::DelayReturn, 100);
             m.set_dsp_param(0, DspParam::DelayFeedback, 0);
             m.set_dsp_param(0, DspParam::DelayTime, cc);
+            // As above: measure timing, not filtering.
+            m.set_dsp_param(0, DspParam::DelayCutoff, 127);
             let mut out = vec![0i32; frames * 2];
             m.render(&mut out);
             // The loudest frame after the dry impulse has passed is the echo.
@@ -1191,6 +1232,108 @@ mod tests {
             (0.5..2.0).contains(&ratio),
             "the 126->127 step should be a small change, not a cliff: \
              amplitude ratio {ratio:.2} (energies {at_126:.9} -> {at_127:.9})"
+        );
+    }
+
+    /// The thing this feature is for: raising a send alone should produce an audible
+    /// delay, with no need to dial in feedback, return, cutoff and Q first.
+    #[test]
+    fn raising_a_send_alone_is_enough_to_hear_the_delay() {
+        let echo_at = DelayDivision::Quarter.to_samples(120.0, 48_000) as usize;
+        let burst = 4_000usize;
+        let frames = echo_at + burst * 2;
+
+        let mut samples = vec![0.0f32; frames * 2];
+        for i in 0..burst {
+            let t = i as f32;
+            let v = 0.4 * ((t * 0.05).sin() + (t * 0.013).sin()) * 0.5;
+            samples[i * 2] = v;
+            samples[i * 2 + 1] = v;
+        }
+        let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+
+        // ONLY the send. Nothing else touched.
+        m.set_dsp_param(0, DspParam::Send, 100);
+
+        let mut out = vec![0i32; frames * 2];
+        m.render(&mut out);
+
+        // The burst ends at `burst`; a quarter note later there must be an echo.
+        let echo: i64 = out
+            .iter()
+            .skip(echo_at * 2)
+            .take(burst * 2)
+            .map(|&v| (v as i64).abs())
+            .max()
+            .unwrap();
+        assert!(
+            echo > to_i32(0.01).abs() as i64,
+            "a send alone should be audible with the default delay settings, got {echo}"
+        );
+    }
+
+    /// And it must still be *silent* until that send is raised: the delay is opt-in,
+    /// its settings just are not blank. A show that never touches a send never hears
+    /// it, even though feedback and return are live.
+    #[test]
+    fn the_delay_is_silent_until_a_send_is_raised_despite_live_defaults() {
+        let frames = 20_000usize;
+        let mut samples = vec![0.0f32; frames * 2];
+        for (i, v) in samples.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 0.4 } else { -0.4 };
+        }
+        // Two mixers on identical audio: one untouched, one with the delay knobs
+        // explicitly zeroed. If the live defaults leaked into the output, these
+        // would differ.
+        let mut untouched = Mixer::new(song(vec![pair(0, samples.clone())]), 48_000);
+        let mut zeroed = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+        zeroed.set_dsp_param(0, DspParam::DelayReturn, 0);
+        zeroed.set_dsp_param(0, DspParam::DelayFeedback, 0);
+
+        let mut a = vec![0i32; frames * 2];
+        let mut b = vec![0i32; frames * 2];
+        untouched.render(&mut a);
+        zeroed.render(&mut b);
+        assert_eq!(
+            a, b,
+            "with no send raised, live delay defaults must be inaudible"
+        );
+    }
+
+    /// The defaults are applied through the same CC mapping a pedal move uses, so a
+    /// default and an explicit CC of the same value must be indistinguishable. Two
+    /// conversion paths would be two places to drift.
+    #[test]
+    fn defaults_match_the_equivalent_cc_moves() {
+        use turtle_core::model::DelayDefaults;
+        let d = DelayDefaults::default();
+
+        let frames = 30_000usize;
+        let render = |explicit: bool| -> Vec<i32> {
+            let mut samples = vec![0.0f32; frames * 2];
+            for i in 0..4_000 {
+                let t = i as f32;
+                let v = 0.4 * (t * 0.05).sin();
+                samples[i * 2] = v;
+                samples[i * 2 + 1] = v;
+            }
+            let mut m = Mixer::new(song(vec![pair(0, samples)]), 48_000);
+            m.set_dsp_param(0, DspParam::Send, 100);
+            if explicit {
+                // Re-apply the same values as if a pedal had sent them.
+                m.set_dsp_param(0, DspParam::DelayFeedback, d.feedback);
+                m.set_dsp_param(0, DspParam::DelayReturn, d.r#return);
+                m.set_dsp_param(0, DspParam::DelayCutoff, d.cutoff);
+                m.set_dsp_param(0, DspParam::DelayResonance, d.resonance);
+            }
+            let mut out = vec![0i32; frames * 2];
+            m.render(&mut out);
+            out
+        };
+        assert_eq!(
+            render(false),
+            render(true),
+            "a default must be identical to the same value arriving as a CC"
         );
     }
 }
