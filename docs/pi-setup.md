@@ -123,9 +123,11 @@ RT runtime not started (requires Linux/ALSA). Engine wiring OK.
 This proves the model, validation, timeline compilation, transport state
 machine, and the engine's lock-free wiring all work on real hardware. It does
 **not** touch audio or MIDI I/O — `turtled`'s `main` still runs against
-`NullAudio`/`NullMidi` stubs until the ALSA backend is wired into a runnable
-path (below), so this output is unchanged even though the ALSA code now
-compiles, and there's no sound or lights yet.
+`NullAudio`/`NullMidi` stubs **by design**: `turtled <show.toml>` is the
+load-and-validate path, deliberately kept free of hardware so it works anywhere.
+The paths that make sound are `turtled control <bundle>` (the real one, driven by
+MIDI and the control socket) and `turtled play <bundle>` (a fixed-duration
+one-shot for bring-up).
 
 ## 4. What runs where
 
@@ -136,18 +138,25 @@ compiles, and there's no sound or lights yet.
 
 ## ALSA backend
 
-The audio PCM loop and MIDI rawmidi I/O (spec §2/§3) are Linux-only and sit
-behind the `backend` traits in `turtled`. The **first slice has landed**:
-`alsa_backend.rs` opens/configures the PCM device (`AlsaAudio`) and fans MIDI
-out over rawmidi (`AlsaMidi`). It builds only on the Pi (see §2) — its extra
-requirement is the ALSA development headers, now folded into the §2 apt install:
+The audio PCM loop and MIDI rawmidi I/O (spec §2/§3) are Linux-only and sit behind
+the `backend` traits in `turtled`: `alsa_backend.rs` opens and configures the PCM
+device (`AlsaAudio`) and fans MIDI out over rawmidi (`AlsaMidi`). It builds only on
+the Pi (see §2) — its extra requirement is the ALSA development headers, folded into
+the §2 apt install:
 
 ```bash
 sudo apt install -y libasound2-dev
 ```
 
-Still to come before it is show-ready: resolving logical port labels
-(`"CME:1"`) to ALSA `hw:` device names, and GPIO (§8.1).
+This is complete and in use. Logical port labels (`"CME:1"`) resolve to ALSA device
+names — see [logical port labels](#logical-port-labels-ports) — and the only spec
+item still outstanding on the hardware side is GPIO (§8.1), which needs the LEDs and
+button.
+
+**Because this layer is `cfg(target_os = "linux")`, it never compiles on a Mac.**
+That is worth knowing if you build on a laptop: `cargo test` there validates the
+portable core — the DSP, data model, transport state machine and socket protocol —
+but the first compile of the ALSA code is on the Pi.
 
 ## Finding your device names: `turtle ports`
 
@@ -587,6 +596,68 @@ bind the control socket:
 sudo systemctl stop turtled
 ./target/release/turtled control /media/shows/Tone.turtle -v
 ```
+
+### Going from "running it by hand" to installed
+
+If you have been testing with `./target/release/turtled ...` from the repo, this is
+the switch to a permanent install:
+
+```bash
+cd ~/the-turtle
+git checkout main && git pull
+cargo build --release -p turtled -p turtle-cli
+
+sudo install -m755 target/release/turtled target/release/turtle /usr/local/bin/
+sudo systemctl enable --now turtled     # `enable` = also start it at boot
+systemctl status turtled                # expect: active, armed "<your show>"
+```
+
+`enable --now` is the difference between "running until the next reboot" and
+"this box plays the show when you power it on". After that, `turtled` and `turtle`
+on your `PATH` are the installed copies; the ones in `target/` are just build
+output.
+
+Two things that catch people out:
+
+- **Stop the hand-run copy first.** Two daemons cannot share the audio device, and
+  the second will fail to bind the control socket.
+- **`turtle` resolves the socket automatically** — it looks for the service's
+  socket first, then the hand-started one — so the same commands work either way
+  with no flags.
+
+### Reloading after you edit a show
+
+There are two different answers, and the distinction saves a lot of restarting:
+
+**Song content reloads when you arm the song.** Selecting a song (a Program Change,
+or `turtle arm <name>`) re-reads that song's `song.toml`, its stems and its MIDI
+files from disk. So while you are working on a song — swapping stems, changing
+`loop`, adjusting its MIDI — you can just re-arm it. Re-arming the song you are
+already on works too.
+
+```bash
+turtle arm opener      # re-reads opener's song.toml, stems and MIDI
+```
+
+**Show-level settings need a restart.** The control map, device names, `[ports]`
+aliases, setlist membership, buffer size and playback rate are all bound when the
+daemon starts — the MIDI ports are open, the CC bindings are compiled. Editing those
+means:
+
+```bash
+sudo systemctl restart turtled
+```
+
+Restarting is cheap: it re-arms the current show from scratch, and with the device
+wait it is robust to an interface that is momentarily busy.
+
+> If you are unsure which kind of change you made, restart — it is a second or two
+> and always correct. The re-arm shortcut is a convenience for iterating on stems,
+> not a rule to memorise.
+
+There is deliberately **no live reload of `show.toml`**. Re-binding MIDI ports and
+the control map underneath a running show is a good way to lose control of a set
+midway through, and a restart is fast enough that the complexity buys nothing.
 
 ### Why `Type=notify` and not `simple`
 

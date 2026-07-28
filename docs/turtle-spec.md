@@ -1,7 +1,7 @@
 # The Turtle — System Specification
 
-**Status:** v0.4 (draft, in active co-design)
-**Last updated:** 2026-07-04
+**Status:** v0.5 — implemented and running on hardware, except GPIO (§8.1)
+**Last updated:** 2026-07-28
 
 The Turtle is a headless, MIDI-controlled backing-track and MIDI-automation player
 for live solo performance, built as a Raspberry Pi appliance. It replaces a laptop
@@ -402,3 +402,13 @@ a preallocated log ring).
 - FLAC/`symphonia` stem support for smaller bundles.
 - Optional WiFi AP for config convenience.
 - Full tempo-map-following for tempo-synced delay (v1 uses nominal BPM).
+- Preserving the delay tail across a song change. The delay is tempo-synced to the
+  song, so it belongs to the song and a switch starts with an empty buffer —
+  including a gapless auto-advance. Keeping the tail would mean separating the
+  delay's buffer from its timing.
+- Independent per-pair playheads ("sampler mode"): each pair triggered from sample 0
+  by its own note, one-shot. This breaks the single-song-timeline assumption that
+  MIDI-out scheduling and looping both rely on, so it wants to be a separate mode
+  rather than a feature.
+- Multiple physical MIDI input ports. Largely covered today by `transport_channel` /
+  `dsp_channel`, which separate two controllers merged onto one cable by channel.
