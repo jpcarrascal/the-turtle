@@ -235,10 +235,20 @@ impl Delay {
         self.filter_gain_comp = 1.0;
     }
 
-    /// Clear the delay buffer.
+    /// Clear all transient state: the buffer *and* the output filter.
+    ///
+    /// The filter matters. A panic clears the delay so the tail stops immediately
+    /// (§6/§8), but a biquad holds its own `z1`/`z2` — so emptying only the buffer
+    /// left the filter ringing on for a few samples afterwards. A test caught it as
+    /// "panic should silence the tail immediately", which is exactly the guarantee
+    /// panic is supposed to make.
+    ///
+    /// The filter's *coefficients* are untouched: a panic should stop the sound, not
+    /// un-set the knobs.
     pub fn reset(&mut self) {
         self.buf.iter_mut().for_each(|s| *s = 0.0);
         self.write = 0;
+        self.output_filter.reset();
     }
 
     /// Process one sample.

@@ -30,7 +30,13 @@ pub fn division_to_samples(beats_per_division: f64, bpm: f64, rate: u32) -> u64 
 /// delay sit *in* the song: any value between a dotted eighth and a quarter is
 /// simply wrong against the beat. A CC selects one of these rather than sweeping
 /// a millisecond value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deserialised from its own label (`"1/8"`, `"1/4."`) rather than a number,
+/// because unlike the continuous controls this is a discrete *musical* value: a
+/// show file saying `time = "1/8"` is self-documenting where `time = 40` would
+/// require knowing the CC band layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum DelayDivision {
     Whole,
     DottedHalf,
@@ -108,6 +114,31 @@ impl DelayDivision {
     /// The longest division, which is what a delay buffer must be sized for.
     pub fn longest() -> DelayDivision {
         DelayDivision::Whole
+    }
+
+    /// Parse a division from its [`label`](DelayDivision::label).
+    pub fn from_label(label: &str) -> Option<DelayDivision> {
+        DelayDivision::ALL
+            .iter()
+            .copied()
+            .find(|d| d.label() == label)
+    }
+}
+
+impl TryFrom<String> for DelayDivision {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        DelayDivision::from_label(&value).ok_or_else(|| {
+            let names: Vec<&str> = DelayDivision::ALL.iter().map(|d| d.label()).collect();
+            format!("unknown note division {value:?}; expected one of {}", names.join(", "))
+        })
+    }
+}
+
+impl From<DelayDivision> for String {
+    fn from(d: DelayDivision) -> String {
+        d.label().to_string()
     }
 }
 
@@ -194,5 +225,19 @@ mod tests {
         // A whole note at 60 BPM is 4 seconds — twice the old fixed 2 s cap.
         assert_eq!(DelayDivision::longest().to_samples(60.0, 48_000), 192_000);
         assert_eq!(DelayDivision::longest(), DelayDivision::Whole);
+    }
+
+    /// Round-trips through its label, so a show file written by `gen-tone` (or by
+    /// hand) parses back to the same division.
+    #[test]
+    fn divisions_round_trip_through_their_labels() {
+        for d in DelayDivision::ALL {
+            assert_eq!(DelayDivision::from_label(d.label()), Some(d), "{}", d.label());
+        }
+        // And a typo is rejected with the valid names listed, rather than silently
+        // falling back to some default.
+        let err = DelayDivision::try_from("1/3".to_string()).unwrap_err();
+        assert!(err.contains("unknown note division"), "{err}");
+        assert!(err.contains("1/4"), "the message should list valid names: {err}");
     }
 }

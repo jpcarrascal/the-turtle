@@ -16,6 +16,75 @@ use crate::error::Error;
 // show.toml
 // ---------------------------------------------------------------------------
 
+/// Starting values for the shared delay bus (§6), from `show.toml`'s `[delay]`.
+///
+/// # Why these are CC values
+///
+/// The continuous controls are given as raw `0..=127` CC values rather than
+/// engineering units, so a default and a live pedal move go through the *identical*
+/// mapping. A second conversion path — percent, Hz, dB — is a second place for the
+/// two to drift apart, and the whole point of a default is that it agrees with what
+/// the knob does.
+///
+/// It also reads better than it sounds: the gain taper puts unity at CC **100**, so
+/// `return = 100` is both "100" and unity gain.
+///
+/// `time` is the exception, and deliberately: a note division is a discrete musical
+/// choice, so it is written as its own label (`"1/8"`).
+///
+/// # Why sends are not here
+///
+/// Per-pair sends stay at zero. The delay is meant to be silent until it is
+/// intentionally added — a show that never touches a send never hears it, even
+/// though these values are live.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct DelayDefaults {
+    /// Note division for the delay time, e.g. `"1/8"`.
+    #[serde(default = "default_delay_time")]
+    pub time: crate::timing::DelayDivision,
+    /// Feedback CC: how many repeats. 64 is about half.
+    #[serde(default = "default_delay_feedback")]
+    pub feedback: u8,
+    /// Return-level CC: how loud the echoes are. 100 is unity.
+    #[serde(default = "default_delay_return")]
+    pub r#return: u8,
+    /// Cutoff CC for the output lowpass. The sweep is exponential, so 89 is about
+    /// 2.5 kHz — a gently darkened echo rather than a muffled one.
+    #[serde(default = "default_delay_cutoff")]
+    pub cutoff: u8,
+    /// Resonance CC. 0 is the floor (Q 0.5): no resonant peak at all.
+    #[serde(default = "default_delay_resonance")]
+    pub resonance: u8,
+}
+
+fn default_delay_time() -> crate::timing::DelayDivision {
+    crate::timing::DelayDivision::Quarter
+}
+fn default_delay_feedback() -> u8 {
+    64
+}
+fn default_delay_return() -> u8 {
+    100
+}
+fn default_delay_cutoff() -> u8 {
+    89
+}
+fn default_delay_resonance() -> u8 {
+    0
+}
+
+impl Default for DelayDefaults {
+    fn default() -> Self {
+        DelayDefaults {
+            time: default_delay_time(),
+            feedback: default_delay_feedback(),
+            r#return: default_delay_return(),
+            cutoff: default_delay_cutoff(),
+            resonance: default_delay_resonance(),
+        }
+    }
+}
+
 /// Per-pair `dsp_pair{0..=3}_{param}` control-map parameters (§6).
 ///
 /// Lives here, with the rest of the config schema, so `validate` can reject a
@@ -58,6 +127,10 @@ pub struct Show {
     /// full ALSA addresses needs no table at all.
     #[serde(default)]
     pub ports: BTreeMap<String, String>,
+    /// Starting values for the shared delay (§6). Absent means the built-in
+    /// defaults, which are chosen to be immediately usable — see [`DelayDefaults`].
+    #[serde(default)]
+    pub delay: DelayDefaults,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

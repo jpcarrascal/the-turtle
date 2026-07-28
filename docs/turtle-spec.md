@@ -176,6 +176,14 @@ rewind_on_stop = true          # true = Stop resets song pointer to 0; false = p
 device = "hw:CARD=HXStomp"
 buffer_frames = 1024           # large = xrun-proof; latency irrelevant
 
+[delay]                        # starting values for the shared delay (§6)
+time      = "1/4"              # note division; "1/8", "1/4.", "1/2" ...
+feedback  = 64                 # CC value: ~half
+return    = 100                # CC value: unity gain (the taper puts unity at 100)
+cutoff    = 89                 # CC value: ~2.5 kHz (the sweep is exponential)
+resonance = 0                  # CC value: 0 = no resonant peak
+# Sends stay at zero: the delay is silent until you intentionally send to it.
+
 [ports]                        # logical alias -> ALSA card id (`turtle ports`)
 CME = "H4MIDIWC"               # so "CME:1".."CME:4" address its four ports
 
