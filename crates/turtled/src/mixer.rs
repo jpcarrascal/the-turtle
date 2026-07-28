@@ -260,16 +260,21 @@ impl DelayBus {
 
     /// Recompute the output filter from the current cutoff and Q.
     ///
-    /// At the top of its range the filter is doing nothing audible, so it is
-    /// cleared rather than left running — that restores the bit-exact passthrough
-    /// and skips two biquads per sample.
+    /// # Why there is no bypass at the top of the cutoff range
+    ///
+    /// There used to be: at `MAX_CUTOFF_HZ` the filter was cleared, on the grounds
+    /// that a 20 kHz lowpass does nothing audible and two biquads per sample are
+    /// worth skipping. But CC 127 maps *exactly* onto that cutoff, so the last step
+    /// of the sweep switched the filter off — and with it the resonant-gain
+    /// compensation, producing a jump of `Q` in one CC step. That was reported from
+    /// the Pi as "a large jump in volume, like if the filter had been suddenly
+    /// turned off", which it was.
+    ///
+    /// Once any filter CC has been touched the filter therefore stays live across
+    /// the whole range, so sweeping cutoff can never step. The bit-exact bypass
+    /// still applies before anything is touched (§6's transparent default), which is
+    /// the case that actually matters for a show that never uses the delay.
     fn apply_filter(&mut self) {
-        if self.cutoff_hz >= MAX_CUTOFF_HZ {
-            self.left.clear_output_filter();
-            self.right.clear_output_filter();
-            self.filter_live = false;
-            return;
-        }
         self.left.set_output_filter(self.cutoff_hz, self.q);
         self.right.set_output_filter(self.cutoff_hz, self.q);
         self.filter_live = true;

@@ -111,6 +111,9 @@ pub struct Delay {
     /// entirely when so: an identity biquad still costs 5 multiplies and 4 adds
     /// per sample per channel, which is not nothing on an RT path.
     filter_live: bool,
+    /// Partial make-up for the filter's resonant gain — `1/sqrt(Q)`. See
+    /// [`Delay::set_output_filter`] for why it is partial rather than full or none.
+    filter_gain_comp: f32,
     sample_rate: f32,
 }
 
@@ -133,6 +136,7 @@ impl Delay {
             mix: 0.0,
             output_filter: Biquad::identity(),
             filter_live: false,
+            filter_gain_comp: 1.0,
             sample_rate,
         }
     }
@@ -196,26 +200,31 @@ impl Delay {
     /// the coefficients, so an adjustable-resonance filter is exactly as cheap as
     /// a fixed one. There is no cheaper "fixed frequency" version worth having.
     ///
-    /// # There is deliberately no resonant-gain compensation
+    /// # Why the resonant gain is *partly* compensated
     ///
-    /// An earlier version scaled the output by `1/Q`, on the theory that a resonant
-    /// lowpass peaks at about `Q` and would otherwise make the resonance knob shift
-    /// the delay's level. That was wrong twice over, and both showed up in use.
+    /// Both extremes were tried on real hardware and both were wrong.
     ///
-    /// It over-corrected by an order of magnitude. A lowpass's **passband** gain is
-    /// 1.0 whatever `Q` is — resonance boosts only a narrow band near the cutoff —
-    /// so dividing the *whole* signal by `Q` attenuated everything by up to 20 dB to
-    /// offset a peak that affects a small slice of the spectrum. For broadband
-    /// material the real level rise from resonance is a few dB.
+    /// **Full `1/Q`** over-corrected by an order of magnitude. A lowpass's passband
+    /// gain is 1.0 whatever `Q` is — resonance boosts only a narrow band near the
+    /// cutoff — so dividing the whole signal by `Q` attenuated everything by up to
+    /// 20 dB to offset a peak affecting a slice of the spectrum.
     ///
-    /// And it made the top of the cutoff sweep discontinuous. CC 127 maps exactly
-    /// onto the maximum cutoff, which bypasses the filter — so the compensation
-    /// vanished in one step and the level jumped by exactly `Q`, up to +20 dB. That
-    /// is what a "large jump in volume, like the filter had suddenly turned off"
-    /// turns out to be: the filter had suddenly turned off.
+    /// **No compensation** then went the other way: with several pairs summed into
+    /// one delay, a resonant sweep "shoots too loud". Which makes sense — a send bus
+    /// already sums, so the peak arrives on top of signal that is several times the
+    /// level of any one pair.
+    ///
+    /// So: `1/sqrt(Q)`. Half the correction in dB terms — 10 dB rather than 20 at
+    /// maximum resonance — which leaves resonance clearly audible as a peak without
+    /// letting a sweep run away when the bus is busy.
+    ///
+    /// The square root is not deeply principled; it is the geometric middle of two
+    /// measured-too-far endpoints. What matters more is that it is *continuous* in
+    /// `Q`, so the resonance knob never steps.
     pub fn set_output_filter(&mut self, cutoff_hz: f32, q: f32) {
         self.output_filter
             .set(FilterType::Lowpass, cutoff_hz, q, self.sample_rate);
+        self.filter_gain_comp = 1.0 / q.max(1.0).sqrt();
         self.filter_live = true;
     }
 
@@ -223,6 +232,7 @@ impl Delay {
     pub fn clear_output_filter(&mut self) {
         self.output_filter = Biquad::identity();
         self.filter_live = false;
+        self.filter_gain_comp = 1.0;
     }
 
     /// Clear the delay buffer.
@@ -288,7 +298,7 @@ impl Delay {
         // when transparent rather than running an identity biquad, which still
         // costs 5 multiplies and 4 adds per sample per channel.
         let wet = if self.filter_live {
-            self.output_filter.process(delayed)
+            self.output_filter.process(delayed * self.filter_gain_comp)
         } else {
             delayed
         };
@@ -648,6 +658,70 @@ mod tests {
         for _ in 0..64 {
             let y = d.process(0.0);
             assert_eq!(y, 0.0, "the tail should have flushed to true zero");
+        }
+    }
+
+    /// The compensation is partial and continuous: half the correction in dB terms,
+    /// and no step anywhere in `Q`.
+    ///
+    /// Both endpoints were rejected on hardware — full `1/Q` flattened resonance by
+    /// 20 dB, none of it "shoots too loud" when several pairs are summed into the
+    /// bus. This pins the middle so neither can creep back.
+    #[test]
+    fn the_resonant_gain_is_half_compensated_in_db() {
+        let level = |q: f32| -> f32 {
+            let mut d = settled(64, 4);
+            d.set_mix(1.0);
+            // Cutoff high enough that the filter passes the impulse, so what is
+            // measured is the compensation rather than the filtering.
+            d.set_output_filter(20_000.0, q);
+            d.process(1.0);
+            (0..8).map(|_| d.process(0.0)).map(f32::abs).fold(0.0, f32::max)
+        };
+
+        let flat = level(0.707); // no resonance: no compensation
+        let peak = level(10.0); // maximum resonance
+        let ratio = peak / flat;
+
+        // This is the NET of the compensation and the filter's own resonant
+        // response — which is what the ear hears, and the reason the number is not
+        // simply 1/sqrt(10) = 0.316: at Q 10 the biquad's ringing raises the impulse
+        // peak by about a third, partly offsetting the make-up.
+        //
+        // What matters is that it lands clearly between the two rejected extremes.
+        // Full 1/Q would net around 0.13 (resonance flattened, the complaint from
+        // #36); no compensation would net around 1.3 (resonance shooting too loud
+        // with several pairs summed, the complaint that prompted this).
+        assert!(
+            (0.25..0.65).contains(&ratio),
+            "expected the middle ground (~0.4 net), got {ratio:.3} \
+             (~0.13 would be full 1/Q, ~1.3 would be none)"
+        );
+    }
+
+    /// Continuous in `Q`, so the resonance knob never steps. The failure this
+    /// guards against is a compensation that switches on at some threshold.
+    #[test]
+    fn the_compensation_is_continuous_across_the_q_range() {
+        let level = |q: f32| -> f32 {
+            let mut d = settled(64, 4);
+            d.set_mix(1.0);
+            d.set_output_filter(20_000.0, q);
+            d.process(1.0);
+            (0..8).map(|_| d.process(0.0)).map(f32::abs).fold(0.0, f32::max)
+        };
+        // Walk the whole range in small steps; no neighbouring pair may jump.
+        let mut prev = level(0.5);
+        let mut q = 0.6;
+        while q <= 10.0 {
+            let cur = level(q);
+            let step = (cur / prev).max(prev / cur);
+            assert!(
+                step < 1.15,
+                "Q {q:.1} stepped by {step:.2}x — the compensation should be smooth"
+            );
+            prev = cur;
+            q += 0.1;
         }
     }
 }
