@@ -318,7 +318,36 @@ cutoff    = 89      # CC value, ~2.5 kHz (the sweep is exponential)
 resonance = 0       # CC value; 0 is the floor, no resonant peak
 ```
 
-Two things worth knowing:
+### Per-song overrides
+
+A song can differ from the show without restating everything — put a `[delay]` in
+its `song.toml` naming only what changes:
+
+```toml
+# songs/ballad/song.toml
+[delay]
+time     = "1/2"
+feedback = 90
+```
+
+Everything not named falls through to `show.toml`. So the show carries "how my
+delay is set up" and a song records only how it *differs*.
+
+This fits how the delay already behaves: its buffer is sized from that song's BPM,
+its divisions are synced to that tempo, and **a song switch replaces the mixer**, so
+the delay resets at a song boundary whether or not you use this table. Per-song
+settings do not introduce that reset — they decide what it resets *to*.
+
+Practical consequence: **live delay tweaks do not survive a song change.** Sweep the
+cutoff during one song and the next starts from its configured values. That is worth
+knowing before it surprises you mid-set, and it is why putting a song's intended
+delay in its `song.toml` is usually better than dialling it in each time.
+
+Song-level settings are re-read when the song is **armed**, so unlike `show.toml`
+they need no restart — see [Reloading after you edit a
+show](#reloading-after-you-edit-a-show).
+
+### Things worth knowing about both
 
 - **The continuous controls are CC values, not percentages or Hz.** That is
   deliberate: a default and a live pedal move then go through the *identical*

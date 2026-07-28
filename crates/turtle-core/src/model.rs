@@ -85,6 +85,43 @@ impl Default for DelayDefaults {
     }
 }
 
+/// A song's `[delay]` table: per-field overrides of the show's defaults (§6).
+///
+/// # Why per-field rather than a whole table
+///
+/// A song that wants a longer delay should write one line, not restate every
+/// setting. Anything left out falls through to `show.toml`, so the show carries
+/// "how my delay is set up" and a song only records how it *differs*.
+///
+/// # Why per-song at all
+///
+/// The delay is already a per-song object in every other respect: its buffer is
+/// sized from that song's BPM, its divisions are synced to that tempo, and a song
+/// switch replaces the whole mixer — so the delay's state resets at a song boundary
+/// whether or not this table exists. Show-level defaults were the odd one out; this
+/// lets each song say what it resets *to*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
+pub struct DelayOverrides {
+    pub time: Option<crate::timing::DelayDivision>,
+    pub feedback: Option<u8>,
+    pub r#return: Option<u8>,
+    pub cutoff: Option<u8>,
+    pub resonance: Option<u8>,
+}
+
+impl DelayOverrides {
+    /// Layer these over the show's defaults, field by field.
+    pub fn applied_to(&self, base: DelayDefaults) -> DelayDefaults {
+        DelayDefaults {
+            time: self.time.unwrap_or(base.time),
+            feedback: self.feedback.unwrap_or(base.feedback),
+            r#return: self.r#return.unwrap_or(base.r#return),
+            cutoff: self.cutoff.unwrap_or(base.cutoff),
+            resonance: self.resonance.unwrap_or(base.resonance),
+        }
+    }
+}
+
 /// Per-pair `dsp_pair{0..=3}_{param}` control-map parameters (§6).
 ///
 /// Lives here, with the rest of the config schema, so `validate` can reject a
@@ -247,6 +284,10 @@ pub struct Song {
     /// Per-pair DSP config, keyed `pair0`, `pair1`, ... (`[dsp.pair0]`).
     #[serde(default)]
     pub dsp: BTreeMap<String, PairDsp>,
+    /// This song's delay settings, overriding the show's field by field (§6).
+    /// Absent means "use the show's".
+    #[serde(default)]
+    pub delay: DelayOverrides,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -682,6 +723,59 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         ] {
             assert!(is_valid_dsp_key(good), "{good} should be accepted");
         }
+    }
+
+    /// A song's `[delay]` overrides the show's field by field: what it names wins,
+    /// what it omits falls through. Restating the whole table to change one value
+    /// would be the wrong ergonomics for the common case (one song wants a longer
+    /// delay).
+    #[test]
+    fn song_delay_overrides_the_show_field_by_field() {
+        let show = DelayDefaults {
+            time: crate::timing::DelayDivision::Quarter,
+            feedback: 64,
+            r#return: 100,
+            cutoff: 89,
+            resonance: 0,
+        };
+
+        // Nothing specified: the show's values, unchanged.
+        assert_eq!(DelayOverrides::default().applied_to(show), show);
+
+        // Two fields specified: those two change, the rest do not.
+        let song: Song = toml::from_str(
+            "[song]\nname=\"b\"\nbpm=90.0\nlength_samples=4\n\n             [delay]\ntime = \"1/2\"\nfeedback = 90\n",
+        )
+        .unwrap();
+        let merged = song.delay.applied_to(show);
+        assert_eq!(merged.time, crate::timing::DelayDivision::Half);
+        assert_eq!(merged.feedback, 90);
+        assert_eq!(merged.r#return, show.r#return, "unspecified fields fall through");
+        assert_eq!(merged.cutoff, show.cutoff);
+        assert_eq!(merged.resonance, show.resonance);
+    }
+
+    /// A song with no `[delay]` at all must behave exactly as before this existed —
+    /// the feature is additive, and every existing song.toml lacks the table.
+    #[test]
+    fn a_song_without_a_delay_table_uses_the_shows_settings() {
+        let song: Song =
+            toml::from_str("[song]\nname=\"a\"\nbpm=120.0\nlength_samples=4\n").unwrap();
+        assert_eq!(song.delay, DelayOverrides::default());
+        let show = DelayDefaults::default();
+        assert_eq!(song.delay.applied_to(show), show);
+    }
+
+    /// A typo'd division in a *song* must be rejected at parse time with the valid
+    /// names, exactly as in show.toml — the same type, so the same error.
+    #[test]
+    fn a_bad_division_in_a_song_is_rejected() {
+        let err = toml::from_str::<Song>(
+            "[song]\nname=\"a\"\nbpm=120.0\nlength_samples=4\n\n[delay]\ntime = \"1/3\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown note division"), "{err}");
     }
 
     #[test]
