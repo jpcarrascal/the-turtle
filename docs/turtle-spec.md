@@ -136,7 +136,11 @@ Shared, once:
   once several pairs were summed into the bus — both were tried on hardware. The
   filter stays live across the whole cutoff range once touched, so the sweep cannot
   step where a bypass would otherwise kick in.
-- **master:** output gain + optional limiter
+- **master:** output gain + optional limiter. The limiter is **linked** across the
+  stereo pair — one gain reduction, detected on the louder channel and applied to
+  both — so heavy limiting changes the level without pulling the image toward the
+  quieter side. Linking is also marginally cheaper than two independent limiters,
+  since the divide and envelope update happen once instead of twice.
 
 Every parameter is driven **only** by a live incoming CC mapping (foot controller /
 expression pedal). No envelopes. Transparent defaults so the chain is inaudible until a

@@ -16,5 +16,5 @@ mod util;
 pub use biquad::{Biquad, FilterType};
 pub use delay::Delay;
 pub use gain::Gain;
-pub use limiter::Limiter;
+pub use limiter::{Limiter, StereoLimiter};
 pub use util::one_pole_coeff;

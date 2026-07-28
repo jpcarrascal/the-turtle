@@ -20,7 +20,7 @@
 //! drives them the mixer is a straight passthrough of the summed stems.
 
 use rtrb::{Consumer, Producer, RingBuffer};
-use turtle_dsp::{one_pole_coeff, Biquad, Delay, FilterType, Gain, Limiter};
+use turtle_dsp::{one_pole_coeff, Biquad, Delay, FilterType, Gain, StereoLimiter};
 
 use turtle_core::model::DelayDefaults;
 use turtle_core::timing::DelayDivision;
@@ -340,12 +340,12 @@ fn silent_gain(sample_rate: f32) -> Gain {
 pub struct Mixer {
     song: PreloadedSong,
     pairs: Vec<PairChain>,
-    // The master limiter is per-channel here. NOTE: this makes the two channels
-    // limit independently (unlinked) — under heavy limiting the stereo image can
-    // shift. A linked stereo limiter (shared gain reduction) is a later refinement;
-    // `turtle-dsp::Limiter` is mono today.
-    limiter_l: Limiter,
-    limiter_r: Limiter,
+    /// **Linked** master limiter: one gain reduction shared by both channels, so
+    /// heavy limiting changes the level without shifting the stereo image. Two
+    /// independent mono limiters used to reduce each channel by whatever it needed
+    /// on its own, which pulls the image toward the quieter side exactly when the
+    /// music is loudest.
+    limiter: StereoLimiter,
     /// The one shared delay every pair sends into (§6).
     delay_bus: DelayBus,
     sample_rate: u32,
@@ -372,8 +372,7 @@ impl Mixer {
             delay_bus: DelayBus::new(song.bpm, sample_rate),
             song,
             pairs,
-            limiter_l: Limiter::default_master(sr),
-            limiter_r: Limiter::default_master(sr),
+            limiter: StereoLimiter::default_master(sr),
             sample_rate,
             pos: 0,
         }
@@ -512,10 +511,9 @@ impl Mixer {
             pair.left.reset();
             pair.right.reset();
         }
-        // `Limiter` is `Copy`, so reassigning a fresh one is the cheapest reset.
+        // `StereoLimiter` is `Copy`, so reassigning a fresh one is the cheapest reset.
         let sr = self.sample_rate as f32;
-        self.limiter_l = Limiter::default_master(sr);
-        self.limiter_r = Limiter::default_master(sr);
+        self.limiter = StereoLimiter::default_master(sr);
     }
 
     /// Render only the delay's tail: no stems, no transport advance (§6).
@@ -532,8 +530,9 @@ impl Mixer {
         let frames = out.len() / 2;
         for f in 0..frames {
             let (wet_l, wet_r) = self.delay_bus.process(0.0, 0.0);
-            out[2 * f] = to_i32(self.limiter_l.process(wet_l));
-            out[2 * f + 1] = to_i32(self.limiter_r.process(wet_r));
+            let (lim_l, lim_r) = self.limiter.process(wet_l, wet_r);
+            out[2 * f] = to_i32(lim_l);
+            out[2 * f + 1] = to_i32(lim_r);
         }
     }
 
@@ -603,8 +602,9 @@ impl Mixer {
             acc_l += wet_l;
             acc_r += wet_r;
             // Master limiter, then map to the device's i32 sample format.
-            out[2 * f] = to_i32(self.limiter_l.process(acc_l));
-            out[2 * f + 1] = to_i32(self.limiter_r.process(acc_r));
+            let (lim_l, lim_r) = self.limiter.process(acc_l, acc_r);
+            out[2 * f] = to_i32(lim_l);
+            out[2 * f + 1] = to_i32(lim_r);
         }
         self.pos += frames as u64;
         // Wrap the transport position too, not just the read index: `position()`
