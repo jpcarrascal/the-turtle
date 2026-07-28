@@ -237,6 +237,9 @@ bpm  = 122.0                   # nominal, for tempo-synced delay
 length_samples = 14112000
 loop = false                   # true = repeat seamlessly until stopped (§14)
 
+[delay]                        # optional: overrides show.toml's [delay], field by
+time = "1/2"                   # field. Anything omitted falls through to the show.
+
 [[pairs]]
 index = 0
 file  = "stems/pair1.wav"

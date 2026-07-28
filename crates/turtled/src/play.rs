@@ -58,9 +58,10 @@ pub fn load_playable(bundle: &Path, song: Option<&str>) -> Result<Playable, Stri
         stems::load_song(&song, &song_dir, rate).map_err(|e| format!("stems: {e}"))?;
     let frames = preloaded.frames as u64;
     let mut mixer = Mixer::new(preloaded, rate);
-    // The show's `[delay]` table, if it has one; otherwise this re-applies the same
-    // built-in defaults the mixer already has (§6).
-    mixer.apply_delay_defaults(&show.delay);
+    // The song's `[delay]` layered over the show's, field by field (§6). This runs
+    // on every load — including the background load behind a song switch — which is
+    // what makes per-song settings work with no extra plumbing.
+    mixer.apply_delay_defaults(&song.delay.applied_to(show.delay));
 
     // Apply each pair's fixed filter topology from song.toml's `[dsp.pairN]`
     // (§6); live CC then drives cutoff/resonance within that topology. Keys
@@ -477,6 +478,66 @@ mod tests {
         let scheds = load_schedulers(&show, &dir.join("songs/opener"), 48_000);
         assert_eq!(scheds.len(), 1);
         assert!(scheds[0].is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End to end through the real loader: a song's `[delay]` reaches the mixer.
+    ///
+    /// The model tests cover the merge arithmetic; this covers the wiring, which is
+    /// the part that would silently do nothing if `load_playable` read the wrong
+    /// table. It matters more than it looks: the same call runs behind a song
+    /// SWITCH, so this is also what makes each song arrive with its own delay.
+    #[test]
+    fn a_songs_delay_table_reaches_the_mixer() {
+        let dir = write_bundle(64);
+        let song_toml = dir.join("songs/opener/song.toml");
+        let base = std::fs::read_to_string(&song_toml).unwrap();
+
+        // Without a [delay] table: the show's default division (a quarter).
+        let quarter = load_playable(&dir, None).unwrap();
+        let at_120 = turtle_core::timing::DelayDivision::Quarter.to_samples(120.0, 48_000);
+
+        // With one: the song's division wins.
+        std::fs::write(&song_toml, format!("{base}\n[delay]\ntime = \"1/2\"\n")).unwrap();
+        let half = load_playable(&dir, None).unwrap();
+
+        // Compare the delay buffers' capacities as a proxy for "the settings landed":
+        // both are sized from the longest division, so instead compare what the delay
+        // actually does — render an impulse and find the echo.
+        let echo_offset = |mut p: Playable| -> usize {
+            p.mixer.set_dsp_param(0, crate::control_map::DspParam::Send, 100);
+            p.mixer
+                .set_dsp_param(0, crate::control_map::DspParam::DelayReturn, 100);
+            p.mixer
+                .set_dsp_param(0, crate::control_map::DspParam::DelayFeedback, 0);
+            p.mixer
+                .set_dsp_param(0, crate::control_map::DspParam::DelayCutoff, 127);
+            let frames = 120_000usize;
+            let mut out = vec![0i32; frames * 2];
+            p.mixer.render(&mut out);
+            out.iter()
+                .step_by(2)
+                .enumerate()
+                .skip(2_000)
+                .max_by_key(|(_, v)| v.abs())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+
+        let without = echo_offset(quarter);
+        let with = echo_offset(half);
+        assert!(
+            with > without,
+            "the song's 1/2 should delay longer than the show's 1/4: {without} then {with}"
+        );
+        // And it is the *right* longer: a half note is twice a quarter.
+        assert!(
+            (with as f64 / without as f64 - 2.0).abs() < 0.15,
+            "expected roughly 2x ({} vs {}), quarter at 120 BPM is {at_120}",
+            with,
+            without
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
