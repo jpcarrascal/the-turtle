@@ -626,6 +626,76 @@ sudo systemctl stop turtled
 ./target/release/turtled control /media/shows/Tone.turtle -v
 ```
 
+### Putting the shows on an external drive
+
+§2 puts stems on a USB SSD, and `turtled.service` is already set up for it:
+`RequiresMountsFor=/media/shows` makes systemd wait for whatever mount covers that
+path and refuse to start with a clear dependency error if it is missing — far better
+than starting and failing on a missing stem. All that is left is mounting the drive
+somewhere stable.
+
+**Mount by UUID, not by `/dev/sda1`.** This is the same trap as ALSA card indices:
+`/dev/sda1` is an enumeration-order name, so plugging in a second USB device — or
+just booting in a different order — can move it. A filesystem UUID never moves.
+
+```bash
+lsblk -f                       # find the partition and copy its UUID
+```
+
+```bash
+# /etc/fstab — one line
+UUID=1234-5678  /media/shows  exfat  ro,nofail,x-systemd.device-timeout=10,uid=turtle  0  0
+```
+
+```bash
+sudo mkdir -p /media/shows
+sudo systemctl daemon-reload   # fstab changes need this before mounting
+sudo mount -a
+turtle doctor /media/shows/YourShow.turtle
+```
+
+Each option earns its place:
+
+- **`ro`** — the daemon only ever *reads* stems, so mounting read-only means a
+  yanked power cord mid-set cannot corrupt the filesystem. That is §12's whole
+  concern, and it costs nothing because nothing on the Pi writes here.
+- **`nofail`** — without it, a missing or dead drive hangs the *boot*. With it, the
+  Pi boots normally and only `turtled` fails, which is the failure you want: visible,
+  contained, and explained by `systemctl status`.
+- **`x-systemd.device-timeout=10`** — the default wait is 90 seconds. Ten is plenty
+  for a drive that is actually plugged in.
+
+**Which filesystem?** You author bundles on a Mac, so:
+
+- **exFAT** — macOS reads and writes it natively. No journal, so it is the more
+  fragile format in principle — but the Pi mounts it `ro` and never writes, so the
+  only risk is on the Mac while copying, where you can see what is happening.
+- **ext4** — journaled and more robust, but macOS cannot write it without
+  third-party software, which makes updating a show a chore.
+
+exFAT is the pragmatic choice here, precisely *because* the Pi never writes to it.
+
+**To update a show**, either take the drive to the Mac, or remount briefly:
+
+```bash
+sudo systemctl stop turtled
+sudo mount -o remount,rw /media/shows
+# ... edit ...
+sudo mount -o remount,ro /media/shows
+sudo systemctl start turtled
+```
+
+Then point `ExecStart` at the bundle on the drive (`sudo systemctl edit --full
+turtled`):
+
+```
+ExecStart=/usr/local/bin/turtled control /media/shows/YourShow.turtle
+```
+
+> The read-only rootfs (below) is independent of this. That protects the SD card;
+> this protects the drive holding your stems. Both are worth having, and neither
+> depends on the other.
+
 ### Going from "running it by hand" to installed
 
 If you have been testing with `./target/release/turtled ...` from the repo, this is
