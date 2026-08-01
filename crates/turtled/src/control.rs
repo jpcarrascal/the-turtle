@@ -109,6 +109,10 @@ struct LoadedSong {
     /// Whether the incoming song loops (§14) — same reason as `frames`: it is a
     /// property of the song, so it has to travel with it across a switch.
     looping: bool,
+    /// The incoming song's nominal tempo, for the clock probe (§5). Per-song like
+    /// `frames` and `looping`, and for the same reason: a switch must change it or
+    /// the clock keeps running at the previous song's tempo.
+    bpm: f64,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -124,6 +128,7 @@ fn load_song_payload(
     let schedulers = crate::play::load_schedulers(&p.show, &p.song_dir, rate);
     Ok(LoadedSong {
         looping: p.mixer.is_looping(),
+        bpm: p.mixer.bpm(),
         mixer: p.mixer,
         schedulers,
         frames: p.frames,
@@ -204,6 +209,7 @@ pub fn run(
     // signature cannot see the short `sched` path.
     tuning: crate::sched::Tuning,
     wait_devices: std::time::Duration,
+    clock_probe: bool,
 ) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
@@ -258,6 +264,9 @@ pub fn run(
     // both must change when a song does, or `turtle status` describes the
     // previous song.
     let mut looping = mixer.is_looping();
+    // The clock probe, when `--clock-probe` asked for it (§5). `None` in a show:
+    // it logs, and logging from this SCHED_FIFO loop is a diagnostic, not a feature.
+    let mut probe = clock_probe.then(|| crate::clock_probe::ClockProbe::new(mixer.bpm(), rate));
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -566,6 +575,9 @@ pub fn run(
                             // moved out of `loaded` below.
                             duration_s = loaded.frames as f64 / rate as f64;
                             looping = loaded.looping;
+                            if let Some(p) = probe.as_mut() {
+                                p.retempo(loaded.bpm);
+                            }
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -655,6 +667,9 @@ pub fn run(
                             if let Some(held) = held_next.take() {
                                 duration_s = held.frames as f64 / rate as f64;
                                 looping = held.looping;
+                                if let Some(p) = probe.as_mut() {
+                                    p.retempo(held.bpm);
+                                }
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -695,6 +710,11 @@ pub fn run(
                                 pos_adj as f64 / rate as f64
                             );
                         }
+                    }
+                }
+                if let Some(p) = probe.as_mut() {
+                    if let Some(line) = p.tick(pos) {
+                        println!("{line}");
                     }
                 }
                 pos

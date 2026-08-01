@@ -37,6 +37,7 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod alsa_backend;
 mod clock;
+mod clock_probe;
 mod control;
 mod control_map;
 mod engine;
@@ -75,8 +76,9 @@ fn main() -> ExitCode {
                 "       turtled play <bundle> [song] [-v]      play a song to the device (Linux)"
             );
             eprintln!("       turtled control <bundle> [song] [-v]   drive playback from MIDI + socket (Linux)");
+            eprintln!("  -v, --verbose        log each dispatched MIDI event (bring-up diagnostics)");
             eprintln!(
-                "  -v, --verbose        log each dispatched MIDI event (bring-up diagnostics)"
+                "  --clock-probe        measure MIDI-clock pulse jitter and log it (sends nothing)"
             );
             eprintln!(
                 "  --socket <path>      control socket to bind (control only; default $TURTLE_SOCKET,"
@@ -128,6 +130,10 @@ struct CmdOpts {
     /// How long to wait for the audio/MIDI devices to appear before giving up
     /// (§12). `0` restores the old fail-immediately behaviour.
     wait_devices: std::time::Duration,
+    /// Measure MIDI-clock pulse jitter and log it, sending nothing (§5). A
+    /// diagnostic for deciding whether clock can be dispatched from the ~1 ms
+    /// control loop or needs its own thread — see [`crate::clock_probe`].
+    clock_probe: bool,
 }
 
 /// How the audio thread's CPU is chosen.
@@ -191,9 +197,11 @@ impl CmdOpts {
         // placement to the scheduler (§12).
         let mut audio_cpu = CpuChoice::Auto;
         let mut wait_devices = retry::DEFAULT_WAIT;
+        let mut clock_probe = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-v" | "--verbose" => verbose = true,
+                "--clock-probe" => clock_probe = true,
                 // Consumes the next arg as its value; a trailing `--socket`
                 // with nothing after it is a usage error, not a silent default.
                 "--socket" | "-s" => {
@@ -235,6 +243,7 @@ impl CmdOpts {
             rt_priority,
             audio_cpu,
             wait_devices,
+            clock_probe,
         })
     }
 }
@@ -269,6 +278,7 @@ fn control_command(opts: CmdOpts) -> ExitCode {
             std::path::Path::new(&socket),
             tuning,
             opts.wait_devices,
+            opts.clock_probe,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -279,7 +289,8 @@ fn control_command(opts: CmdOpts) -> ExitCode {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&bundle, &opts.song, opts.verbose, &socket, tuning, opts.wait_devices);
+        let _ =
+            (&bundle, &opts.song, opts.verbose, &socket, tuning, opts.wait_devices, opts.clock_probe);
         eprintln!(
             "control requires Linux/ALSA (this host is {})",
             std::env::consts::OS
