@@ -15,6 +15,11 @@ use crate::mixer::Mixer;
 /// play/pause flag; the sample position lives in the [`Mixer`] (§3.1).
 pub struct RtAudio {
     playing: bool,
+    /// Active section as of the last check, so [`check_section`] can spot a switch
+    /// the mixer made on its own at a boundary.
+    ///
+    /// [`check_section`]: RtAudio::check_section
+    last_section: usize,
     /// Whether `EndReached` has already been reported for the current run
     /// (since `Start`/`Seek`), so a finished-but-not-yet-stopped mixer
     /// doesn't spam the event queue every period while the control thread's
@@ -31,6 +36,7 @@ impl Default for RtAudio {
     fn default() -> Self {
         RtAudio {
             playing: false,
+            last_section: 0,
             reported_end: false,
             last_pos: 0,
         }
@@ -64,6 +70,20 @@ impl RtAudio {
             }
             RtCommand::ToggleMute(pair) => mixer.toggle_pair_mute(pair),
             RtCommand::SetDsp(pair, param, value) => mixer.set_dsp_param(pair, param, value),
+            RtCommand::SelectSection(index) => {
+                if self.playing {
+                    // Mid-playback a jump would be audible, so it waits for the
+                    // boundary (§4.1).
+                    mixer.queue_section(index);
+                } else {
+                    // Stopped, the note chooses where Start will come in from.
+                    mixer.select_section(index);
+                    // That resets the position; without re-baselining, the next
+                    // tick would read the drop to 0 as a loop wrap and rewind
+                    // every MIDI cursor.
+                    self.last_pos = mixer.position();
+                }
+            }
             RtCommand::ClearDelay => mixer.clear_delay(),
         }
     }
@@ -84,6 +104,31 @@ impl RtAudio {
         let wrapped = self.playing && pos < self.last_pos;
         self.last_pos = pos;
         wrapped
+    }
+
+    /// Re-baseline the section watermark after a song swap, without reporting.
+    ///
+    /// A new song starts at its first section, and the control thread already knows
+    /// the new song's sections from the load — so reporting here would be a
+    /// duplicate at best, and at worst arrive with the *previous* song's names still
+    /// in hand.
+    pub fn resync_section(&mut self, mixer: &Mixer) {
+        self.last_section = mixer.active_section();
+    }
+
+    /// Did the active section just change (§4.1)? Reports once per change.
+    ///
+    /// Polled rather than returned from the switch itself because the switch
+    /// happens deep inside `render`, per frame, on the audio thread — handing an
+    /// event out from there would mean threading a producer into the DSP loop.
+    pub fn check_section(&mut self, mixer: &Mixer) -> Option<usize> {
+        let now = mixer.active_section();
+        if now != self.last_section {
+            self.last_section = now;
+            Some(now)
+        } else {
+            None
+        }
     }
 
     pub fn check_end(&mut self, mixer: &Mixer) -> bool {
@@ -161,6 +206,7 @@ pub fn run_audio(
         // not the one it's replacing. At most one is ever queued in practice.
         while let Ok(new_mixer) = song_rx.pop() {
             *mixer = new_mixer;
+            rt.resync_section(mixer);
         }
 
         // Drain every queued command. `pop()` is `Err` when the queue is empty,
@@ -175,6 +221,10 @@ pub fn run_audio(
 
         if rt.check_loop(mixer) {
             let _ = events.push(crate::engine::RtEvent::Looped);
+        }
+
+        if let Some(index) = rt.check_section(mixer) {
+            let _ = events.push(crate::engine::RtEvent::SectionChanged { index });
         }
 
         if rt.check_end(mixer) {
@@ -326,6 +376,78 @@ mod tests {
             rt.step(&mut m, &mut out);
         }
         assert_eq!(m.position(), pos, "a tail must not advance the transport");
+    }
+
+    /// Build a two-section song for the switching tests: "a" then "b", both looping.
+    fn two_section_mixer(frames: usize) -> Mixer {
+        let sections = vec![
+            PreloadedSection::new(
+                "a".into(),
+                vec![StemPair { index: 0, samples: vec![0.5; frames * 2], frames }],
+                true,
+            ),
+            PreloadedSection::new(
+                "b".into(),
+                vec![StemPair { index: 0, samples: vec![0.25; frames * 2], frames }],
+                true,
+            ),
+        ];
+        Mixer::new(
+            PreloadedSong { name: "t".into(), sample_rate: 48_000, sections, bpm: 120.0 },
+            48_000,
+        )
+    }
+
+    /// While playing, a section note queues; while stopped, it selects the entry
+    /// point. Same command, and the split is made here because this is where the
+    /// transport flag lives (§4.1).
+    #[test]
+    fn a_section_command_queues_while_playing_and_selects_while_stopped() {
+        let mut m = two_section_mixer(4);
+        let mut rt = RtAudio::new();
+
+        // Stopped: applies at once, so Start comes in from section b.
+        rt.apply(&mut m, RtCommand::SelectSection(1));
+        assert_eq!(m.section_name(), "b");
+        assert!(m.queued_section_name().is_none());
+
+        // Playing: queues instead, so the switch waits for the boundary.
+        rt.apply(&mut m, RtCommand::Start);
+        rt.apply(&mut m, RtCommand::SelectSection(0));
+        assert_eq!(m.section_name(), "b", "no jump mid-playback");
+        assert_eq!(m.queued_section_name(), Some("a"));
+    }
+
+    /// Selecting while stopped moves the position to 0, which looks exactly like a
+    /// loop wrap. Reporting it as one would rewind every MIDI cursor spuriously.
+    #[test]
+    fn selecting_a_section_while_stopped_is_not_reported_as_a_loop() {
+        let mut m = two_section_mixer(8);
+        let mut rt = RtAudio::new();
+        let mut out = [0i32; 4 * 2];
+
+        rt.apply(&mut m, RtCommand::Start);
+        rt.step(&mut m, &mut out);
+        assert!(!rt.check_loop(&m));
+        rt.apply(&mut m, RtCommand::Stop);
+        rt.apply(&mut m, RtCommand::SelectSection(1));
+        assert!(!rt.check_loop(&m), "an entry-point change is not a wrap");
+    }
+
+    /// A switch has to reach the control thread: section lengths and loop flags
+    /// differ, so `turtle status` would otherwise describe the wrong one.
+    #[test]
+    fn a_section_switch_is_reported_once() {
+        let mut m = two_section_mixer(4);
+        let mut rt = RtAudio::new();
+        let mut out = [0i32; 4 * 2];
+
+        rt.apply(&mut m, RtCommand::Start);
+        assert_eq!(rt.check_section(&m), None, "no switch yet");
+        rt.apply(&mut m, RtCommand::SelectSection(1));
+        rt.step(&mut m, &mut out);
+        assert_eq!(rt.check_section(&m), Some(1), "the switch reports");
+        assert_eq!(rt.check_section(&m), None, "and not again on the same section");
     }
 
     #[test]

@@ -237,6 +237,15 @@ pub struct Control {
     pub panic: Binding,
     /// Per-pair mute toggles: a single `notes = [..]` binding.
     pub mute: Binding,
+    /// Section triggers (§4.1): one `notes = [..]` binding whose *position* in the
+    /// list is the section index — note 0 selects section 0, and so on. Same shape
+    /// as `mute` on purpose, so there is one mechanism rather than two.
+    ///
+    /// Optional: a show whose songs have no sections needs no binding, and notes
+    /// past a song's section count are ignored rather than an error, exactly as an
+    /// unmapped mute note is.
+    #[serde(default)]
+    pub sections: Option<Binding>,
     /// Remaining `dsp_*` CC bindings, keyed by their TOML key.
     #[serde(flatten)]
     pub dsp: BTreeMap<String, Binding>,
@@ -450,6 +459,14 @@ impl Show {
         self.control.prev.check("control.prev", &mut p);
         self.control.panic.check("control.panic", &mut p);
         self.control.mute.check("control.mute", &mut p);
+        if let Some(b) = &self.control.sections {
+            b.check("control.sections", &mut p);
+            // A single `note` would bind every section to one trigger, which cannot
+            // be what was meant — the index comes from the position in `notes`.
+            if b.notes.is_none() {
+                p.push("control.sections: needs `notes = [..]`, one note per section".into());
+            }
+        }
         for (key, b) in &self.control.dsp {
             b.check(key, &mut p);
             // An unknown `dsp_*` key is rejected rather than ignored. Silently

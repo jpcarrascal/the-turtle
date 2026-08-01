@@ -117,6 +117,28 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
     control.mute.notes.as_ref()?.iter().position(|&n| n == d1)
 }
 
+/// Decode a note-on against the `sections` binding, returning the section index
+/// (the note's position in `sections.notes`) if it matches (§4.1).
+///
+/// Same shape as [`decode_mute`], but gated by `transport_channel`: choosing what
+/// plays next is a transport gesture, not a mixing one, and it will usually come
+/// from the same pedal as start/stop. Whether the index actually exists in the
+/// current song is the mixer's business — a note past the section count is ignored
+/// there, so remapping a controller never has to match the shortest song.
+pub fn decode_section(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usize> {
+    if status & 0xF0 != 0x90 || d2 == 0 {
+        return None;
+    }
+    if !channel_matches(control.transport_channel, midi_channel(status)) {
+        return None;
+    }
+    let binding = control.sections.as_ref()?;
+    if binding.kind != BindingKind::Note {
+        return None;
+    }
+    binding.notes.as_ref()?.iter().position(|&n| n == d1)
+}
+
 /// Decode an incoming CC against every `[control]` `dsp_*` binding, returning
 /// every `(pair, param, raw 0..=127 value)` it drives. More than one binding
 /// can share a CC number — e.g. mapping the same pedal to `dsp_pair0_send`
@@ -432,4 +454,28 @@ dsp_pair0_cutoff = { type = "cc", cc = 20 }
         }
         assert_eq!(parse_dsp_key("dsp_cutoff"), None); // global-style key, no pair
     }
+    /// A section note decodes to its POSITION in `notes`, not the note number —
+    /// the same rule as mute, so one mechanism covers both.
+    #[test]
+    fn decodes_section_notes_to_a_section_index() {
+        let toml = format!("{SHOW}sections = {{ type = \"note\", notes = [76, 77, 78] }}\n");
+        let c = Show::from_toml_str(&toml).unwrap().control;
+        assert_eq!(decode_section(&c, 0x90, 76, 100), Some(0));
+        assert_eq!(decode_section(&c, 0x90, 78, 100), Some(2));
+        // Unmapped note, note-off, and a wrong status all decline.
+        assert_eq!(decode_section(&c, 0x90, 99, 100), None);
+        assert_eq!(decode_section(&c, 0x90, 76, 0), None, "note-off is not a trigger");
+        assert_eq!(decode_section(&c, 0x80, 76, 100), None);
+        // And it must not also read as a transport command.
+        assert_eq!(decode(&c, 0x90, 76, 100), None);
+    }
+
+    /// No `sections` binding at all is the normal case for a show whose songs have
+    /// no sections — it must decline quietly, not panic.
+    #[test]
+    fn a_show_without_a_sections_binding_decodes_nothing() {
+        let c = control();
+        assert_eq!(decode_section(&c, 0x90, 76, 100), None);
+    }
+
 }

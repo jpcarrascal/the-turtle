@@ -394,6 +394,7 @@ mod tests {
         Status {
             bundle: Some("/media/shows/Test.turtle".into()),
             looping: false,
+            section: None,
             show: "Tone".into(),
             state: State::Armed,
             song: Some("tone".into()),

@@ -65,6 +65,11 @@ pub fn print_status(s: &Status) {
     } else {
         println!("song:   {song}");
     }
+    // Under the song, since a section belongs to one — and only when the song has
+    // sections, so an ordinary song's status is unchanged (§4.1).
+    if let Some(section) = &s.section {
+        println!("part:   {section}");
+    }
     if let Some(next) = &s.armed_next {
         println!("next:   {next}");
     }

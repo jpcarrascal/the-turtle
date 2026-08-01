@@ -28,6 +28,13 @@ pub enum RtCommand {
     /// Set a live DSP param on pair `index` to the raw `0..=127` CC value
     /// (§6), independent of transport state.
     SetDsp(usize, DspParam, u8),
+    /// Select section `index` (§4.1): queued to take over at the active section's
+    /// next boundary while playing, applied immediately while stopped.
+    ///
+    /// The playing/stopped split is made on the audio thread, in `RtAudio::apply`,
+    /// because that is where the transport flag lives — the control thread's state
+    /// machine and the audio thread's `playing` can differ for a period or two.
+    SelectSection(usize),
     /// Silence the delay bus immediately, discarding whatever tail is ringing.
     ///
     /// Sent on `Action::Panic`, which is reached both by a **second Stop** and by
@@ -57,6 +64,13 @@ pub enum RtEvent {
     /// **on the RT thread**, which must not allocate (§3) — formatting is the
     /// control thread's job.
     AudioFailed { errno: i32 },
+    /// The active section changed (§4.1): a queued section took over at the
+    /// boundary, or a note picked an entry point while stopped.
+    ///
+    /// The control thread needs it because section lengths and `loop` flags differ,
+    /// so `turtle status`'s duration and looping flag would otherwise keep
+    /// describing whichever section the song was armed with.
+    SectionChanged { index: usize },
     /// A looping song just wrapped past its end back to the start (§14).
     ///
     /// The control thread reseeks every MIDI scheduler's cursor: they hold an
@@ -86,6 +100,8 @@ pub enum Decoded {
     Mute(usize),
     /// Moved a live DSP parameter on a pair.
     Dsp(usize, DspParam, u8),
+    /// Selected a section (§4.1) — queued or immediate depending on the transport.
+    Section(usize),
     /// A transport command (§8).
     Transport(Command),
 }
@@ -99,6 +115,7 @@ impl std::fmt::Display for Decoded {
             Decoded::Dsp(pair, param, value) => {
                 write!(f, "dsp pair{pair} {} = {value}", format!("{param:?}").to_lowercase())
             }
+            Decoded::Section(index) => write!(f, "section {index}"),
             Decoded::Transport(cmd) => write!(f, "{}", format!("{cmd:?}").to_lowercase()),
         }
     }
@@ -173,6 +190,13 @@ impl Engine {
         if let Some(pair) = control_map::decode_mute(&self.control, status, d1, d2) {
             self.last_decoded.push(Decoded::Mute(pair));
             return vec![RtCommand::ToggleMute(pair)];
+        }
+        // Like mute, this bypasses the transport state machine: a section note is
+        // valid in every state, and what it *means* (queue vs. select an entry
+        // point) is decided on the audio thread where the transport flag lives.
+        if let Some(index) = control_map::decode_section(&self.control, status, d1, d2) {
+            self.last_decoded.push(Decoded::Section(index));
+            return vec![RtCommand::SelectSection(index)];
         }
         let dsp = control_map::decode_dsp(&self.control, status, d1, d2);
         if !dsp.is_empty() {

@@ -152,6 +152,12 @@ pub struct Status {
     /// and "the song is over" mean different things.
     #[serde(default)]
     pub looping: bool,
+    /// The section currently playing (§4.1), as `"chorus (2/3)"`.
+    ///
+    /// `None` for a song without `[[sections]]`, which is every song that predates
+    /// them — so an older bundle reports exactly what it used to.
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 /// Where a command came from, for `monitor`.
@@ -309,6 +315,7 @@ mod tests {
             show: "Tone".into(),
             bundle: Some("/media/shows/Tone.turtle".into()),
             looping: false,
+            section: None,
             state: State::Playing,
             song: Some("tone".into()),
             armed_next: None,

@@ -355,6 +355,12 @@ pub struct Mixer {
     /// Which section is playing (§14). Always a valid index: `PreloadedSong` always
     /// has at least one section.
     active: usize,
+    /// A section waiting to take over at the active section's next boundary (§4.1).
+    ///
+    /// The switch happens *here*, on the audio thread, rather than on the control
+    /// thread reacting to a wrap event: the event is reported after the wrap, so a
+    /// control-thread swap would land a period or two late and stutter the downbeat.
+    queued: Option<usize>,
 }
 
 impl Mixer {
@@ -381,6 +387,7 @@ impl Mixer {
             delay_bus: DelayBus::new(song.bpm, sample_rate),
             // Playback starts at the first section unless one is selected (§14).
             active: 0,
+            queued: None,
             song,
             pairs,
             limiter: StereoLimiter::default_master(sr),
@@ -389,10 +396,56 @@ impl Mixer {
         }
     }
 
+    /// Queue `index` to take over at the active section's next boundary (§4.1).
+    ///
+    /// Last one wins, with no special cases: queueing while something is already
+    /// queued replaces it, and queueing the section already playing is how you
+    /// cancel — at the boundary it does exactly what looping would have done.
+    /// An index the current song does not have is ignored, so one `[control]`
+    /// binding can cover every song in a show.
+    pub fn queue_section(&mut self, index: usize) {
+        if index < self.song.sections.len() {
+            self.queued = Some(index);
+        }
+    }
+
+    /// Switch to `index` immediately, from the top (§4.1).
+    ///
+    /// For choosing an entry point while stopped — mid-playback this would be an
+    /// audible jump, which is what [`queue_section`](Self::queue_section) exists to
+    /// avoid.
+    pub fn select_section(&mut self, index: usize) {
+        if index < self.song.sections.len() {
+            self.active = index;
+            self.queued = None;
+            self.pos = 0;
+        }
+    }
+
+    /// The name of the section waiting to take over, if any — for `turtle status`.
+    pub fn queued_section_name(&self) -> Option<&str> {
+        self.queued.map(|i| self.song.sections[i].name.as_str())
+    }
+
+    /// The active section's index, so the control thread can track switches.
+    pub fn active_section(&self) -> usize {
+        self.active
+    }
+
     /// The section currently playing (§14).
     #[inline]
     fn section(&self) -> &crate::stems::PreloadedSection {
         &self.song.sections[self.active]
+    }
+
+    /// Every section as `(name, frames, looping)`, for the control thread to keep
+    /// `turtle status` honest across a switch without reaching into the mixer.
+    pub fn section_summary(&self) -> Vec<(String, u64, bool)> {
+        self.song
+            .sections
+            .iter()
+            .map(|s| (s.name.clone(), s.frames as u64, s.looping))
+            .collect()
     }
 
     /// The active section's name, for `turtle status` and logs.
@@ -533,7 +586,12 @@ impl Mixer {
         // A looping song never finishes, which is what stops `EndReached` firing
         // and therefore what stops the gapless auto-advance (§8) from carrying the
         // setlist forward. Stop is the only way out, by design.
-        !self.section().looping && self.pos >= self.section().frames as u64
+        // A queued section means there IS more to play: a non-looping section with
+        // something queued hands over at its end instead of ending the song, which
+        // is what makes a one-shot intro work.
+        !self.section().looping
+            && self.queued.is_none()
+            && self.pos >= self.section().frames as u64
     }
 
     /// Jump to `pos` (rewind / restart) and clear DSP tails.
@@ -593,19 +651,9 @@ impl Mixer {
     /// gap. Doing it here costs a compare and a subtract per frame.
     pub fn render(&mut self, out: &mut [i32]) {
         let frames = out.len() / 2;
-        // 0 when not looping, which turns the wrap below into a never-taken branch.
-        let wrap_at = if self.section().looping { self.section().frames as u64 } else { 0 };
         for f in 0..frames {
-            let raw = self.pos + f as u64;
-            // `pos` is kept below `wrap_at` at the end of this function, so a
-            // single subtraction covers any song at least one period long. The
-            // modulo is the fallback for a song shorter than one buffer, which is
-            // degenerate but should still loop rather than misbehave.
-            let frame_idx = if wrap_at != 0 && raw >= wrap_at {
-                if raw < wrap_at * 2 { raw - wrap_at } else { raw % wrap_at }
-            } else {
-                raw
-            };
+            self.cross_section_boundary();
+            let frame_idx = self.pos;
             // Sum every pair's contribution for this frame.
             let mut acc_l = 0.0f32;
             let mut acc_r = 0.0f32;
@@ -643,15 +691,47 @@ impl Mixer {
             let (lim_l, lim_r) = self.limiter.process(acc_l, acc_r);
             out[2 * f] = to_i32(lim_l);
             out[2 * f + 1] = to_i32(lim_r);
+            // Advancing per frame — rather than adding `frames` at the end — is
+            // what keeps `pos` meaningful *inside* this loop, so the boundary check
+            // above sees the true position of each sample. `position()` therefore
+            // also stays within the active section, which is what the clock and the
+            // MIDI scheduler want: past the end they would never fire again.
+            self.pos += 1;
         }
-        self.pos += frames as u64;
-        // Wrap the transport position too, not just the read index: `position()`
-        // feeds the clock and `turtle status`, so letting it run past the song
-        // length would report a position beyond the duration and stop the MIDI
-        // scheduler from ever re-firing the loop's events.
-        if wrap_at != 0 && self.pos >= wrap_at {
-            self.pos %= wrap_at;
+        // Once more for the final frame's advance, so `position()` is already
+        // normalised when the control thread reads it between periods rather than
+        // briefly reporting a position equal to the section length.
+        self.cross_section_boundary();
+    }
+
+    /// Apply the section boundary if `pos` has reached the end of the active
+    /// section (§4.1): hand over to a queued section, else wrap if it loops, else
+    /// leave `pos` past the end for `is_finished` to report.
+    ///
+    /// Called per frame — not per buffer — which is what lets a switch or a wrap
+    /// land on the exact sample rather than being quantised to the period. At 1024
+    /// frames that is 21 ms, easily audible as a gap or a late downbeat. The cost
+    /// is a compare per frame on the common path.
+    #[inline]
+    fn cross_section_boundary(&mut self) {
+        let end = self.section().frames as u64;
+        if end == 0 || self.pos < end {
+            return;
         }
+        if let Some(next) = self.queued.take() {
+            // A queued section takes over at the boundary whether the active one
+            // loops or not: one rule, so a `loop = false` section is "play once,
+            // then hand over" for free.
+            self.active = next;
+            self.pos = 0;
+        } else if self.section().looping {
+            // A single subtraction covers any section at least one period long;
+            // the modulo is the fallback for a section shorter than one buffer,
+            // which is degenerate but should still loop.
+            self.pos = if self.pos < end * 2 { self.pos - end } else { self.pos % end };
+        }
+        // Otherwise: past the end, not looping, nothing queued. `is_finished`
+        // reports it and the stem reads fall off the end into silence.
     }
 }
 
@@ -1397,6 +1477,141 @@ mod tests {
             m.render(&mut out);
             assert!(!m.is_finished(), "a looping section never finishes");
         }
+    }
+
+    /// A section note that arrives in the gap between a one-shot section running
+    /// out and the transport actually stopping must still be honoured: the song is
+    /// only over when nothing is waiting to play.
+    #[test]
+    fn queueing_after_a_section_has_run_out_rescues_the_song() {
+        let intro = PreloadedSection::new("intro".into(), vec![pair(0, vec![0.5; 8])], false);
+        let verse = PreloadedSection::new("verse".into(), vec![pair(0, vec![0.25; 8])], true);
+        let mut m = Mixer::new(sectioned(vec![intro, verse]), 48_000);
+
+        let mut out = vec![0i32; 4 * 2];
+        m.render(&mut out);
+        assert!(m.is_finished(), "the one-shot section ran out");
+
+        // The note lands after the end but before the transport has stopped.
+        m.queue_section(1);
+        assert!(!m.is_finished(), "something is queued, so the song is not over");
+        m.render(&mut out);
+        assert_eq!(m.section_name(), "verse", "and it takes over on the next period");
+    }
+
+    // ---- section switching (§4.1) ----
+
+    /// The whole point: a queued section takes over at the boundary, not before —
+    /// and the seam lands mid-buffer, on the exact sample, not at a period edge.
+    #[test]
+    fn a_queued_section_takes_over_at_the_boundary_mid_buffer() {
+        // Section a: 4 frames of 0.5, looping. Section b: 4 frames of 0.25.
+        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 8])], true);
+        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.25; 8])], true);
+        let mut m = Mixer::new(sectioned(vec![a, b]), 48_000);
+        m.queue_section(1);
+
+        // Render 6 frames: 4 of section a, then 2 of section b — the switch has to
+        // land inside this buffer, which is what makes it sample-accurate.
+        let mut out = vec![0i32; 6 * 2];
+        m.render(&mut out);
+        let left: Vec<i32> = out.iter().step_by(2).copied().collect();
+        for (i, v) in left.iter().enumerate().take(4) {
+            assert!((v - to_i32(0.5)).abs() < 16, "frame {i} should still be section a: {v}");
+        }
+        for (i, v) in left.iter().enumerate().skip(4) {
+            assert!((v - to_i32(0.25)).abs() < 16, "frame {i} should be section b: {v}");
+        }
+        assert_eq!(m.section_name(), "b");
+        assert_eq!(m.position(), 2, "position restarts inside the new section");
+        assert!(m.queued_section_name().is_none(), "the queue clears after a switch");
+    }
+
+    /// Last one wins, with no special case: the most recent note is the one that
+    /// happens, and re-queueing the playing section is how you cancel.
+    #[test]
+    fn the_last_queued_section_wins_and_requeueing_the_active_one_cancels() {
+        let sections = vec![
+            PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 8])], true),
+            PreloadedSection::new("b".into(), vec![pair(0, vec![0.25; 8])], true),
+            PreloadedSection::new("c".into(), vec![pair(0, vec![0.125; 8])], true),
+        ];
+        let mut m = Mixer::new(sectioned(sections), 48_000);
+        m.queue_section(1);
+        m.queue_section(2);
+        assert_eq!(m.queued_section_name(), Some("c"), "the later note replaces the earlier");
+
+        let mut out = vec![0i32; 8 * 2];
+        m.render(&mut out);
+        assert_eq!(m.section_name(), "c");
+
+        // Now cancel a pending switch by queueing the section already playing: at
+        // the boundary it does exactly what looping would have done.
+        m.queue_section(0);
+        m.queue_section(2);
+        m.render(&mut out);
+        assert_eq!(m.section_name(), "c", "re-queueing the active section is a no-op");
+    }
+
+    /// An index the song does not have is ignored, so one `[control]` binding of
+    /// eight notes can serve a show whose songs have two sections and six.
+    #[test]
+    fn queueing_a_section_that_does_not_exist_is_ignored() {
+        let mut m = Mixer::new(
+            sectioned(vec![PreloadedSection::new("only".into(), vec![pair(0, vec![0.5; 8])], true)]),
+            48_000,
+        );
+        m.queue_section(7);
+        assert!(m.queued_section_name().is_none());
+        let mut out = vec![0i32; 8 * 2];
+        m.render(&mut out);
+        assert_eq!(m.section_name(), "only");
+    }
+
+    /// A `loop = false` section with something queued hands over at its end instead
+    /// of ending the song — that is what makes a one-shot intro work. With nothing
+    /// queued it still ends, which is the behaviour `loop = false` promises.
+    #[test]
+    fn a_non_looping_section_hands_over_when_one_is_queued_and_ends_when_not() {
+        let intro = || PreloadedSection::new("intro".into(), vec![pair(0, vec![0.5; 8])], false);
+        let verse = || PreloadedSection::new("verse".into(), vec![pair(0, vec![0.25; 8])], true);
+
+        let mut m = Mixer::new(sectioned(vec![intro(), verse()]), 48_000);
+        m.queue_section(1);
+        assert!(!m.is_finished(), "a queued section means there is more to play");
+        let mut out = vec![0i32; 6 * 2];
+        m.render(&mut out);
+        assert_eq!(m.section_name(), "verse", "the intro handed over at its end");
+        assert!(!m.is_finished());
+
+        // Nothing queued: the same section ends the song.
+        let mut m = Mixer::new(sectioned(vec![intro(), verse()]), 48_000);
+        m.render(&mut out);
+        assert!(m.is_finished(), "a one-shot section with nothing queued ends");
+        assert_eq!(m.section_name(), "intro");
+    }
+
+    /// Selecting while stopped is a jump, not a queue: it is how you choose where
+    /// Start comes in from.
+    #[test]
+    fn selecting_a_section_applies_immediately_and_from_the_top() {
+        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 8])], true);
+        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.25; 8])], true);
+        let mut m = Mixer::new(sectioned(vec![a, b]), 48_000);
+
+        let mut out = vec![0i32; 2 * 2];
+        m.render(&mut out); // advance into section a
+        assert_eq!(m.position(), 2);
+
+        m.queue_section(1);
+        m.select_section(1);
+        assert_eq!(m.section_name(), "b");
+        assert_eq!(m.position(), 0, "a selected section starts from the top");
+        assert!(m.queued_section_name().is_none(), "and supersedes anything queued");
+
+        m.render(&mut out);
+        let left: Vec<i32> = out.iter().step_by(2).copied().collect();
+        assert!(left.iter().all(|v| (v - to_i32(0.25)).abs() < 16), "{left:?}");
     }
 
     // ---- sections (§14) ----

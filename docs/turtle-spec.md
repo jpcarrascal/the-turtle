@@ -109,8 +109,24 @@ path, not two.
   pair count across all sections, so changing section is an index change with no
   allocation — a prerequisite for doing it on the audio thread.
 
-Selecting a section live (a note queues one, which takes over at the next loop wrap)
-is not implemented yet — see §14. Today playback starts at the first section.
+**Switching.** One `[control]` note per section (§7.1). What a note does depends on
+the transport:
+
+- **Playing:** it *queues* that section, which takes over at the active section's next
+  boundary — never immediately. The switch happens on the audio thread at the exact
+  sample, so the seam lands on the downbeat rather than being quantised to the period.
+- **Stopped:** it selects the entry point. Start then begins there, defaulting to the
+  first section.
+
+Last one wins, with no special cases. Queueing again replaces what was queued;
+queueing the section already playing is how you cancel, because at the boundary it
+does exactly what looping would have done. The queue clears once a switch happens, so
+the new section simply loops until another note. A note for a section the current song
+does not have is ignored, so one binding can serve a whole show.
+
+A queued section takes over at the boundary whether the active section loops or not —
+which is what makes `loop = false` mean "play once, then hand over". With nothing
+queued, a `loop = false` section still ends the song.
 
 ---
 
@@ -239,7 +255,8 @@ stop    = { type = "note", note = 61 }
 next    = { type = "note", note = 62 }
 prev    = { type = "note", note = 63 }
 panic   = { type = "note", note = 65 }   # note 64 free (Restart removed; Start restarts)
-mute    = { type = "note", notes = [72, 73, 74, 75] }   # per-pair toggle
+mute    = { type = "note", notes = [72, 73, 74, 75] }    # per-pair toggle
+sections = { type = "note", notes = [76, 77, 78, 79] }   # optional; position = section index
 dsp_pair0_cutoff = { type = "cc", cc = 20 }
 dsp_delay_return = { type = "cc", cc = 21 }
 
@@ -454,16 +471,10 @@ a preallocated log ring).
   implemented; importing loop start/end from Ableton and toggling loop on/off live
   from a MIDI binding remain open. "Switch off mid-loop" would mean "continue past
   the loop end the next time it is crossed", never a jump.
-- **Live section switching** (§4.1): sections load and play, but selecting one is not
-  wired up. Agreed design: one note per section bound in `[control]`; the note queues
-  a section that takes over at the next loop wrap, never immediately; last one wins
-  with no special cases, so re-sending the playing section's note is a no-op and that
-  is also how you cancel; the queue clears after a switch. While stopped, a section
-  note selects the entry point and Start plays it. The switch itself is an index flip
-  on the RT thread at the wrap sample — a control-thread swap would land 1–2 ms late
-  and stutter, and rebuilding the mixer would reset the delay tail and filter state.
-- Per-section MIDI (each section carrying its own SMFs). Deliberately deferred: the
-  audio-only form is useful alone.
+- Per-section MIDI (each section carrying its own SMFs). Sections are audio-only:
+  the song's SMFs play against the song timeline, so a section switch rewinds the
+  MIDI cursors exactly as a loop wrap does. Deliberately deferred — the audio-only
+  form is useful alone.
 - Crossfade segues (v1 is hard auto-advance only).
 - Touch-takeover blending of DSP params (v1 is live-only, no blend).
 - FLAC/`symphonia` stem support for smaller bundles.

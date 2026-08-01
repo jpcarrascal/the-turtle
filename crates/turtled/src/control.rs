@@ -113,10 +113,13 @@ struct LoadedSong {
     /// That is exact while playback stays on one section; live section switching
     /// will have to refresh it, since sections may differ.
     looping: bool,
-    /// How many sections the song has (§4.1); `1` for a song without `[[sections]]`.
-    sections: usize,
-    /// The section that will play — the first one, until switching exists.
-    first_section: String,
+    /// Every section's name, length in frames and `loop` flag (§4.1), indexed the
+    /// same way the RT thread indexes them.
+    ///
+    /// Carried rather than read from the mixer because the mixer belongs to the RT
+    /// thread the moment it is handed over — this is the control thread's copy of
+    /// what it needs to answer `turtle status` after a switch.
+    sections: Vec<(String, u64, bool)>,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -132,10 +135,8 @@ fn load_song_payload(
     let schedulers = crate::play::load_schedulers(&p.show, &p.song_dir, rate);
     Ok(LoadedSong {
         looping: p.mixer.is_looping(),
-        // Captured before the mixer moves into the struct; only used for the log
-        // line, but on hardware "did my sections load?" is otherwise invisible.
-        sections: p.mixer.section_count(),
-        first_section: p.mixer.section_name().to_string(),
+        // Captured before the mixer moves into the struct below.
+        sections: p.mixer.section_summary(),
         mixer: p.mixer,
         schedulers,
         frames: p.frames,
@@ -270,6 +271,9 @@ pub fn run(
     // both must change when a song does, or `turtle status` describes the
     // previous song.
     let mut looping = mixer.is_looping();
+    // The current song's sections (§4.1), for the same reason: a switch changes
+    // the length and the loop flag, so `turtle status` needs the new section's.
+    let mut sections = mixer.section_summary();
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -368,6 +372,9 @@ pub fn run(
     // transport's own notion of them as songs are switched below.
     let mut current_song = Some(song_name.clone());
     let mut armed_next_song: Option<String> = None;
+    // Which section is playing (§4.1); reset to the first whenever a song is armed,
+    // which is what the RT thread does with the fresh mixer.
+    let mut active_section = 0usize;
 
     // Start the control socket only once the transport is armed, so the very
     // first `turtle status` a client can possibly see is already truthful.
@@ -391,6 +398,9 @@ pub fn run(
         position_s: 0.0,
         duration_s,
         looping: mixer.is_looping(),
+        // `None` for a song without `[[sections]]`: reporting "1 of 1" for every
+        // ordinary song would be noise in the common case.
+        section: section_label(&sections, 0),
     }));
     let server = socket::start(
         socket_path,
@@ -578,8 +588,8 @@ pub fn run(
                             // moved out of `loaded` below.
                             duration_s = loaded.frames as f64 / rate as f64;
                             looping = loaded.looping;
-                            let sections = loaded.sections;
-                            let first_section = loaded.first_section.clone();
+                            sections = loaded.sections;
+                            active_section = 0;
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -591,9 +601,11 @@ pub fn run(
                             }
                             // Only for a genuinely sectioned song: every other song
                             // is one implicit section, and saying so would be noise.
-                            if sections > 1 {
+                            if sections.len() > 1 {
                                 println!(
-                                    "[sections] {sections} loaded; starting at \"{first_section}\""
+                                    "[sections] {} loaded; starting at \"{}\"",
+                                    sections.len(),
+                                    sections[0].0
                                 );
                             }
                         } else if was_playing {
@@ -664,6 +676,27 @@ pub fn run(
                             println!("[loop] wrapped; MIDI cursors rewound");
                         }
                     }
+                    // A section took over at the boundary, or a note picked an
+                    // entry point while stopped (§4.1). Sections differ in length
+                    // and in whether they loop, so both have to follow — otherwise
+                    // `turtle status` keeps describing the section the song was
+                    // armed with.
+                    RtEvent::SectionChanged { index } => {
+                        if let Some((name, frames, loops)) = sections.get(index) {
+                            duration_s = *frames as f64 / rate as f64;
+                            looping = *loops;
+                            if verbose {
+                                println!(
+                                    "[section] \"{name}\" active wall={:.3}s",
+                                    epoch.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                        active_section = index;
+                        // The MIDI cursors are rewound by the `Looped` event that
+                        // the same backwards jump also raises, so nothing to do
+                        // here — deliberately not seeking twice.
+                    }
                     RtEvent::EndReached => {
                         let was_playing = eng.state() == State::Playing;
                         let cmds = eng.handle(Command::EndReached, &mut midi_out);
@@ -676,6 +709,8 @@ pub fn run(
                             if let Some(held) = held_next.take() {
                                 duration_s = held.frames as f64 / rate as f64;
                                 looping = held.looping;
+                                sections = held.sections.clone();
+                                active_section = 0;
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -740,6 +775,10 @@ pub fn run(
                 snap.position_s = position as f64 / rate as f64;
                 snap.duration_s = duration_s;
                 snap.looping = looping;
+                let label = section_label(&sections, active_section);
+                if snap.section != label {
+                    snap.section = label;
+                }
                 // Only clone the names when they actually change — this runs
                 // ~1000x a second, and in the steady state they don't.
                 if snap.song.as_deref() != current_song.as_deref() {
@@ -792,6 +831,19 @@ struct RtView {
 /// path, and the EndReached-driven gapless-advance path), and a long-lived
 /// closure capturing `schedulers` by `&mut` would conflict with the plain
 /// reassignments (`schedulers = loaded.schedulers`) elsewhere in the loop.
+/// How `turtle status` names the active section (§4.1): `"chorus (2/3)"`.
+///
+/// `None` for a song with no `[[sections]]` — its one implicit section is the song
+/// itself, and reporting "1 of 1" for every ordinary song would be noise. The index
+/// is included because section names need not be memorable mid-set.
+fn section_label(sections: &[(String, u64, bool)], active: usize) -> Option<String> {
+    if sections.len() < 2 {
+        return None;
+    }
+    let (name, _, _) = sections.get(active)?;
+    Some(format!("{name} ({}/{})", active + 1, sections.len()))
+}
+
 /// Portable (no ALSA types) so it's type-checked on the dev Mac even though
 /// its only caller, `run`, is `cfg(linux)`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -816,6 +868,18 @@ fn dispatch_rt(
             view.playing = false;
             if verbose {
                 println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
+            }
+        }
+        // The RT thread decides whether this queues or applies immediately (§4.1),
+        // so there is nothing to track here — but it is worth logging, because
+        // "did my pedal reach the Turtle?" and "did the switch happen?" are
+        // different questions and this answers the first.
+        RtCommand::SelectSection(index) => {
+            if verbose {
+                println!(
+                    "[section] {index} requested wall={:.3}s",
+                    epoch.elapsed().as_secs_f64()
+                );
             }
         }
         // Nothing for the control thread to track: the RT thread just empties the
