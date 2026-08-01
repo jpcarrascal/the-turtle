@@ -117,26 +117,29 @@ pub fn decode_mute(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usiz
     control.mute.notes.as_ref()?.iter().position(|&n| n == d1)
 }
 
-/// Decode a note-on against the `sections` binding, returning the section index
-/// (the note's position in `sections.notes`) if it matches (§4.1).
+/// Decode a note-on against the current song's section notes (§4.1), returning the
+/// section index whose `note` matches.
 ///
-/// Same shape as [`decode_mute`], but gated by `transport_channel`: choosing what
-/// plays next is a transport gesture, not a mixing one, and it will usually come
-/// from the same pedal as start/stop. Whether the index actually exists in the
-/// current song is the mixer's business — a note past the section count is ignored
-/// there, so remapping a controller never has to match the shortest song.
-pub fn decode_section(control: &Control, status: u8, d1: u8, d2: u8) -> Option<usize> {
+/// Takes the notes rather than reading them off `Control` because they live in
+/// **song.toml**, next to the sections they select — see [`turtle_core::model::Section::note`].
+/// The channel gate is still the show's `transport_channel`: choosing what plays next
+/// is a transport gesture, and will usually come from the same pedal as start/stop.
+pub fn decode_section(
+    control: &Control,
+    section_notes: &[Option<u8>],
+    status: u8,
+    d1: u8,
+    d2: u8,
+) -> Option<usize> {
     if status & 0xF0 != 0x90 || d2 == 0 {
         return None;
     }
     if !channel_matches(control.transport_channel, midi_channel(status)) {
         return None;
     }
-    let binding = control.sections.as_ref()?;
-    if binding.kind != BindingKind::Note {
-        return None;
-    }
-    binding.notes.as_ref()?.iter().position(|&n| n == d1)
+    // `flatten`-style match: a section with no note can never be selected, and must
+    // not be matched by a stray note that happens to decode to `None`.
+    section_notes.iter().position(|n| *n == Some(d1))
 }
 
 /// Decode an incoming CC against every `[control]` `dsp_*` binding, returning
@@ -454,28 +457,32 @@ dsp_pair0_cutoff = { type = "cc", cc = 20 }
         }
         assert_eq!(parse_dsp_key("dsp_cutoff"), None); // global-style key, no pair
     }
-    /// A section note decodes to its POSITION in `notes`, not the note number —
-    /// the same rule as mute, so one mechanism covers both.
+    /// A section note decodes to the section carrying it — the notes come from
+    /// song.toml, so the index is a position in the SONG's sections, not in a list
+    /// held in show.toml.
     #[test]
     fn decodes_section_notes_to_a_section_index() {
-        let toml = format!("{SHOW}sections = {{ type = \"note\", notes = [76, 77, 78] }}\n");
-        let c = Show::from_toml_str(&toml).unwrap().control;
-        assert_eq!(decode_section(&c, 0x90, 76, 100), Some(0));
-        assert_eq!(decode_section(&c, 0x90, 78, 100), Some(2));
+        let c = control();
+        // Section 1 has no note of its own: unreachable, but it must not shift the
+        // indices of the sections around it.
+        let notes = [Some(76u8), None, Some(78u8)];
+        assert_eq!(decode_section(&c, &notes, 0x90, 76, 100), Some(0));
+        assert_eq!(decode_section(&c, &notes, 0x90, 78, 100), Some(2));
         // Unmapped note, note-off, and a wrong status all decline.
-        assert_eq!(decode_section(&c, 0x90, 99, 100), None);
-        assert_eq!(decode_section(&c, 0x90, 76, 0), None, "note-off is not a trigger");
-        assert_eq!(decode_section(&c, 0x80, 76, 100), None);
+        assert_eq!(decode_section(&c, &notes, 0x90, 99, 100), None);
+        assert_eq!(decode_section(&c, &notes, 0x90, 76, 0), None, "note-off is not a trigger");
+        assert_eq!(decode_section(&c, &notes, 0x80, 76, 100), None);
         // And it must not also read as a transport command.
         assert_eq!(decode(&c, 0x90, 76, 100), None);
     }
 
-    /// No `sections` binding at all is the normal case for a show whose songs have
-    /// no sections — it must decline quietly, not panic.
+    /// A song with no sections (or none carrying notes) decodes nothing, rather
+    /// than matching the first entry of an empty list.
     #[test]
-    fn a_show_without_a_sections_binding_decodes_nothing() {
+    fn a_song_without_section_notes_decodes_nothing() {
         let c = control();
-        assert_eq!(decode_section(&c, 0x90, 76, 100), None);
+        assert_eq!(decode_section(&c, &[], 0x90, 76, 100), None);
+        assert_eq!(decode_section(&c, &[None, None], 0x90, 76, 100), None);
     }
 
 }

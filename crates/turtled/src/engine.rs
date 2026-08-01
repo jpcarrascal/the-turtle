@@ -128,6 +128,12 @@ pub struct Engine {
     num_ports: usize,
     pending_preload: Option<String>,
     last_decoded: Vec<Decoded>,
+    /// The current song's section notes (§4.1), indexed by section — set by the
+    /// control thread whenever a song is armed.
+    ///
+    /// Held here because this is where MIDI is decoded, but it is *song* state, not
+    /// show state: unlike every other binding it changes as the setlist advances.
+    section_notes: Vec<Option<u8>>,
 }
 
 impl Engine {
@@ -138,6 +144,8 @@ impl Engine {
             active_notes: ActiveNotes::new(),
             num_ports: show.destinations.len().max(1),
             pending_preload: None,
+            // Empty until a song is armed, so a note before then selects nothing.
+            section_notes: Vec::new(),
             last_decoded: Vec::new(),
         }
     }
@@ -194,7 +202,9 @@ impl Engine {
         // Like mute, this bypasses the transport state machine: a section note is
         // valid in every state, and what it *means* (queue vs. select an entry
         // point) is decided on the audio thread where the transport flag lives.
-        if let Some(index) = control_map::decode_section(&self.control, status, d1, d2) {
+        if let Some(index) =
+            control_map::decode_section(&self.control, &self.section_notes, status, d1, d2)
+        {
             self.last_decoded.push(Decoded::Section(index));
             return vec![RtCommand::SelectSection(index)];
         }
@@ -214,6 +224,15 @@ impl Engine {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Point the section triggers at a newly armed song (§4.1).
+    ///
+    /// Called on every song change, including a gapless advance — stale notes would
+    /// select by the *previous* song's arrangement, which is the kind of bug that
+    /// only shows up mid-set.
+    pub fn set_section_notes(&mut self, notes: Vec<Option<u8>>) {
+        self.section_notes = notes;
     }
 
     /// Apply a transport command, returning the RT commands to forward.
@@ -428,6 +447,36 @@ song = "01-opener"
 
         e.handle_midi(0xB0, 20, 90, &mut midi); // dsp_pair0_cutoff
         assert_eq!(e.take_last_decoded(), vec![Decoded::Dsp(0, DspParam::Cutoff, 90)]);
+    }
+
+    /// Section notes belong to the SONG, so they have to be repointed at every song
+    /// change. Stale notes would select by the previous song's arrangement — a bug
+    /// that only shows up mid-set, on the second song.
+    #[test]
+    fn section_notes_follow_the_armed_song() {
+        let mut e = engine();
+        let mut midi = RecordingMidi::default();
+
+        // Before any song is armed, a section note selects nothing.
+        assert!(e.handle_midi(0x90, 76, 100, &mut midi).is_empty());
+
+        e.set_section_notes(vec![Some(76), Some(77)]);
+        assert_eq!(
+            e.handle_midi(0x90, 77, 100, &mut midi),
+            vec![RtCommand::SelectSection(1)]
+        );
+        assert_eq!(e.take_last_decoded(), vec![Decoded::Section(1)]);
+
+        // The next song uses different notes for a different number of sections.
+        e.set_section_notes(vec![Some(80), Some(81), Some(82)]);
+        assert!(
+            e.handle_midi(0x90, 77, 100, &mut midi).is_empty(),
+            "the previous song's note must no longer select anything"
+        );
+        assert_eq!(
+            e.handle_midi(0x90, 82, 100, &mut midi),
+            vec![RtCommand::SelectSection(2)]
+        );
     }
 
     /// The record must show *every* pair a fanned-out CC drove, or `monitor`

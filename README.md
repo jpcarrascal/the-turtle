@@ -24,7 +24,7 @@ except GPIO (§8.1), which is waiting on parts.
 | Live DSP (§6) — per-pair filter, shared tempo-synced delay, linked master limiter | ✅ |
 | Transport + setlist (§8) — MIDI control, gapless auto-advance, background preload | ✅ |
 | Per-song looping (§14) — seamless, `loop = true` | ✅ |
-| Song sections (§4.1) — several stem sets per song, switched from a note at the loop boundary | ✅ |
+| Song sections (§4.1) — several stem sets per song, each with its own trigger note, switched at the loop boundary | ✅ |
 | CLI + control socket (§10) — `status`/`arm`/transport/`monitor`/`doctor`/`ports` | ✅ |
 | System (§12) — systemd, watchdog, RT priorities, device wait, read-only rootfs | ✅ |
 | GPIO (§8.1) — status/error LEDs, panic button | ⬜ no hardware yet |

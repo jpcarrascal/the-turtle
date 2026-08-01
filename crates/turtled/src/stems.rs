@@ -38,6 +38,8 @@ pub struct PreloadedSection {
     /// Whether this section repeats at its end. Already resolved against the
     /// song-level default by `Section::loops`, so the RT thread just reads a bool.
     pub looping: bool,
+    /// The MIDI note that selects this section (§4.1), if it has one.
+    pub note: Option<u8>,
 }
 
 impl PreloadedSection {
@@ -45,7 +47,13 @@ impl PreloadedSection {
     /// one — shorter pairs are zero-padded by the mixer.
     pub fn new(name: String, pairs: Vec<StemPair>, looping: bool) -> Self {
         let frames = pairs.iter().map(|p| p.frames).max().unwrap_or(0);
-        PreloadedSection { name, frames, pairs, looping }
+        PreloadedSection { name, frames, pairs, looping, note: None }
+    }
+
+    /// The same, with the note that selects it (§4.1).
+    pub fn with_note(mut self, note: Option<u8>) -> Self {
+        self.note = note;
+        self
     }
 }
 
@@ -109,12 +117,15 @@ pub fn load_song(
             // `Path::join` handles the relative `file` path portably.
             pairs.push(load_pair(pair.index, &base_dir.join(&pair.file), expected_rate)?);
         }
-        sections.push(PreloadedSection::new(
-            section.name.clone(),
-            pairs,
-            // Section's own `loop` if it has one, else the song's (§4.1).
-            section.loops(&song.song),
-        ));
+        sections.push(
+            PreloadedSection::new(
+                section.name.clone(),
+                pairs,
+                // Section's own `loop` if it has one, else the song's (§4.1).
+                section.loops(&song.song),
+            )
+            .with_note(section.note),
+        );
     }
     Ok(PreloadedSong {
         name: song.song.name.clone(),

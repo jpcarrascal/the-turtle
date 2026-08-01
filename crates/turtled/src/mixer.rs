@@ -363,6 +363,16 @@ pub struct Mixer {
     queued: Option<usize>,
 }
 
+/// The control thread's copy of one section (§4.1): everything it needs to answer
+/// `turtle status` and to decode section notes, with none of the audio.
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub name: String,
+    pub frames: u64,
+    pub looping: bool,
+    pub note: Option<u8>,
+}
+
 impl Mixer {
     /// Build the mixer for a preloaded song. Allocates all DSP state here, off
     /// the RT thread, so [`render`](Self::render) never allocates.
@@ -438,13 +448,19 @@ impl Mixer {
         &self.song.sections[self.active]
     }
 
-    /// Every section as `(name, frames, looping)`, for the control thread to keep
-    /// `turtle status` honest across a switch without reaching into the mixer.
-    pub fn section_summary(&self) -> Vec<(String, u64, bool)> {
+    /// Every section, for the control thread to keep `turtle status` honest across a
+    /// switch and to point the section triggers at the right song — without reaching
+    /// into the mixer, which belongs to the RT thread once handed over.
+    pub fn section_summary(&self) -> Vec<SectionInfo> {
         self.song
             .sections
             .iter()
-            .map(|s| (s.name.clone(), s.frames as u64, s.looping))
+            .map(|s| SectionInfo {
+                name: s.name.clone(),
+                frames: s.frames as u64,
+                looping: s.looping,
+                note: s.note,
+            })
             .collect()
     }
 

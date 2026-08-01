@@ -113,13 +113,13 @@ struct LoadedSong {
     /// That is exact while playback stays on one section; live section switching
     /// will have to refresh it, since sections may differ.
     looping: bool,
-    /// Every section's name, length in frames and `loop` flag (§4.1), indexed the
-    /// same way the RT thread indexes them.
+    /// Every section (§4.1), indexed the same way the RT thread indexes them.
     ///
     /// Carried rather than read from the mixer because the mixer belongs to the RT
     /// thread the moment it is handed over — this is the control thread's copy of
-    /// what it needs to answer `turtle status` after a switch.
-    sections: Vec<(String, u64, bool)>,
+    /// what it needs to answer `turtle status` after a switch and to point the
+    /// section triggers at the newly armed song.
+    sections: Vec<crate::mixer::SectionInfo>,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -366,6 +366,9 @@ pub fn run(
     // preload request `Select` queued and go straight to Loaded.
     let _ = eng.take_pending_preload();
     eng.handle(Command::Loaded, &mut midi_out);
+    // The startup song is armed without going through the load path below, so its
+    // section triggers have to be pointed here too (§4.1).
+    eng.set_section_notes(sections.iter().map(|s| s.note).collect());
 
     // The song currently armed/playing, and the one held for a gapless
     // advance — reported by `turtle status`, and kept in step with the
@@ -589,6 +592,7 @@ pub fn run(
                             duration_s = loaded.frames as f64 / rate as f64;
                             looping = loaded.looping;
                             sections = loaded.sections;
+                            eng.set_section_notes(sections.iter().map(|s| s.note).collect());
                             active_section = 0;
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
@@ -605,7 +609,7 @@ pub fn run(
                                 println!(
                                     "[sections] {} loaded; starting at \"{}\"",
                                     sections.len(),
-                                    sections[0].0
+                                    sections[0].name
                                 );
                             }
                         } else if was_playing {
@@ -682,12 +686,13 @@ pub fn run(
                     // `turtle status` keeps describing the section the song was
                     // armed with.
                     RtEvent::SectionChanged { index } => {
-                        if let Some((name, frames, loops)) = sections.get(index) {
-                            duration_s = *frames as f64 / rate as f64;
-                            looping = *loops;
+                        if let Some(s) = sections.get(index) {
+                            duration_s = s.frames as f64 / rate as f64;
+                            looping = s.looping;
                             if verbose {
                                 println!(
-                                    "[section] \"{name}\" active wall={:.3}s",
+                                    "[section] \"{}\" active wall={:.3}s",
+                                    s.name,
                                     epoch.elapsed().as_secs_f64()
                                 );
                             }
@@ -710,6 +715,9 @@ pub fn run(
                                 duration_s = held.frames as f64 / rate as f64;
                                 looping = held.looping;
                                 sections = held.sections.clone();
+                                eng.set_section_notes(
+                                    sections.iter().map(|s| s.note).collect(),
+                                );
                                 active_section = 0;
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
@@ -836,12 +844,12 @@ struct RtView {
 /// `None` for a song with no `[[sections]]` — its one implicit section is the song
 /// itself, and reporting "1 of 1" for every ordinary song would be noise. The index
 /// is included because section names need not be memorable mid-set.
-fn section_label(sections: &[(String, u64, bool)], active: usize) -> Option<String> {
+fn section_label(sections: &[crate::mixer::SectionInfo], active: usize) -> Option<String> {
     if sections.len() < 2 {
         return None;
     }
-    let (name, _, _) = sections.get(active)?;
-    Some(format!("{name} ({}/{})", active + 1, sections.len()))
+    let s = sections.get(active)?;
+    Some(format!("{} ({}/{})", s.name, active + 1, sections.len()))
 }
 
 /// Portable (no ALSA types) so it's type-checked on the dev Mac even though

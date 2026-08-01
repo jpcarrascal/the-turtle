@@ -237,15 +237,6 @@ pub struct Control {
     pub panic: Binding,
     /// Per-pair mute toggles: a single `notes = [..]` binding.
     pub mute: Binding,
-    /// Section triggers (§4.1): one `notes = [..]` binding whose *position* in the
-    /// list is the section index — note 0 selects section 0, and so on. Same shape
-    /// as `mute` on purpose, so there is one mechanism rather than two.
-    ///
-    /// Optional: a show whose songs have no sections needs no binding, and notes
-    /// past a song's section count are ignored rather than an error, exactly as an
-    /// unmapped mute note is.
-    #[serde(default)]
-    pub sections: Option<Binding>,
     /// Remaining `dsp_*` CC bindings, keyed by their TOML key.
     #[serde(flatten)]
     pub dsp: BTreeMap<String, Binding>,
@@ -348,6 +339,19 @@ pub struct Section {
     /// TOML key is `loop`; see [`SongMeta::looping`] for why the field is not.
     #[serde(default, rename = "loop")]
     pub looping: Option<bool>,
+    /// The MIDI note that selects this section (§4.1), on the transport channel.
+    ///
+    /// Declared here rather than as one list in `show.toml`'s `[control]` because
+    /// the arrangement and its triggers are the same thing: reading song.toml tells
+    /// you what each pedal does for *this* song, instead of counting positions in a
+    /// list held somewhere else. The cost is that changing controllers means editing
+    /// the songs — an accepted trade.
+    ///
+    /// Optional, but a section with no note cannot be reached: nothing else selects
+    /// one. `turtle doctor` warns about that rather than failing, since a song being
+    /// edited is allowed to be temporarily incomplete.
+    #[serde(default)]
+    pub note: Option<u8>,
 }
 
 impl Section {
@@ -459,14 +463,6 @@ impl Show {
         self.control.prev.check("control.prev", &mut p);
         self.control.panic.check("control.panic", &mut p);
         self.control.mute.check("control.mute", &mut p);
-        if let Some(b) = &self.control.sections {
-            b.check("control.sections", &mut p);
-            // A single `note` would bind every section to one trigger, which cannot
-            // be what was meant — the index comes from the position in `notes`.
-            if b.notes.is_none() {
-                p.push("control.sections: needs `notes = [..]`, one note per section".into());
-            }
-        }
         for (key, b) in &self.control.dsp {
             b.check(key, &mut p);
             // An unknown `dsp_*` key is rejected rather than ignored. Silently
@@ -562,6 +558,7 @@ impl Song {
         check_pairs(&self.pairs, "song", &mut p);
 
         let mut seen_names = BTreeMap::new();
+        let mut seen_notes = BTreeMap::new();
         for (i, section) in self.sections.iter().enumerate() {
             if section.name.trim().is_empty() {
                 p.push(format!("section {i}: name must not be empty"));
@@ -576,6 +573,22 @@ impl Song {
                     "section {:?}: needs at least one [[sections.pairs]]",
                     section.name
                 ));
+            }
+            if let Some(note) = section.note {
+                if note > 127 {
+                    p.push(format!(
+                        "section {:?}: note {note} out of range 0..=127",
+                        section.name
+                    ));
+                }
+                // Two sections on one note is ambiguous — the note would select
+                // whichever happened to be listed first, silently.
+                if let Some(other) = seen_notes.insert(note, section.name.clone()) {
+                    p.push(format!(
+                        "sections {other:?} and {:?} share note {note}",
+                        section.name
+                    ));
+                }
             }
             check_pairs(&section.pairs, &format!("section {:?}", section.name), &mut p);
         }
@@ -596,6 +609,8 @@ impl Song {
                 // `None`, not `Some(self.song.looping)`: the fallback lives in
                 // `Section::loops`, so there is one place it can be got wrong.
                 looping: None,
+                // Nothing to select: a song without sections has only this one.
+                note: None,
             }]
         } else {
             self.sections.clone()
@@ -882,6 +897,66 @@ file  = "stems/c.wav"
         assert!(err.contains("out of range"), "missing range error: {err}");
         // And it says WHICH section, since a song now has several.
         assert!(err.contains("bad"), "error should name the section: {err}");
+    }
+
+    /// Two sections on one note is ambiguous — the note would silently select
+    /// whichever was listed first.
+    #[test]
+    fn two_sections_may_not_share_a_note() {
+        let toml = r#"
+[song]
+name = "N"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = "intro"
+note = 76
+[[sections.pairs]]
+index = 0
+file  = "stems/a.wav"
+
+[[sections]]
+name = "verse"
+note = 76
+[[sections.pairs]]
+index = 0
+file  = "stems/b.wav"
+"#;
+        let err = Song::from_toml_str(toml).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("share note 76"), "unhelpful error: {err}");
+        assert!(err.contains("intro") && err.contains("verse"), "name both: {err}");
+    }
+
+    /// The note is optional and parses alongside the section's other fields — a
+    /// section without one simply cannot be selected.
+    #[test]
+    fn section_notes_parse_and_are_optional() {
+        let toml = r#"
+[song]
+name = "N"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = "intro"
+note = 76
+loop = false
+[[sections.pairs]]
+index = 0
+file  = "stems/a.wav"
+
+[[sections]]
+name = "verse"
+[[sections.pairs]]
+index = 0
+file  = "stems/b.wav"
+"#;
+        let song = Song::from_toml_str(toml).expect("parse");
+        song.validate().expect("valid: a section without a note is incomplete, not wrong");
+        assert_eq!(song.sections[0].note, Some(76));
+        assert!(!song.sections[0].loops(&song.song), "`loop` and `note` coexist");
+        assert_eq!(song.sections[1].note, None);
     }
 
     /// `loop` is per section, with the song's as the default — an arrangement mixes

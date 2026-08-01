@@ -109,8 +109,9 @@ path, not two.
   pair count across all sections, so changing section is an index change with no
   allocation — a prerequisite for doing it on the audio thread.
 
-**Switching.** One `[control]` note per section (§7.1). What a note does depends on
-the transport:
+**Switching.** Each section declares the note that selects it, in `song.toml`
+(§7.2) — next to the section itself, so one file describes the whole arrangement and
+what each pedal does for it. What a note does depends on the transport:
 
 - **Playing:** it *queues* that section, which takes over at the active section's next
   boundary — never immediately. The switch happens on the audio thread at the exact
@@ -121,8 +122,15 @@ the transport:
 Last one wins, with no special cases. Queueing again replaces what was queued;
 queueing the section already playing is how you cancel, because at the boundary it
 does exactly what looping would have done. The queue clears once a switch happens, so
-the new section simply loops until another note. A note for a section the current song
-does not have is ignored, so one binding can serve a whole show.
+the new section simply loops until another note. Notes are matched against the
+*current* song's sections, so different songs may use different notes and a note
+belonging to no section is ignored.
+
+Two sections in one song may not share a note (`Song::validate`). A section note that
+collides with a transport or mute binding is caught by `turtle doctor`, not at load:
+the note is in `song.toml` and the bindings are in `show.toml`, so nothing but a
+bundle-wide check ever sees both. `doctor` also warns about a section with no `note`,
+since nothing can select it.
 
 A queued section takes over at the boundary whether the active section loops or not —
 which is what makes `loop = false` mean "play once, then hand over". With nothing
@@ -256,7 +264,6 @@ next    = { type = "note", note = 62 }
 prev    = { type = "note", note = 63 }
 panic   = { type = "note", note = 65 }   # note 64 free (Restart removed; Start restarts)
 mute    = { type = "note", notes = [72, 73, 74, 75] }    # per-pair toggle
-sections = { type = "note", notes = [76, 77, 78, 79] }   # optional; position = section index
 dsp_pair0_cutoff = { type = "cc", cc = 20 }
 dsp_delay_return = { type = "cc", cc = 21 }
 
@@ -304,13 +311,15 @@ loop = true                    # the DEFAULT for this song's sections
 
 [[sections]]
 name = "intro"                 # names must be non-empty and unique
-loop = false                   # ...which a section may override: plays once, ends
+note = 76                      # the note that selects it, on transport_channel
+loop = false                   # ...overriding the song: plays once, then hands over
 [[sections.pairs]]
 index = 0
 file  = "stems/intro_drums.wav"
 
 [[sections]]
 name = "chorus"                # no `loop`, so it takes the song's: vamps
+note = 77
 [[sections.pairs]]
 index = 0
 file  = "stems/chorus_drums.wav"

@@ -256,6 +256,11 @@ fn check_stems(show: &turtle_core::Show, show_path: &Path) -> Vec<Check> {
                 continue;
             }
         };
+        // Section notes live in song.toml and the transport bindings in show.toml,
+        // so nothing but a bundle-wide check ever sees both (§4.1). A section that
+        // shadows `stop` is silent at load time and baffling on stage.
+        checks.extend(check_section_notes(show, &entry.song, &song));
+
         // Every section's stems, not just `[[pairs]]` — `effective_sections` gives
         // a section-less song as one section, so both forms check the same way. A
         // sectioned song walked via `song.pairs` would report zero stems and pass.
@@ -295,6 +300,70 @@ fn check_stems(show: &turtle_core::Show, show_path: &Path) -> Vec<Check> {
             total_bytes as f64 / 1_048_576.0,
             show.setlist.len()
         )));
+    }
+    checks
+}
+
+/// One song's section notes (§4.1) against the show's own note bindings.
+///
+/// This check exists because moving the trigger into `song.toml` — next to the
+/// section it selects — put it out of reach of `Show::validate`, which only ever
+/// sees one file. `doctor` loads the whole bundle, so it is the only place the two
+/// can be compared at all.
+fn check_section_notes(
+    show: &turtle_core::Show,
+    song_name: &str,
+    song: &turtle_core::Song,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    if song.sections.is_empty() {
+        return checks;
+    }
+    let c = &show.control;
+    // Every note the show already claims, with the binding that claims it.
+    let mut taken: Vec<(u8, &str)> = Vec::new();
+    for (binding, name) in [
+        (&c.start, "start"),
+        (&c.stop, "stop"),
+        (&c.next, "next"),
+        (&c.prev, "prev"),
+        (&c.panic, "panic"),
+        (&c.mute, "mute"),
+    ] {
+        if let Some(n) = binding.note {
+            taken.push((n, name));
+        }
+        for n in binding.notes.iter().flatten() {
+            taken.push((*n, name));
+        }
+    }
+
+    for section in &song.sections {
+        match section.note {
+            Some(note) => {
+                if let Some((_, owner)) = taken.iter().find(|(n, _)| *n == note) {
+                    checks.push(Check::fail(
+                        format!(
+                            "song \"{song_name}\" section \"{}\": note {note} is already \
+                             bound to `{owner}`",
+                            section.name
+                        ),
+                        "give the section a different note, or move the transport binding",
+                    ));
+                }
+            }
+            // Not a failure: a song being edited is allowed to be incomplete, and
+            // the daemon simply never selects it. But it can never be reached, so
+            // saying nothing would be worse.
+            None => checks.push(Check::warn(
+                format!(
+                    "song \"{song_name}\" section \"{}\" has no `note`, so nothing can \
+                     select it",
+                    section.name
+                ),
+                "add `note = <0-127>` to the section",
+            )),
+        }
     }
     checks
 }
@@ -709,6 +778,25 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A show with the standard note bindings, for the section-note collision
+    /// checks: stop is 61, mute claims 72-75.
+    const SHOW_WITH_BINDINGS: &str = r#"
+[show]
+name = "x"
+playback_rate = 48000
+[audio]
+device = "hw:0"
+[control]
+input_port = "hw:1"
+select_channel = 1
+start = { type = "note", note = 60 }
+stop  = { type = "note", note = 61 }
+next  = { type = "note", note = 62 }
+prev  = { type = "note", note = 63 }
+panic = { type = "note", note = 65 }
+mute  = { type = "note", notes = [72, 73, 74, 75] }
+"#;
+
     /// A sectioned song's stems live under `[[sections]]`, not `[[pairs]]` (§4.1).
     /// Walking `song.pairs` would find nothing and report a clean bill of health
     /// for a bundle with every stem missing — the exact failure mode doctor exists
@@ -725,7 +813,7 @@ mod tests {
         std::fs::write(
             &song_toml,
             "[song]\nname = \"tone\"\nbpm = 120.0\nlength_samples = 12000\n\n\
-             [[sections]]\nname = \"intro\"\n[[sections.pairs]]\nindex = 0\n\
+             [[sections]]\nname = \"intro\"\nnote = 76\n[[sections.pairs]]\nindex = 0\n\
              file = \"stems/nope.wav\"\n",
         )
         .unwrap();
@@ -738,6 +826,66 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The section note lives in song.toml and the transport bindings in show.toml,
+    /// so `Show::validate` cannot see both — a section shadowing `stop` would be
+    /// silent at load time and baffling on stage. This is the only check that
+    /// catches it.
+    #[test]
+    fn a_section_note_colliding_with_a_transport_binding_fails() {
+        let show = turtle_core::Show::from_toml_str(SHOW_WITH_BINDINGS).unwrap();
+        let song = turtle_core::Song::from_toml_str(
+            "[song]\nname = \"s\"\nbpm = 120.0\nlength_samples = 10\n\n\
+             [[sections]]\nname = \"intro\"\nnote = 61\n[[sections.pairs]]\n\
+             index = 0\nfile = \"stems/a.wav\"\n",
+        )
+        .unwrap();
+
+        let checks = check_section_notes(&show, "s", &song);
+        assert!(
+            checks.iter().any(|c| c.level == Level::Fail && c.detail.contains("`stop`")),
+            "note 61 is stop; the collision must name it: {checks:?}"
+        );
+
+        // The same song on a free note passes.
+        let song = turtle_core::Song::from_toml_str(
+            "[song]\nname = \"s\"\nbpm = 120.0\nlength_samples = 10\n\n\
+             [[sections]]\nname = \"intro\"\nnote = 76\n[[sections.pairs]]\n\
+             index = 0\nfile = \"stems/a.wav\"\n",
+        )
+        .unwrap();
+        assert!(check_section_notes(&show, "s", &song).is_empty());
+    }
+
+    /// A mute note is just as much of a collision as a transport one — they come
+    /// from the same controller.
+    #[test]
+    fn a_section_without_a_note_warns_rather_than_fails() {
+        let show = turtle_core::Show::from_toml_str(SHOW_WITH_BINDINGS).unwrap();
+        let song = turtle_core::Song::from_toml_str(
+            "[song]\nname = \"s\"\nbpm = 120.0\nlength_samples = 10\n\n\
+             [[sections]]\nname = \"orphan\"\n[[sections.pairs]]\n\
+             index = 0\nfile = \"stems/a.wav\"\n",
+        )
+        .unwrap();
+        let checks = check_section_notes(&show, "s", &song);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::Warn, "an unfinished song is not broken");
+        assert!(checks[0].detail.contains("orphan"));
+
+        // A mute note collides too — same controller, same problem.
+        let song = turtle_core::Song::from_toml_str(
+            "[song]\nname = \"s\"\nbpm = 120.0\nlength_samples = 10\n\n\
+             [[sections]]\nname = \"intro\"\nnote = 73\n[[sections.pairs]]\n\
+             index = 0\nfile = \"stems/a.wav\"\n",
+        )
+        .unwrap();
+        assert!(
+            check_section_notes(&show, "s", &song)
+                .iter()
+                .any(|c| c.level == Level::Fail && c.detail.contains("`mute`")),
+        );
     }
 
     /// A missing bundle must be one clear failure, not a panic or a cascade.
