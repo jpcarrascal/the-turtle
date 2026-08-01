@@ -349,8 +349,12 @@ pub struct Mixer {
     /// The one shared delay every pair sends into (§6).
     delay_bus: DelayBus,
     sample_rate: u32,
-    /// Current playback position in frames (samples per channel) from song start.
+    /// Current playback position in frames (samples per channel) from the start of
+    /// the **active section**.
     pos: u64,
+    /// Which section is playing (§14). Always a valid index: `PreloadedSong` always
+    /// has at least one section.
+    active: usize,
 }
 
 impl Mixer {
@@ -358,11 +362,16 @@ impl Mixer {
     /// the RT thread, so [`render`](Self::render) never allocates.
     pub fn new(song: PreloadedSong, sample_rate: u32) -> Self {
         let sr = sample_rate as f32;
-        // One transparent chain per pair. `map` + `collect` builds the `Vec` in
-        // one shot; `_` ignores each pair's data (we only need the count/layout).
-        let pairs = song
-            .pairs
+        // One transparent chain per pair, sized for the WIDEST section rather than
+        // the active one. Sections may use different pair counts, and switching
+        // between them must not allocate — it happens on the RT thread (§14).
+        let widest = song
+            .sections
             .iter()
+            .map(|s| s.pairs.len())
+            .max()
+            .unwrap_or(0);
+        let pairs = (0..widest)
             .map(|_| PairChain {
                 left: ChannelChain::new(sr),
                 right: ChannelChain::new(sr),
@@ -370,12 +379,35 @@ impl Mixer {
             .collect();
         Mixer {
             delay_bus: DelayBus::new(song.bpm, sample_rate),
+            // Playback starts at the first section unless one is selected (§14).
+            active: 0,
             song,
             pairs,
             limiter: StereoLimiter::default_master(sr),
             sample_rate,
             pos: 0,
         }
+    }
+
+    /// The section currently playing (§14).
+    #[inline]
+    fn section(&self) -> &crate::stems::PreloadedSection {
+        &self.song.sections[self.active]
+    }
+
+    /// The active section's name, for `turtle status` and logs.
+    pub fn section_name(&self) -> &str {
+        &self.section().name
+    }
+
+    /// How many sections this song has. `1` for a song without `[[sections]]`.
+    pub fn section_count(&self) -> usize {
+        self.song.sections.len()
+    }
+
+    /// Length of the active section in frames — what the transport loops or ends at.
+    pub fn section_frames(&self) -> usize {
+        self.section().frames
     }
 
     /// Whether the loaded song repeats instead of ending (§14).
@@ -501,7 +533,7 @@ impl Mixer {
         // A looping song never finishes, which is what stops `EndReached` firing
         // and therefore what stops the gapless auto-advance (§8) from carrying the
         // setlist forward. Stop is the only way out, by design.
-        !self.song.looping && self.pos >= self.song.frames as u64
+        !self.song.looping && self.pos >= self.section().frames as u64
     }
 
     /// Jump to `pos` (rewind / restart) and clear DSP tails.
@@ -562,7 +594,7 @@ impl Mixer {
     pub fn render(&mut self, out: &mut [i32]) {
         let frames = out.len() / 2;
         // 0 when not looping, which turns the wrap below into a never-taken branch.
-        let wrap_at = if self.song.looping { self.song.frames as u64 } else { 0 };
+        let wrap_at = if self.song.looping { self.section().frames as u64 } else { 0 };
         for f in 0..frames {
             let raw = self.pos + f as u64;
             // `pos` is kept below `wrap_at` at the end of this function, so a
@@ -582,7 +614,13 @@ impl Mixer {
             let mut send_r = 0.0f32;
             // `zip` walks the stem data and its matching DSP chain together;
             // `iter_mut` on the chains because `process` mutates their state.
-            for (stem, chain) in self.song.pairs.iter().zip(self.pairs.iter_mut()) {
+            // `zip` stops at the shorter side, so a section using fewer pairs than
+            // the widest simply leaves the spare chains idle.
+            for (stem, chain) in self.song.sections[self.active]
+                .pairs
+                .iter()
+                .zip(self.pairs.iter_mut())
+            {
                 // Past the end of a (possibly shorter) stem, read silence.
                 let (l, r) = if (frame_idx as usize) < stem.frames {
                     let i = frame_idx as usize * 2;
@@ -629,15 +667,18 @@ fn to_i32(x: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stems::StemPair;
+    use crate::stems::{PreloadedSection, StemPair};
 
     fn song(pairs: Vec<StemPair>) -> PreloadedSong {
-        let frames = pairs.iter().map(|p| p.frames).max().unwrap_or(0);
+        sectioned(vec![PreloadedSection::new("t".into(), pairs)])
+    }
+
+    /// A song of several named sections, for the section tests.
+    fn sectioned(sections: Vec<PreloadedSection>) -> PreloadedSong {
         PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            frames,
-            pairs,
+            sections,
             looping: false,
             bpm: 120.0,
         }
@@ -1336,4 +1377,78 @@ mod tests {
             "a default must be identical to the same value arriving as a CC"
         );
     }
+    // ---- sections (§14) ----
+
+    /// The mixer plays the first section, not a concatenation and not the others.
+    #[test]
+    fn playback_reads_the_active_section() {
+        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 8])]);
+        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.25; 8])]);
+        let mut m = Mixer::new(sectioned(vec![a, b]), 48_000);
+        assert_eq!(m.section_count(), 2);
+        assert_eq!(m.section_name(), "a");
+
+        let mut out = vec![0i32; 8];
+        m.render(&mut out);
+        // Section a's level, unmistakably not section b's.
+        let expect = to_i32(0.5);
+        assert!(
+            out.iter().all(|&v| (v - expect).abs() < 16),
+            "expected section a's 0.5, got {:?}",
+            &out[..4]
+        );
+    }
+
+    /// Sections have their own lengths, so end-of-song is the ACTIVE section's
+    /// length — not the song's longest or first.
+    #[test]
+    fn end_of_playback_follows_the_active_sections_length() {
+        // Section a is 2 frames; section b is much longer.
+        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 4])]);
+        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.5; 400])]);
+        let mut m = Mixer::new(sectioned(vec![a, b]), 48_000);
+        let mut out = vec![0i32; 4];
+        m.render(&mut out);
+        assert!(m.is_finished(), "2-frame section should be done after 2 frames");
+    }
+
+    /// A switch will happen on the RT thread, so the chains must already exist for
+    /// the widest section — allocating there would be a dropout.
+    #[test]
+    fn chains_are_allocated_for_the_widest_section() {
+        let narrow = || PreloadedSection::new("narrow".into(), vec![pair(0, vec![0.5; 4])]);
+        let wide = || {
+            PreloadedSection::new(
+                "wide".into(),
+                vec![pair(0, vec![0.5; 4]), pair(1, vec![0.5; 4]), pair(2, vec![0.5; 4])],
+            )
+        };
+        // Widest last, then widest first: order must not matter.
+        let m = Mixer::new(sectioned(vec![narrow(), wide()]), 48_000);
+        assert_eq!(m.pairs.len(), 3);
+        let m = Mixer::new(sectioned(vec![wide(), narrow()]), 48_000);
+        assert_eq!(m.pairs.len(), 3);
+    }
+
+    /// A section using fewer pairs than the widest leaves the spare chains idle
+    /// rather than reading past the end of its pair list.
+    #[test]
+    fn a_narrow_section_renders_without_touching_spare_chains() {
+        let narrow = PreloadedSection::new("narrow".into(), vec![pair(0, vec![0.5; 8])]);
+        let wide = PreloadedSection::new(
+            "wide".into(),
+            vec![pair(0, vec![0.5; 8]), pair(1, vec![0.5; 8]), pair(2, vec![0.5; 8])],
+        );
+        let mut m = Mixer::new(sectioned(vec![narrow, wide]), 48_000);
+        let mut out = vec![0i32; 8];
+        m.render(&mut out);
+        // One pair at 0.5, not three summed to 1.5 (which would also clip).
+        let expect = to_i32(0.5);
+        assert!(
+            out.iter().all(|&v| (v - expect).abs() < 16),
+            "spare chains contributed audio: {:?}",
+            &out[..4]
+        );
+    }
+
 }

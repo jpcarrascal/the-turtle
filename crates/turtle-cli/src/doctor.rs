@@ -256,7 +256,10 @@ fn check_stems(show: &turtle_core::Show, show_path: &Path) -> Vec<Check> {
                 continue;
             }
         };
-        for pair in &song.pairs {
+        // Every section's stems, not just `[[pairs]]` — `effective_sections` gives
+        // a section-less song as one section, so both forms check the same way. A
+        // sectioned song walked via `song.pairs` would report zero stems and pass.
+        for pair in song.effective_sections().iter().flat_map(|s| &s.pairs) {
             // `pair.file` is relative to the *song* directory and already carries
             // its own `stems/` prefix (e.g. "stems/pair1.wav"). Joining another
             // "stems" here looked right and produced `stems/stems/pair1.wav`,
@@ -701,6 +704,37 @@ mod tests {
         assert!(
             checks.iter().any(|c| c.level == Level::Fail && c.detail.contains("empty")),
             "a zero-byte stem must fail: {checks:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A sectioned song's stems live under `[[sections]]`, not `[[pairs]]` (§4.1).
+    /// Walking `song.pairs` would find nothing and report a clean bill of health
+    /// for a bundle with every stem missing — the exact failure mode doctor exists
+    /// to prevent.
+    #[test]
+    fn stems_inside_sections_are_checked_too() {
+        let root = std::env::temp_dir().join(format!("turtle-sect-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        crate::gen::gen_tone(&root, 0.25, 440.0, false, false).expect("generate a test bundle");
+
+        // Rewrite the generated song into the sectioned form, pointing the section
+        // at a stem that does not exist.
+        let song_toml = root.join("songs").join("tone").join("song.toml");
+        std::fs::write(
+            &song_toml,
+            "[song]\nname = \"tone\"\nbpm = 120.0\nlength_samples = 12000\n\n\
+             [[sections]]\nname = \"intro\"\n[[sections.pairs]]\nindex = 0\n\
+             file = \"stems/nope.wav\"\n",
+        )
+        .unwrap();
+
+        let show = turtle_core::Show::load(root.join("show.toml")).unwrap();
+        let checks = check_stems(&show, &root.join("show.toml"));
+        assert!(
+            checks.iter().any(|c| c.level == Level::Fail && c.detail.contains("nope.wav")),
+            "a missing stem inside a section must be reported: {checks:?}"
         );
 
         std::fs::remove_dir_all(&root).ok();

@@ -279,8 +279,15 @@ pub struct SetlistEntry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Song {
     pub song: SongMeta,
+    /// The song's stems, when it has no sections. Mutually exclusive with
+    /// [`Song::sections`] — see [`Song::validate`].
     #[serde(default)]
     pub pairs: Vec<Pair>,
+    /// Sections, each looping on its own until the next is triggered (§14).
+    ///
+    /// Ordered: the first is where playback starts unless another is selected.
+    #[serde(default)]
+    pub sections: Vec<Section>,
     /// Per-pair DSP config, keyed `pair0`, `pair1`, ... (`[dsp.pair0]`).
     #[serde(default)]
     pub dsp: BTreeMap<String, PairDsp>,
@@ -303,6 +310,22 @@ pub struct SongMeta {
     /// Defaults to false, so existing songs are unaffected.
     #[serde(default, rename = "loop")]
     pub looping: bool,
+}
+
+/// One section of a song: an alternative set of stems that loops on its own (§14).
+///
+/// A song with sections is a live arrangement — an intro, a verse, a chorus — each
+/// looping until the next is triggered. A song without them is just a song, and is
+/// treated internally as a single unnamed section (see [`Song::effective_sections`])
+/// so everything downstream has one code path rather than two.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Section {
+    /// How the section is referred to — in a control binding, a log line, or
+    /// `turtle status`.
+    pub name: String,
+    /// This section's stems. Sections may use different numbers of pairs.
+    #[serde(default)]
+    pub pairs: Vec<Pair>,
 }
 
 /// One stereo stem pair (§4): up to 4 per song.
@@ -486,21 +509,71 @@ impl Song {
         if self.song.length_samples == 0 {
             p.push("song.length_samples must be > 0".into());
         }
-        if self.pairs.len() > 4 {
-            p.push(format!("at most 4 pairs allowed (got {})", self.pairs.len()));
+        // Either form, never both: with both present it is genuinely ambiguous
+        // which stems play, and guessing would be worse than refusing.
+        if !self.pairs.is_empty() && !self.sections.is_empty() {
+            p.push(
+                "a song has either [[pairs]] or [[sections]], not both — \
+                 move the pairs into a section"
+                    .into(),
+            );
         }
 
-        let mut seen_idx = BTreeMap::new();
-        for pair in &self.pairs {
-            if pair.index > 3 {
-                p.push(format!("pair index {} out of range 0..=3", pair.index));
+        check_pairs(&self.pairs, "song", &mut p);
+
+        let mut seen_names = BTreeMap::new();
+        for (i, section) in self.sections.iter().enumerate() {
+            if section.name.trim().is_empty() {
+                p.push(format!("section {i}: name must not be empty"));
             }
-            if seen_idx.insert(pair.index, ()).is_some() {
-                p.push(format!("duplicate pair index {}", pair.index));
+            // Names identify a section in bindings and logs, so duplicates would
+            // make one of them unreachable.
+            if seen_names.insert(section.name.clone(), ()).is_some() {
+                p.push(format!("duplicate section name {:?}", section.name));
             }
+            if section.pairs.is_empty() {
+                p.push(format!(
+                    "section {:?}: needs at least one [[sections.pairs]]",
+                    section.name
+                ));
+            }
+            check_pairs(&section.pairs, &format!("section {:?}", section.name), &mut p);
         }
 
         Error::from_problems(p)
+    }
+
+    /// The song's sections, treating a section-less song as one unnamed section.
+    ///
+    /// Lets everything downstream — loader, mixer, transport — work in terms of
+    /// sections alone, instead of branching on whether a song happens to have them.
+    /// Clones, but only at load time, never on the RT path.
+    pub fn effective_sections(&self) -> Vec<Section> {
+        if self.sections.is_empty() {
+            vec![Section {
+                name: self.song.name.clone(),
+                pairs: self.pairs.clone(),
+            }]
+        } else {
+            self.sections.clone()
+        }
+    }
+}
+
+/// Shared pair checks, so a section's pairs are held to the same rules as a
+/// section-less song's (§4: at most 4, indices 0..=3, no duplicates).
+fn check_pairs(pairs: &[Pair], ctx: &str, p: &mut Vec<String>) {
+    if pairs.len() > 4 {
+        p.push(format!("{ctx}: at most 4 pairs allowed (got {})", pairs.len()));
+    }
+    let mut seen_idx = BTreeMap::new();
+    for pair in pairs {
+        if pair.index > 3 {
+            p.push(format!("{ctx}: pair index {} out of range 0..=3", pair.index));
+        }
+        if seen_idx.insert(pair.index, ()).is_some() {
+            p.push(format!("{ctx}: duplicate pair index {}", pair.index));
+        }
     }
 }
 
@@ -609,6 +682,164 @@ file  = "stems/pair2.wav"
 [dsp.pair0]
 filter = "lp"
 "#;
+
+    // ---- sections (§14) ----
+
+    /// A section-less song is one implicit section, so everything downstream can
+    /// assume sections exist without a legacy code path.
+    #[test]
+    fn a_song_without_sections_reads_as_one_section_named_after_the_song() {
+        let song = Song::from_toml_str(SONG_TOML).expect("parse");
+        let sections = song.effective_sections();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, "Opener");
+        assert_eq!(sections[0].pairs.len(), 2);
+        assert_eq!(sections[0].pairs[1].file, "stems/pair2.wav");
+    }
+
+    #[test]
+    fn sections_parse_with_their_own_pairs_and_lengths() {
+        let toml = r#"
+[song]
+name = "Arranged"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = "intro"
+[[sections.pairs]]
+index = 0
+file  = "stems/intro_drums.wav"
+
+[[sections]]
+name = "chorus"
+[[sections.pairs]]
+index = 0
+file  = "stems/chorus_drums.wav"
+[[sections.pairs]]
+index = 1
+file  = "stems/chorus_gtr.wav"
+"#;
+        let song = Song::from_toml_str(toml).expect("parse");
+        song.validate().expect("valid");
+        let sections = song.effective_sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "intro");
+        assert_eq!(sections[0].pairs.len(), 1);
+        assert_eq!(sections[1].name, "chorus");
+        assert_eq!(sections[1].pairs.len(), 2);
+        assert_eq!(sections[1].pairs[1].file, "stems/chorus_gtr.wav");
+        // The song's own `[[pairs]]` stays empty — sections carry the stems.
+        assert!(song.pairs.is_empty());
+    }
+
+    /// Both forms at once is ambiguous — which set plays? — so it is rejected
+    /// rather than resolved by a precedence rule nobody would remember.
+    #[test]
+    fn pairs_and_sections_together_are_rejected() {
+        let toml = r#"
+[song]
+name = "Both"
+bpm  = 120.0
+length_samples = 100
+
+[[pairs]]
+index = 0
+file  = "stems/a.wav"
+
+[[sections]]
+name = "intro"
+[[sections.pairs]]
+index = 0
+file  = "stems/b.wav"
+"#;
+        let song = Song::from_toml_str(toml).expect("parse");
+        let err = song.validate().unwrap_err().to_string();
+        assert!(err.contains("not both"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn sections_need_unique_non_empty_names() {
+        let dup = r#"
+[song]
+name = "D"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = "verse"
+[[sections.pairs]]
+index = 0
+file  = "stems/a.wav"
+
+[[sections]]
+name = "verse"
+[[sections.pairs]]
+index = 0
+file  = "stems/b.wav"
+"#;
+        let err = Song::from_toml_str(dup).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "unhelpful error: {err}");
+
+        let empty = r#"
+[song]
+name = "E"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = ""
+[[sections.pairs]]
+index = 0
+file  = "stems/a.wav"
+"#;
+        let err = Song::from_toml_str(empty).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("name"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_section_needs_at_least_one_pair() {
+        let toml = r#"
+[song]
+name = "S"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = "silent"
+"#;
+        let err = Song::from_toml_str(toml).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("silent"), "error should name the section: {err}");
+    }
+
+    /// §4's pair rules are per-section, not per-song — a five-pair or
+    /// duplicate-index section must fail the same way a song-level one does.
+    #[test]
+    fn section_pairs_obey_the_same_rules_as_song_pairs() {
+        let toml = r#"
+[song]
+name = "S"
+bpm  = 120.0
+length_samples = 100
+
+[[sections]]
+name = "bad"
+[[sections.pairs]]
+index = 0
+file  = "stems/a.wav"
+[[sections.pairs]]
+index = 0
+file  = "stems/b.wav"
+[[sections.pairs]]
+index = 9
+file  = "stems/c.wav"
+"#;
+        let err = Song::from_toml_str(toml).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate pair index 0"), "missing dup error: {err}");
+        assert!(err.contains("out of range"), "missing range error: {err}");
+        // And it says WHICH section, since a song now has several.
+        assert!(err.contains("bad"), "error should name the section: {err}");
+    }
 
     /// End-to-end: a `[ports]` table in a real show.toml must produce the ALSA
     /// addresses `turtled` will open, for both destinations and the control input.

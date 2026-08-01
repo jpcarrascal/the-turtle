@@ -208,7 +208,7 @@ pub fn run_audio(
 mod tests {
     use super::*;
     use crate::mixer::Mixer;
-    use crate::stems::{PreloadedSong, StemPair};
+    use crate::stems::{PreloadedSection, PreloadedSong, StemPair};
 
     // A mixer over one pair of constant non-silent samples, so "did we render?"
     // is easy to see in the output.
@@ -217,8 +217,7 @@ mod tests {
         let song = PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            frames: 2,
-            pairs: vec![pair],
+            sections: vec![PreloadedSection::new("t".into(), vec![pair])],
             looping: false,
             bpm: 120.0,
         };
@@ -281,8 +280,7 @@ mod tests {
         let song = PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            frames: 8_000,
-            pairs: vec![pair],
+            sections: vec![PreloadedSection::new("t".into(), vec![pair])],
             looping: false,
             bpm: 120.0,
         };
@@ -338,8 +336,7 @@ mod tests {
         let song = PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            frames: 2,
-            pairs: vec![pair],
+            sections: vec![PreloadedSection::new("t".into(), vec![pair])],
             looping: true,
             bpm: 120.0,
         };

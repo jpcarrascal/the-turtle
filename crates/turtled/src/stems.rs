@@ -26,14 +26,39 @@ pub struct StemPair {
     pub frames: usize,
 }
 
-/// A song decoded into RAM: all its pairs, ready for the RT mixer to read.
+/// One section decoded into RAM (§14).
+#[derive(Debug)]
+pub struct PreloadedSection {
+    pub name: String,
+    /// Longest pair length in frames; shorter pairs are zero-padded by the mixer.
+    /// Per section, because sections differ in length — a 4-bar intro and an 8-bar
+    /// chorus loop at different points.
+    pub frames: usize,
+    pub pairs: Vec<StemPair>,
+}
+
+impl PreloadedSection {
+    /// Build a section from its decoded pairs, taking `frames` from the longest
+    /// one — shorter pairs are zero-padded by the mixer.
+    pub fn new(name: String, pairs: Vec<StemPair>) -> Self {
+        let frames = pairs.iter().map(|p| p.frames).max().unwrap_or(0);
+        PreloadedSection { name, frames, pairs }
+    }
+}
+
+/// A song decoded into RAM: every section, ready for the RT mixer to read.
+///
+/// **All** sections are resident, not just the active one. A section switch happens
+/// at a loop boundary that may be only a couple of bars away, which is not enough
+/// warning to load from disk — and keeping them resident means a switch is an index
+/// change rather than a data move, so it can be done exactly at the wrap sample.
 #[derive(Debug)]
 pub struct PreloadedSong {
     pub name: String,
     pub sample_rate: u32,
-    /// Longest pair length in frames; shorter pairs are zero-padded by the mixer.
-    pub frames: usize,
-    pub pairs: Vec<StemPair>,
+    /// Always at least one: a song without `[[sections]]` yields a single section
+    /// built from its `[[pairs]]` (see `Song::effective_sections`).
+    pub sections: Vec<PreloadedSection>,
     /// Nominal tempo, for the tempo-synced delay (§6). Carried on the song for
     /// the same reason as `looping`: switching songs must switch the tempo the
     /// delay syncs to, or the echoes stay locked to the previous song's grid.
@@ -73,22 +98,23 @@ pub fn load_song(
     base_dir: &Path,
     expected_rate: u32,
 ) -> Result<PreloadedSong, StemError> {
-    // Preallocate to the known pair count so the push loop never reallocates.
-    let mut pairs = Vec::with_capacity(song.pairs.len());
-    let mut frames = 0usize;
-    for pair in &song.pairs {
-        // `Path::join` handles the relative `file` path portably.
-        let decoded = load_pair(pair.index, &base_dir.join(&pair.file), expected_rate)?;
-        // `max` keeps the running longest length so the mixer knows how far the
-        // song runs even when one pair is shorter than another.
-        frames = frames.max(decoded.frames);
-        pairs.push(decoded);
+    // One code path: a song without `[[sections]]` arrives here as a single
+    // section, so nothing below has to care which form the file used.
+    let declared = song.effective_sections();
+    let mut sections = Vec::with_capacity(declared.len());
+    for section in &declared {
+        // Preallocate to the known pair count so the push loop never reallocates.
+        let mut pairs = Vec::with_capacity(section.pairs.len());
+        for pair in &section.pairs {
+            // `Path::join` handles the relative `file` path portably.
+            pairs.push(load_pair(pair.index, &base_dir.join(&pair.file), expected_rate)?);
+        }
+        sections.push(PreloadedSection::new(section.name.clone(), pairs));
     }
     Ok(PreloadedSong {
         name: song.song.name.clone(),
         sample_rate: expected_rate,
-        frames,
-        pairs,
+        sections,
         looping: song.song.looping,
         bpm: song.song.bpm,
     })
@@ -222,6 +248,63 @@ file = "{file}"
         assert!(song.song.looping, "`loop = true` should set it");
     }
 
+    /// Every section is decoded up front, each with its own length — a switch may
+    /// be only a bar away, which is not enough warning to hit the disk (§14).
+    #[test]
+    fn loads_every_section_with_its_own_length() {
+        let short = temp_wav("sect_short");
+        let long = temp_wav("sect_long");
+        let extra = temp_wav("sect_extra");
+        // 2 frames, 4 frames, 4 frames.
+        write_wav(&short, 2, 48_000, 24, &[0; 4]);
+        write_wav(&long, 2, 48_000, 24, &[0; 8]);
+        write_wav(&extra, 2, 48_000, 24, &[0; 8]);
+        let dir = short.parent().unwrap().to_path_buf();
+        let names: Vec<&str> = [&short, &long, &extra]
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        let song = Song::from_toml_str(&format!(
+            r#"
+[song]
+name = "t"
+bpm = 120.0
+length_samples = 4
+
+[[sections]]
+name = "intro"
+[[sections.pairs]]
+index = 0
+file = "{}"
+
+[[sections]]
+name = "chorus"
+[[sections.pairs]]
+index = 0
+file = "{}"
+[[sections.pairs]]
+index = 1
+file = "{}"
+"#,
+            names[0], names[1], names[2]
+        ))
+        .unwrap();
+
+        let loaded = load_song(&song, &dir, 48_000).unwrap();
+        assert_eq!(loaded.sections.len(), 2);
+        assert_eq!(loaded.sections[0].name, "intro");
+        assert_eq!(loaded.sections[0].frames, 2);
+        assert_eq!(loaded.sections[0].pairs.len(), 1);
+        assert_eq!(loaded.sections[1].name, "chorus");
+        assert_eq!(loaded.sections[1].frames, 4);
+        assert_eq!(loaded.sections[1].pairs.len(), 2);
+
+        for path in [short, long, extra] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     #[test]
     fn decodes_and_normalises_int24() {
         let path = temp_wav("ok");
@@ -231,10 +314,10 @@ file = "{file}"
         let song = song_with_pair(path.file_name().unwrap().to_str().unwrap());
         let loaded = load_song(&song, path.parent().unwrap(), 48_000).unwrap();
 
-        assert_eq!(loaded.frames, 2);
-        assert_eq!(loaded.pairs.len(), 1);
-        let s = &loaded.pairs[0].samples;
-        assert_eq!(loaded.pairs[0].frames, 2);
+        assert_eq!(loaded.sections[0].frames, 2);
+        assert_eq!(loaded.sections[0].pairs.len(), 1);
+        let s = &loaded.sections[0].pairs[0].samples;
+        assert_eq!(loaded.sections[0].pairs[0].frames, 2);
         // ~ +1.0 and ~ -1.0 at full scale; exact 0.0 for silence.
         assert!((s[0] - 1.0).abs() < 1e-4, "got {}", s[0]);
         assert!((s[1] + 1.0).abs() < 1e-4, "got {}", s[1]);
@@ -289,9 +372,9 @@ file = "{}"
         );
         let song = Song::from_toml_str(&toml).unwrap();
         let loaded = load_song(&song, p0.parent().unwrap(), 48_000).unwrap();
-        assert_eq!(loaded.frames, 3);
-        assert_eq!(loaded.pairs[0].frames, 3);
-        assert_eq!(loaded.pairs[1].frames, 1);
+        assert_eq!(loaded.sections[0].frames, 3);
+        assert_eq!(loaded.sections[0].pairs[0].frames, 3);
+        assert_eq!(loaded.sections[0].pairs[1].frames, 1);
         let _ = std::fs::remove_file(&p0);
         let _ = std::fs::remove_file(&p1);
     }

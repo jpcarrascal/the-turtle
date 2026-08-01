@@ -16,11 +16,13 @@ use crate::scheduler::PortScheduler;
 use crate::stems;
 
 /// Everything needed to start playback: the parsed show (for device/rate), the
-/// mixer primed with the song's stems, the song length in frames, and the song
+/// mixer primed with the song's stems, the active section's length in frames, and the song
 /// directory (so the MIDI scheduler can find the per-destination SMFs).
 pub struct Playable {
     pub show: Show,
     pub mixer: Mixer,
+    /// Length of the section that will play (§14); the whole song for a
+    /// section-less song.
     pub frames: u64,
     pub song_dir: PathBuf,
 }
@@ -56,8 +58,10 @@ pub fn load_playable(bundle: &Path, song: Option<&str>) -> Result<Playable, Stri
     // to the song directory.
     let preloaded =
         stems::load_song(&song, &song_dir, rate).map_err(|e| format!("stems: {e}"))?;
-    let frames = preloaded.frames as u64;
     let mut mixer = Mixer::new(preloaded, rate);
+    // The active section's length — `play` starts at section 0 (§14), so for a
+    // song without `[[sections]]` this is just the song length as before.
+    let frames = mixer.section_frames() as u64;
     // The song's `[delay]` layered over the show's, field by field (§6). This runs
     // on every load — including the background load behind a song switch — which is
     // what makes per-song settings work with no extra plumbing.

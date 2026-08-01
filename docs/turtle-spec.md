@@ -89,6 +89,27 @@ milliseconds — well within tolerance for kick-synced lighting and pedal/video 
 - **Format:** WAV int24 (converter output). WAV-only in v1.
 - **Master bus:** sum of pairs → optional brickwall limiter → device out (stereo).
 
+### 4.1 Sections
+
+A song may be split into **sections** — an intro, a verse, a chorus — each with its
+own set of up to 4 stereo pairs and its own length. A song without `[[sections]]` is
+treated internally as a single section holding its `[[pairs]]`, so there is one code
+path, not two.
+
+- **Every section is resident.** All of a song's sections are decoded into RAM when
+  the song loads, not just the one playing. Budget **≈1.5 MB of RAM per second of
+  section audio** (4 pairs = 8 channels of f32); six 8-second sections is ≈74 MB, so
+  arming the next song still fits comfortably.
+- **The loop point is per section**, not per song: a 4-bar intro and an 8-bar chorus
+  wrap at different places. `loop = true` loops the *active* section; with
+  `loop = false` the song still ends when that section runs out.
+- **DSP is sized for the widest section.** The mixer allocates chains for the largest
+  pair count across all sections, so changing section is an index change with no
+  allocation — a prerequisite for doing it on the audio thread.
+
+Selecting a section live (a note queues one, which takes over at the next loop wrap)
+is not implemented yet — see §14. Today playback starts at the first section.
+
 ---
 
 ## 5. MIDI scheduling and output
@@ -252,6 +273,36 @@ file  = "stems/pair2.wav"
 filter = "lp"                  # default transparent; live CC drives cutoff/Q
 ```
 
+A song with sections (§4.1) moves its stems into `[[sections]]` instead. The two forms
+are mutually exclusive — a song has either `[[pairs]]` or `[[sections]]`, never both:
+
+```toml
+[song]
+name = "Arranged"
+bpm  = 120.0
+length_samples = 5760000
+loop = true                    # loops the ACTIVE section
+
+[[sections]]
+name = "intro"                 # names must be non-empty and unique
+[[sections.pairs]]
+index = 0
+file  = "stems/intro_drums.wav"
+
+[[sections]]
+name = "chorus"
+[[sections.pairs]]
+index = 0
+file  = "stems/chorus_drums.wav"
+[[sections.pairs]]
+index = 1
+file  = "stems/chorus_gtr.wav"
+```
+
+Each section's pairs follow the same §4 rules on their own: at most 4, indices
+`0..=3`, no duplicates. `[dsp.pairN]` stays song-level — a pair index means the same
+filter topology in every section.
+
 ---
 
 ## 8. Control surface and state machine
@@ -400,6 +451,16 @@ a preallocated log ring).
   implemented; importing loop start/end from Ableton and toggling loop on/off live
   from a MIDI binding remain open. "Switch off mid-loop" would mean "continue past
   the loop end the next time it is crossed", never a jump.
+- **Live section switching** (§4.1): sections load and play, but selecting one is not
+  wired up. Agreed design: one note per section bound in `[control]`; the note queues
+  a section that takes over at the next loop wrap, never immediately; last one wins
+  with no special cases, so re-sending the playing section's note is a no-op and that
+  is also how you cancel; the queue clears after a switch. While stopped, a section
+  note selects the entry point and Start plays it. The switch itself is an index flip
+  on the RT thread at the wrap sample — a control-thread swap would land 1–2 ms late
+  and stutter, and rebuilding the mixer would reset the delay tail and filter state.
+- Per-section MIDI (each section carrying its own SMFs). Deliberately deferred: the
+  audio-only form is useful alone.
 - Crossfade segues (v1 is hard auto-advance only).
 - Touch-takeover blending of DSP params (v1 is live-only, no blend).
 - FLAC/`symphonia` stem support for smaller bundles.

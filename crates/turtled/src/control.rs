@@ -109,6 +109,10 @@ struct LoadedSong {
     /// Whether the incoming song loops (§14) — same reason as `frames`: it is a
     /// property of the song, so it has to travel with it across a switch.
     looping: bool,
+    /// How many sections the song has (§4.1); `1` for a song without `[[sections]]`.
+    sections: usize,
+    /// The section that will play — the first one, until switching exists.
+    first_section: String,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -124,6 +128,10 @@ fn load_song_payload(
     let schedulers = crate::play::load_schedulers(&p.show, &p.song_dir, rate);
     Ok(LoadedSong {
         looping: p.mixer.is_looping(),
+        // Captured before the mixer moves into the struct; only used for the log
+        // line, but on hardware "did my sections load?" is otherwise invisible.
+        sections: p.mixer.section_count(),
+        first_section: p.mixer.section_name().to_string(),
         mixer: p.mixer,
         schedulers,
         frames: p.frames,
@@ -566,6 +574,8 @@ pub fn run(
                             // moved out of `loaded` below.
                             duration_s = loaded.frames as f64 / rate as f64;
                             looping = loaded.looping;
+                            let sections = loaded.sections;
+                            let first_section = loaded.first_section.clone();
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -573,6 +583,13 @@ pub fn run(
                                 println!(
                                     "[armed] \"{song}\" wall={:.3}s",
                                     epoch.elapsed().as_secs_f64()
+                                );
+                            }
+                            // Only for a genuinely sectioned song: every other song
+                            // is one implicit section, and saying so would be noise.
+                            if sections > 1 {
+                                println!(
+                                    "[sections] {sections} loaded; starting at \"{first_section}\""
                                 );
                             }
                         } else if was_playing {
