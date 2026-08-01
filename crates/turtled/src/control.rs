@@ -502,7 +502,7 @@ pub fn run(
                         });
                     }
                     for cmd in rt_cmds {
-                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut probe);
+                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
                     }
                     // Select/Next/Prev arm a song without emitting any
                     // RtCommand (only `Action::Preload`), so this has to be
@@ -536,7 +536,7 @@ pub fn run(
                     });
                 }
                 for c in rt_cmds {
-                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut probe);
+                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose);
                 }
                 pump_preload(
                     &mut eng,
@@ -649,12 +649,6 @@ pub fn run(
                         for sched in schedulers.iter_mut() {
                             sched.seek(0);
                         }
-                        // Same reasoning as the cursors: the position jumped back
-                        // without time passing, so the pulse train rebases rather
-                        // than firing every pulse it "missed" in one burst.
-                        if let Some(p) = probe.as_mut() {
-                            p.reset_to(0);
-                        }
                         // Anything sounding from the previous pass is released, so
                         // a note held across the seam does not hang.
                         if verbose {
@@ -691,7 +685,7 @@ pub fn run(
                             });
                         }
                         for cmd in cmds {
-                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut probe);
+                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
                         }
                     }
                 }
@@ -807,7 +801,6 @@ fn dispatch_rt(
     tx: &mut crate::engine::RtProducer,
     epoch: std::time::Instant,
     verbose: bool,
-    probe: &mut Option<crate::clock_probe::ClockProbe>,
 ) {
     use crate::engine::RtCommand;
 
@@ -837,12 +830,6 @@ fn dispatch_rt(
             view.position = pos;
             for sched in schedulers.iter_mut() {
                 sched.seek(pos);
-            }
-            // The pulse train rebases with the cursors. Without this the probe
-            // would go quiet after the first Stop: its next pulse index would sit
-            // far ahead of a rewound position and never come due again.
-            if let Some(p) = probe.as_mut() {
-                p.reset_to(pos);
             }
         }
         RtCommand::ToggleMute(pair) => {

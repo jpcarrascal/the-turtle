@@ -25,8 +25,6 @@
 //! `offset_ms` already exists to trim. What a device hears is the *variation*, so
 //! peak-to-peak is the number that decides the design.
 
-use std::time::Duration;
-
 use turtle_core::timing::MidiClock;
 
 /// How many pulses to gather before printing a line. 480 is 20 beats — ten seconds
@@ -46,6 +44,11 @@ pub struct ClockProbe {
     lateness: Vec<u64>,
     /// Pulses seen since the probe started, across all windows.
     total: u64,
+    /// Position at the previous tick, for spotting a discontinuity.
+    last_pos: Option<u64>,
+    /// Discontinuities skipped in the current window — reported, not hidden,
+    /// because "the probe ignored something" must never be invisible.
+    skipped: u32,
 }
 
 impl ClockProbe {
@@ -55,6 +58,8 @@ impl ClockProbe {
             rate,
             lateness: Vec::with_capacity(REPORT_EVERY),
             total: 0,
+            last_pos: None,
+            skipped: 0,
         }
     }
 
@@ -63,16 +68,36 @@ impl ClockProbe {
     pub fn retempo(&mut self, bpm: f64) {
         self.clock = MidiClock::new(bpm, self.rate);
         self.lateness.clear();
-    }
-
-    /// A seek or a loop wrap: rebase without counting the pulses jumped over.
-    pub fn reset_to(&mut self, pos: u64) {
-        self.clock.reset_to(pos);
+        // A new song restarts the transport, so the old position says nothing
+        // about whether the next tick is continuous.
+        self.last_pos = None;
     }
 
     /// Call once per dispatch tick with the interpolated transport position.
     /// Returns a report line when a window completes.
+    ///
+    /// # Why discontinuities are detected here and not signalled
+    ///
+    /// An earlier version rebased from the `Looped` and `Seek` events instead. That
+    /// was wrong in a way worth recording: the RT thread snapshots the clock
+    /// *before* rendering, so when `Looped` reaches the control thread the last
+    /// published anchor is still the pre-wrap position at the end of the song.
+    /// Rebasing to 0 and then ticking with that position emitted every pulse in
+    /// between — a whole song's worth in one tick, reported as 43 seconds of
+    /// "lateness". Noticing the jump here needs no assumption about event ordering
+    /// at all, which is the only reason it is correct.
     pub fn tick(&mut self, pos: u64) -> Option<String> {
+        if let Some(prev) = self.last_pos.replace(pos) {
+            // Backwards is a wrap or a rewind. A big forward jump is a seek. Either
+            // way time did not pass, so the pulses in the gap were never late —
+            // they simply never came due.
+            let jump_forward = pos.saturating_sub(prev) > self.discontinuity_threshold();
+            if pos < prev || jump_forward {
+                self.clock.reset_to(pos);
+                self.skipped += 1;
+                return None;
+            }
+        }
         for index in self.clock.drain_due(pos) {
             // Saturating because a rebase can leave a pulse nominally ahead of the
             // position for one tick; that is a 0, not a negative.
@@ -80,6 +105,17 @@ impl ClockProbe {
             self.total += 1;
         }
         (self.lateness.len() >= REPORT_EVERY).then(|| self.report())
+    }
+
+    /// How far the position may advance in one tick before it reads as a seek
+    /// rather than a stall: 100 ms, about a hundred ticks.
+    ///
+    /// Set well above any stall worth measuring — a genuine 100 ms gap in the
+    /// dispatch loop would be an audible dropout with much bigger problems than
+    /// clock jitter — so real stalls stay in the statistics and only genuine
+    /// discontinuities are dropped.
+    fn discontinuity_threshold(&self) -> u64 {
+        self.rate as u64 / 10
     }
 
     /// Summarise and clear the window.
@@ -99,7 +135,7 @@ impl ClockProbe {
         let spread = max - min;
         let line = format!(
             "[clock] {} pulses  nominal {:.3}ms  late min {:.3} mean {:.3} p99 {:.3} max {:.3}ms  \
-             peak-to-peak {:.3}ms ({:.1}% of a pulse)",
+             peak-to-peak {:.3}ms ({:.1}% of a pulse)  {} discontinuities",
             self.total,
             ms(nominal),
             ms(min),
@@ -108,14 +144,11 @@ impl ClockProbe {
             ms(max),
             ms(spread),
             spread / nominal * 100.0,
+            self.skipped,
         );
         self.lateness.clear();
+        self.skipped = 0;
         line
-    }
-
-    /// The dispatch interval this probe is measuring against, for the banner.
-    pub fn tick_interval(&self) -> Duration {
-        Duration::from_millis(1)
     }
 }
 
@@ -167,16 +200,63 @@ mod tests {
         );
     }
 
-    /// A rebase must not bill the probe for pulses that were jumped over — a loop
-    /// wrap would otherwise report a burst of enormous lateness that never happened.
+    /// The bug this test exists for, measured on hardware: a loop wrap made the
+    /// probe report 43 SECONDS of "lateness" and 1537 pulses in a single tick,
+    /// because the position jumped back while the probe had been rebased to 0 from
+    /// an event that arrived before the clock caught up. Detecting the jump here
+    /// needs no assumption about event ordering.
     #[test]
-    fn a_rebase_does_not_count_the_pulses_jumped_over() {
+    fn a_backwards_jump_is_skipped_not_counted_as_lateness() {
         let mut p = ClockProbe::new(120.0, 48_000);
-        p.tick(1000);
+        // Play 40 seconds in, one tick at a time (48 samples per tick).
+        for tick in 0..40_000u64 {
+            p.tick(tick * 48);
+        }
         let before = p.total;
-        p.reset_to(48_000);
-        p.tick(48_000);
-        assert_eq!(p.total, before + 1, "only the pulse at the new position counts");
+        assert!(before > 1000, "should have counted real pulses first");
+
+        // The loop wraps: position drops to near zero.
+        assert_eq!(p.tick(0), None);
+        assert_eq!(p.total, before, "a wrap must not emit the pulses it jumped over");
+
+        // And the probe carries on counting from the new position.
+        for tick in 1..2000u64 {
+            p.tick(tick * 48);
+        }
+        assert!(p.total > before, "counting must resume after the wrap");
+        // Nothing pathological got into the statistics.
+        let worst = p.lateness.iter().copied().max().unwrap_or(0);
+        assert!(worst < 48 * 2, "post-wrap lateness should still be about a tick: {worst}");
+    }
+
+    /// A forward seek is the same discontinuity in the other direction, and would
+    /// otherwise dump every pulse it skipped as enormous lateness.
+    #[test]
+    fn a_forward_seek_is_skipped_too() {
+        let mut p = ClockProbe::new(120.0, 48_000);
+        for tick in 0..1000u64 {
+            p.tick(tick * 48);
+        }
+        let before = p.total;
+        p.tick(48_000 * 30); // jump 30 seconds ahead
+        assert_eq!(p.total, before, "a seek must not emit the pulses it skipped");
+    }
+
+    /// A real stall must still be counted — the discontinuity rule exists to drop
+    /// position jumps, not to hide the loop running late, which is the entire
+    /// point of the measurement.
+    #[test]
+    fn a_genuine_stall_stays_in_the_statistics() {
+        let mut p = ClockProbe::new(120.0, 48_000);
+        p.tick(0);
+        // 50 ms of transport passes in one tick: under the 100 ms threshold, so it
+        // is a stall, not a seek.
+        p.tick(48_000 / 20);
+        let worst = p.lateness.iter().copied().max().unwrap_or(0);
+        assert!(
+            worst > 48_000 / 100,
+            "a 50ms stall must show up as lateness, got {worst} samples"
+        );
     }
 
     /// Windows must not straddle a tempo change: the nominal interval differs, so
