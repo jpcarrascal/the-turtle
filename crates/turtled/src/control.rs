@@ -108,6 +108,10 @@ struct LoadedSong {
     frames: u64,
     /// Whether the incoming song loops (§14) — same reason as `frames`: it is a
     /// property of the song, so it has to travel with it across a switch.
+    ///
+    /// Now the **active section's** flag (§4.1), snapshotted when the song is armed.
+    /// That is exact while playback stays on one section; live section switching
+    /// will have to refresh it, since sections may differ.
     looping: bool,
     /// How many sections the song has (§4.1); `1` for a song without `[[sections]]`.
     sections: usize,

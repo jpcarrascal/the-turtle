@@ -415,7 +415,7 @@ impl Mixer {
     /// Read from the song rather than stored separately on the mixer, so a song
     /// switch cannot leave a stale flag behind.
     pub fn is_looping(&self) -> bool {
-        self.song.looping
+        self.section().looping
     }
 
     pub fn position(&self) -> u64 {
@@ -533,7 +533,7 @@ impl Mixer {
         // A looping song never finishes, which is what stops `EndReached` firing
         // and therefore what stops the gapless auto-advance (§8) from carrying the
         // setlist forward. Stop is the only way out, by design.
-        !self.song.looping && self.pos >= self.section().frames as u64
+        !self.section().looping && self.pos >= self.section().frames as u64
     }
 
     /// Jump to `pos` (rewind / restart) and clear DSP tails.
@@ -594,7 +594,7 @@ impl Mixer {
     pub fn render(&mut self, out: &mut [i32]) {
         let frames = out.len() / 2;
         // 0 when not looping, which turns the wrap below into a never-taken branch.
-        let wrap_at = if self.song.looping { self.section().frames as u64 } else { 0 };
+        let wrap_at = if self.section().looping { self.section().frames as u64 } else { 0 };
         for f in 0..frames {
             let raw = self.pos + f as u64;
             // `pos` is kept below `wrap_at` at the end of this function, so a
@@ -670,7 +670,7 @@ mod tests {
     use crate::stems::{PreloadedSection, StemPair};
 
     fn song(pairs: Vec<StemPair>) -> PreloadedSong {
-        sectioned(vec![PreloadedSection::new("t".into(), pairs)])
+        sectioned(vec![PreloadedSection::new("t".into(), pairs, false)])
     }
 
     /// A song of several named sections, for the section tests.
@@ -679,14 +679,13 @@ mod tests {
             name: "t".into(),
             sample_rate: 48_000,
             sections,
-            looping: false,
             bpm: 120.0,
         }
     }
 
-    /// The same, but flagged `loop = true`.
+    /// The same, but with its one section flagged `loop = true`.
     fn looping_song(pairs: Vec<StemPair>) -> PreloadedSong {
-        PreloadedSong { looping: true, ..song(pairs) }
+        sectioned(vec![PreloadedSection::new("t".into(), pairs, true)])
     }
 
     fn pair(index: u8, samples: Vec<f32>) -> StemPair {
@@ -1377,13 +1376,36 @@ mod tests {
             "a default must be identical to the same value arriving as a CC"
         );
     }
+    /// Looping is the ACTIVE section's business: a non-looping section inside a
+    /// looping song must still end, and a looping one must not.
+    #[test]
+    fn looping_follows_the_active_section() {
+        let one_shot =
+            || PreloadedSection::new("one_shot".into(), vec![pair(0, vec![0.5; 8])], false);
+        let vamp = || PreloadedSection::new("vamp".into(), vec![pair(0, vec![0.5; 8])], true);
+
+        let mut m = Mixer::new(sectioned(vec![one_shot(), vamp()]), 48_000);
+        assert!(!m.is_looping());
+        let mut out = vec![0i32; 8];
+        m.render(&mut out);
+        assert!(m.is_finished(), "a non-looping section ends even mid-song");
+
+        // The same two sections, the looping one first.
+        let mut m = Mixer::new(sectioned(vec![vamp(), one_shot()]), 48_000);
+        assert!(m.is_looping());
+        for _ in 0..4 {
+            m.render(&mut out);
+            assert!(!m.is_finished(), "a looping section never finishes");
+        }
+    }
+
     // ---- sections (§14) ----
 
     /// The mixer plays the first section, not a concatenation and not the others.
     #[test]
     fn playback_reads_the_active_section() {
-        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 8])]);
-        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.25; 8])]);
+        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 8])], false);
+        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.25; 8])], false);
         let mut m = Mixer::new(sectioned(vec![a, b]), 48_000);
         assert_eq!(m.section_count(), 2);
         assert_eq!(m.section_name(), "a");
@@ -1404,8 +1426,8 @@ mod tests {
     #[test]
     fn end_of_playback_follows_the_active_sections_length() {
         // Section a is 2 frames; section b is much longer.
-        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 4])]);
-        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.5; 400])]);
+        let a = PreloadedSection::new("a".into(), vec![pair(0, vec![0.5; 4])], false);
+        let b = PreloadedSection::new("b".into(), vec![pair(0, vec![0.5; 400])], false);
         let mut m = Mixer::new(sectioned(vec![a, b]), 48_000);
         let mut out = vec![0i32; 4];
         m.render(&mut out);
@@ -1416,11 +1438,12 @@ mod tests {
     /// the widest section — allocating there would be a dropout.
     #[test]
     fn chains_are_allocated_for_the_widest_section() {
-        let narrow = || PreloadedSection::new("narrow".into(), vec![pair(0, vec![0.5; 4])]);
+        let narrow = || PreloadedSection::new("narrow".into(), vec![pair(0, vec![0.5; 4])], false);
         let wide = || {
             PreloadedSection::new(
                 "wide".into(),
                 vec![pair(0, vec![0.5; 4]), pair(1, vec![0.5; 4]), pair(2, vec![0.5; 4])],
+                false,
             )
         };
         // Widest last, then widest first: order must not matter.
@@ -1434,10 +1457,11 @@ mod tests {
     /// rather than reading past the end of its pair list.
     #[test]
     fn a_narrow_section_renders_without_touching_spare_chains() {
-        let narrow = PreloadedSection::new("narrow".into(), vec![pair(0, vec![0.5; 8])]);
+        let narrow = PreloadedSection::new("narrow".into(), vec![pair(0, vec![0.5; 8])], false);
         let wide = PreloadedSection::new(
             "wide".into(),
             vec![pair(0, vec![0.5; 8]), pair(1, vec![0.5; 8]), pair(2, vec![0.5; 8])],
+            false,
         );
         let mut m = Mixer::new(sectioned(vec![narrow, wide]), 48_000);
         let mut out = vec![0i32; 8];

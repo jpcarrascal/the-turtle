@@ -35,14 +35,17 @@ pub struct PreloadedSection {
     /// chorus loop at different points.
     pub frames: usize,
     pub pairs: Vec<StemPair>,
+    /// Whether this section repeats at its end. Already resolved against the
+    /// song-level default by `Section::loops`, so the RT thread just reads a bool.
+    pub looping: bool,
 }
 
 impl PreloadedSection {
     /// Build a section from its decoded pairs, taking `frames` from the longest
     /// one — shorter pairs are zero-padded by the mixer.
-    pub fn new(name: String, pairs: Vec<StemPair>) -> Self {
+    pub fn new(name: String, pairs: Vec<StemPair>, looping: bool) -> Self {
         let frames = pairs.iter().map(|p| p.frames).max().unwrap_or(0);
-        PreloadedSection { name, frames, pairs }
+        PreloadedSection { name, frames, pairs, looping }
     }
 }
 
@@ -59,14 +62,11 @@ pub struct PreloadedSong {
     /// Always at least one: a song without `[[sections]]` yields a single section
     /// built from its `[[pairs]]` (see `Song::effective_sections`).
     pub sections: Vec<PreloadedSection>,
-    /// Nominal tempo, for the tempo-synced delay (§6). Carried on the song for
-    /// the same reason as `looping`: switching songs must switch the tempo the
-    /// delay syncs to, or the echoes stay locked to the previous song's grid.
+    /// Nominal tempo, for the tempo-synced delay (§6). Carried on the song, not the
+    /// section, because switching songs must switch the tempo the delay syncs to or
+    /// the echoes stay locked to the previous song's grid — whereas a section change
+    /// is within one tempo.
     pub bpm: f64,
-    /// `[song] loop` — repeat instead of ending (§14). Carried on the *song*, not
-    /// the mixer's configuration, so switching songs switches the behaviour with
-    /// it rather than leaving a stale flag behind.
-    pub looping: bool,
 }
 
 /// Why a stem failed to load. `thiserror` derives the `Display`/`Error` impls
@@ -109,13 +109,17 @@ pub fn load_song(
             // `Path::join` handles the relative `file` path portably.
             pairs.push(load_pair(pair.index, &base_dir.join(&pair.file), expected_rate)?);
         }
-        sections.push(PreloadedSection::new(section.name.clone(), pairs));
+        sections.push(PreloadedSection::new(
+            section.name.clone(),
+            pairs,
+            // Section's own `loop` if it has one, else the song's (§4.1).
+            section.loops(&song.song),
+        ));
     }
     Ok(PreloadedSong {
         name: song.song.name.clone(),
         sample_rate: expected_rate,
         sections,
-        looping: song.song.looping,
         bpm: song.song.bpm,
     })
 }
@@ -226,11 +230,11 @@ file = "{file}"
 
         let mut song = song_with_pair(file);
         assert!(!song.song.looping, "default is off, so existing songs are unaffected");
-        assert!(!load_song(&song, base, 48_000).unwrap().looping);
+        assert!(!load_song(&song, base, 48_000).unwrap().sections[0].looping);
 
         song.song.looping = true;
         assert!(
-            load_song(&song, base, 48_000).unwrap().looping,
+            load_song(&song, base, 48_000).unwrap().sections[0].looping,
             "loop = true must survive loading"
         );
         std::fs::remove_file(&path).ok();

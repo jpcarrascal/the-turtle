@@ -303,8 +303,11 @@ pub struct SongMeta {
     /// Nominal tempo, used for tempo-synced delay (§6).
     pub bpm: f64,
     pub length_samples: u64,
-    /// Repeat this song seamlessly until it is stopped, instead of ending and
-    /// auto-advancing to the next setlist entry (§14).
+    /// Repeat seamlessly until stopped, instead of ending and auto-advancing to the
+    /// next setlist entry (§14).
+    ///
+    /// For a song with sections this is the **default** for its sections; each may
+    /// override it with its own `loop` (see [`Section::looping`]).
     ///
     /// Named `looping` because `loop` is a Rust keyword; the TOML key is `loop`.
     /// Defaults to false, so existing songs are unaffected.
@@ -326,6 +329,26 @@ pub struct Section {
     /// This section's stems. Sections may use different numbers of pairs.
     #[serde(default)]
     pub pairs: Vec<Pair>,
+    /// Whether this section repeats when it reaches its end, overriding the
+    /// song-level `loop`. `None` means "whatever the song says".
+    ///
+    /// Per section because an arrangement mixes both: an intro that plays once and
+    /// then hands over, a chorus that vamps until you leave it. The song-level flag
+    /// stays as the default so a song of uniformly looping sections says it once.
+    ///
+    /// TOML key is `loop`; see [`SongMeta::looping`] for why the field is not.
+    #[serde(default, rename = "loop")]
+    pub looping: Option<bool>,
+}
+
+impl Section {
+    /// Does this section loop, given the song it belongs to?
+    ///
+    /// The section's own `loop` wins; absent, the song's applies. Resolved here
+    /// rather than at each call site so the precedence exists in exactly one place.
+    pub fn loops(&self, song: &SongMeta) -> bool {
+        self.looping.unwrap_or(song.looping)
+    }
 }
 
 /// One stereo stem pair (§4): up to 4 per song.
@@ -553,6 +576,9 @@ impl Song {
             vec![Section {
                 name: self.song.name.clone(),
                 pairs: self.pairs.clone(),
+                // `None`, not `Some(self.song.looping)`: the fallback lives in
+                // `Section::loops`, so there is one place it can be got wrong.
+                looping: None,
             }]
         } else {
             self.sections.clone()
@@ -839,6 +865,57 @@ file  = "stems/c.wav"
         assert!(err.contains("out of range"), "missing range error: {err}");
         // And it says WHICH section, since a song now has several.
         assert!(err.contains("bad"), "error should name the section: {err}");
+    }
+
+    /// `loop` is per section, with the song's as the default — an arrangement mixes
+    /// a one-shot intro with a vamping chorus, so one flag for the whole song cannot
+    /// express it.
+    #[test]
+    fn section_loop_overrides_the_song_default() {
+        let toml = r#"
+[song]
+name = "L"
+bpm  = 120.0
+length_samples = 100
+loop = true
+
+[[sections]]
+name = "intro"
+loop = false
+[[sections.pairs]]
+index = 0
+file  = "stems/a.wav"
+
+[[sections]]
+name = "chorus"
+[[sections.pairs]]
+index = 0
+file  = "stems/b.wav"
+"#;
+        let song = Song::from_toml_str(toml).expect("parse");
+        song.validate().expect("valid");
+        let sections = song.effective_sections();
+        assert!(!sections[0].loops(&song.song), "an explicit `loop = false` wins");
+        assert!(sections[1].loops(&song.song), "no `loop` inherits the song's");
+
+        // And the other way round: a looping section inside a non-looping song.
+        let song = Song::from_toml_str(&toml.replace("loop = true", "loop = false")
+            .replace("loop = false
+[[sections.pairs]]", "loop = true
+[[sections.pairs]]"))
+            .expect("parse");
+        assert!(song.effective_sections()[0].loops(&song.song));
+        assert!(!song.effective_sections()[1].loops(&song.song));
+    }
+
+    /// A song without sections keeps behaving exactly as it did: its single
+    /// implicit section takes the song-level flag.
+    #[test]
+    fn a_section_less_song_inherits_its_own_loop_flag() {
+        let toml = "[song]\nname=\"t\"\nbpm=120.0\nlength_samples=4\nloop = true\n\
+                    [[pairs]]\nindex=0\nfile=\"stems/a.wav\"\n";
+        let song = Song::from_toml_str(toml).unwrap();
+        assert!(song.effective_sections()[0].loops(&song.song));
     }
 
     /// End-to-end: a `[ports]` table in a real show.toml must produce the ALSA

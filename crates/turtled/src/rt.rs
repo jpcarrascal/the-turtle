@@ -217,8 +217,7 @@ mod tests {
         let song = PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            sections: vec![PreloadedSection::new("t".into(), vec![pair])],
-            looping: false,
+            sections: vec![PreloadedSection::new("t".into(), vec![pair], false)],
             bpm: 120.0,
         };
         Mixer::new(song, 48_000)
@@ -280,8 +279,7 @@ mod tests {
         let song = PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            sections: vec![PreloadedSection::new("t".into(), vec![pair])],
-            looping: false,
+            sections: vec![PreloadedSection::new("t".into(), vec![pair], false)],
             bpm: 120.0,
         };
         let mut m = Mixer::new(song, 48_000);
@@ -336,8 +334,7 @@ mod tests {
         let song = PreloadedSong {
             name: "t".into(),
             sample_rate: 48_000,
-            sections: vec![PreloadedSection::new("t".into(), vec![pair])],
-            looping: true,
+            sections: vec![PreloadedSection::new("t".into(), vec![pair], true)],
             bpm: 120.0,
         };
         let mut m = Mixer::new(song, 48_000);

@@ -100,9 +100,11 @@ path, not two.
   the song loads, not just the one playing. Budget **≈1.5 MB of RAM per second of
   section audio** (4 pairs = 8 channels of f32); six 8-second sections is ≈74 MB, so
   arming the next song still fits comfortably.
-- **The loop point is per section**, not per song: a 4-bar intro and an 8-bar chorus
-  wrap at different places. `loop = true` loops the *active* section; with
-  `loop = false` the song still ends when that section runs out.
+- **Looping is per section**, both the flag and the point. A 4-bar intro and an 8-bar
+  chorus wrap in different places, and an arrangement mixes a one-shot intro with a
+  vamping chorus — so each section carries its own `loop`, defaulting to the song's.
+  A section with `loop = false` ends the song when it runs out, wherever it sits in
+  the arrangement.
 - **DSP is sized for the widest section.** The mixer allocates chains for the largest
   pair count across all sections, so changing section is an index change with no
   allocation — a prerequisite for doing it on the audio thread.
@@ -281,16 +283,17 @@ are mutually exclusive — a song has either `[[pairs]]` or `[[sections]]`, neve
 name = "Arranged"
 bpm  = 120.0
 length_samples = 5760000
-loop = true                    # loops the ACTIVE section
+loop = true                    # the DEFAULT for this song's sections
 
 [[sections]]
 name = "intro"                 # names must be non-empty and unique
+loop = false                   # ...which a section may override: plays once, ends
 [[sections.pairs]]
 index = 0
 file  = "stems/intro_drums.wav"
 
 [[sections]]
-name = "chorus"
+name = "chorus"                # no `loop`, so it takes the song's: vamps
 [[sections.pairs]]
 index = 0
 file  = "stems/chorus_drums.wav"
