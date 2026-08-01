@@ -205,6 +205,14 @@ pub struct Destination {
     /// Signed millisecond offset applied at dispatch; compensates mean latency.
     #[serde(default)]
     pub offset_ms: f64,
+    /// Send MIDI clock to this port while playing (§5).
+    ///
+    /// Opt-in per destination rather than everywhere, so a port carrying only
+    /// lighting cues is not made to parse 48 bytes a second it will ignore — and
+    /// so `offset_ms` above applies to the clock as it does to cues, which is what
+    /// makes a port's latency trim mean one thing rather than two.
+    #[serde(default)]
+    pub clock: bool,
 }
 
 /// Incoming foot-controller map (§7.1). All entries are remappable.

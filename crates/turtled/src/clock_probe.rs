@@ -25,7 +25,7 @@
 //! `offset_ms` already exists to trim. What a device hears is the *variation*, so
 //! peak-to-peak is the number that decides the design.
 
-use turtle_core::timing::MidiClock;
+use turtle_core::timing::{Advance, MidiClock};
 
 /// How many pulses to gather before printing a line. 480 is 20 beats — ten seconds
 /// at 120 BPM, often enough to watch a trend and rare enough not to flood a log.
@@ -44,8 +44,6 @@ pub struct ClockProbe {
     lateness: Vec<u64>,
     /// Pulses seen since the probe started, across all windows.
     total: u64,
-    /// Position at the previous tick, for spotting a discontinuity.
-    last_pos: Option<u64>,
     /// Discontinuities skipped in the current window — reported, not hidden,
     /// because "the probe ignored something" must never be invisible.
     skipped: u32,
@@ -58,7 +56,6 @@ impl ClockProbe {
             rate,
             lateness: Vec::with_capacity(REPORT_EVERY),
             total: 0,
-            last_pos: None,
             skipped: 0,
         }
     }
@@ -68,54 +65,30 @@ impl ClockProbe {
     pub fn retempo(&mut self, bpm: f64) {
         self.clock = MidiClock::new(bpm, self.rate);
         self.lateness.clear();
-        // A new song restarts the transport, so the old position says nothing
-        // about whether the next tick is continuous.
-        self.last_pos = None;
     }
 
     /// Call once per dispatch tick with the interpolated transport position.
     /// Returns a report line when a window completes.
     ///
-    /// # Why discontinuities are detected here and not signalled
-    ///
-    /// An earlier version rebased from the `Looped` and `Seek` events instead. That
-    /// was wrong in a way worth recording: the RT thread snapshots the clock
-    /// *before* rendering, so when `Looped` reaches the control thread the last
-    /// published anchor is still the pre-wrap position at the end of the song.
-    /// Rebasing to 0 and then ticking with that position emitted every pulse in
-    /// between — a whole song's worth in one tick, reported as 43 seconds of
-    /// "lateness". Noticing the jump here needs no assumption about event ordering
-    /// at all, which is the only reason it is correct.
+    /// Discontinuities — a loop wrap, a rewind, a seek — are recognised by
+    /// [`MidiClock::advance`] itself and counted here rather than dropped silently:
+    /// "the probe ignored something" must never be invisible in a measurement tool.
     pub fn tick(&mut self, pos: u64) -> Option<String> {
-        if let Some(prev) = self.last_pos.replace(pos) {
-            // Backwards is a wrap or a rewind. A big forward jump is a seek. Either
-            // way time did not pass, so the pulses in the gap were never late —
-            // they simply never came due.
-            let jump_forward = pos.saturating_sub(prev) > self.discontinuity_threshold();
-            if pos < prev || jump_forward {
-                self.clock.reset_to(pos);
+        match self.clock.advance(pos) {
+            Advance::Discontinuity => {
                 self.skipped += 1;
                 return None;
             }
-        }
-        for index in self.clock.drain_due(pos) {
-            // Saturating because a rebase can leave a pulse nominally ahead of the
-            // position for one tick; that is a 0, not a negative.
-            self.lateness.push(pos.saturating_sub(self.clock.pulse_sample(index)));
-            self.total += 1;
+            Advance::Pulses(due) => {
+                for index in due {
+                    // Saturating because a rebase can leave a pulse nominally ahead
+                    // of the position for one tick; that is a 0, not a negative.
+                    self.lateness.push(pos.saturating_sub(self.clock.pulse_sample(index)));
+                    self.total += 1;
+                }
+            }
         }
         (self.lateness.len() >= REPORT_EVERY).then(|| self.report())
-    }
-
-    /// How far the position may advance in one tick before it reads as a seek
-    /// rather than a stall: 100 ms, about a hundred ticks.
-    ///
-    /// Set well above any stall worth measuring — a genuine 100 ms gap in the
-    /// dispatch loop would be an audible dropout with much bigger problems than
-    /// clock jitter — so real stalls stay in the statistics and only genuine
-    /// discontinuities are dropped.
-    fn discontinuity_threshold(&self) -> u64 {
-        self.rate as u64 / 10
     }
 
     /// Summarise and clear the window.

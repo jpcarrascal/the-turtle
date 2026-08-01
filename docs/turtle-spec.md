@@ -107,6 +107,42 @@ milliseconds — well within tolerance for kick-synced lighting and pedal/video 
   which has no automation.
 - **MIDI panic** command: all-notes-off + reset-all-controllers on every port.
 
+### 5.1 MIDI clock master
+
+Destinations may ask for MIDI clock:
+
+```toml
+[[destinations]]
+name = "pedals"
+port = "CME:2"
+offset_ms = 0.0
+clock = true                   # 24 ppqn while playing
+```
+
+- **Tempo only.** 24 `0xF8` pulses per quarter note while playing, `0xFA` on start,
+  `0xFC` on stop. No Song Position Pointer: downstream learns how fast, not where.
+  That is what makes a **loop wrap need no handling** — there is no position to
+  correct, so a wrap is just a discontinuity the pulse train rebases across.
+- **Opt-in per destination**, so a port carrying only lighting cues is not made to
+  parse 48 bytes a second it will ignore. Each port's `offset_ms` applies to its
+  clock exactly as to its cues, so a latency trim means one thing rather than two.
+- **Only while playing.** On stop, gear typically reverts to its own tempo — for a
+  delay pedal that means a ringing tail can change time mid-decay.
+- **Tempo is the song's nominal BPM** (§14). A song whose project changes tempo will
+  hold one tempo while its stems do not.
+
+Pulse times are **derived** from the transport position, never accumulated: pulse
+*n* is at `round(n × samples_per_pulse)`. Accumulating a rounded interval would drift
+about a quarter-second per hour at an awkward tempo. So the clock has no drift, and
+what varies is only each pulse's phase — bounded by one dispatch tick.
+
+Measured on the Pi before this was built (`turtled --clock-probe`, which reports
+pulse lateness without sending anything): peak-to-peak 1.0–1.2 ms against a 28.4 ms
+pulse, mean lateness a stable half-tick over 4800 pulses. Gear that averages tempo
+over a window therefore sees the exact tempo; gear that retimes per pulse sees ~4%.
+Had that been worse, the fallback was a dedicated thread sleeping to each pulse
+deadline off the transport clock.
+
 ---
 
 ## 6. Native DSP — live "knobs"
@@ -195,6 +231,7 @@ CME = "H4MIDIWC"               # so "CME:1".."CME:4" address its four ports
 name = "lights"
 port = "CME:1"
 offset_ms = -8.0
+clock = false                  # optional: 24 ppqn MIDI clock (§5.1); default off
 [[destinations]]
 name = "pedals"
 port = "CME:2"
@@ -400,19 +437,13 @@ a preallocated log ring).
   implemented; importing loop start/end from Ableton and toggling loop on/off live
   from a MIDI binding remain open. "Switch off mid-loop" would mean "continue past
   the loop end the next time it is crossed", never a jump.
-- **MIDI clock master** (§5). Agreed shape: tempo-only — 24 ppqn `0xF8` pulses plus
-  `0xFA`/`0xFC` on start/stop, no Song Position Pointer, so downstream knows how fast
-  but not where. That choice makes a loop wrap need no handling at all, since there
-  is no position to correct. Opt-in per destination (`clock = true`), with the port's
-  `offset_ms` applying as it does to cues. Pulses only while playing.
-  `turtled --clock-probe` measures the jitter this would have without sending
-  anything: pulse times are derived from the transport position, so there is **no
-  drift**, but each pulse can be up to one dispatch tick (~1 ms) late, which is ~5%
-  of a pulse at 120 BPM. Gear that averages tempo sees the exact mean; gear that
-  retimes per pulse sees the spread. If the measurement says that is too much, clock
-  moves to a dedicated thread sleeping to each pulse deadline off the seqlock clock.
-  Tempo is nominal BPM per song, so a song with tempo changes would drift against its
-  own stems.
+- Bar-accurate MIDI clock: Song Position Pointer + Continue, so downstream lands on
+  the right bar rather than merely at the right tempo (§5 sends tempo only). Needs a
+  decision about loop wraps — a wrap would have to re-send SPP, which most gear
+  answers by briefly stopping — and the constant-tempo limit below starts to matter.
+- Full tempo-map following, so clock and the tempo-synced delay track a song whose
+  project changes tempo. Today both use one nominal BPM per song, and such a song
+  would drift against its own stems.
 - Crossfade segues (v1 is hard auto-advance only).
 - Touch-takeover blending of DSP params (v1 is live-only, no blend).
 - FLAC/`symphonia` stem support for smaller bundles.

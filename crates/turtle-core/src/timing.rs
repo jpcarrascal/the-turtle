@@ -179,6 +179,22 @@ pub struct MidiClock {
     samples_per_pulse: f64,
     /// The next pulse index not yet emitted.
     next_index: u64,
+    /// Position at the previous [`advance`](MidiClock::advance), for spotting a
+    /// discontinuity.
+    last_pos: Option<u64>,
+    /// A position jump larger than this reads as a seek rather than a stall.
+    discontinuity: u64,
+}
+
+/// What [`MidiClock::advance`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Advance {
+    /// Pulse indices that came due since the previous call.
+    Pulses(std::ops::Range<u64>),
+    /// The transport jumped — a loop wrap, a rewind, a seek. The clock has
+    /// rebased and emitted nothing, because no time passed: those pulses were
+    /// never late, they simply never came due.
+    Discontinuity,
 }
 
 impl MidiClock {
@@ -201,7 +217,16 @@ impl MidiClock {
     pub fn new(bpm: f64, rate: u32) -> Self {
         let bpm = if bpm.is_finite() && bpm > 0.0 { bpm } else { 1.0 };
         let samples_per_pulse = (60.0 * rate as f64 / (bpm * PPQN as f64)).max(1.0);
-        MidiClock { samples_per_pulse, next_index: 0 }
+        MidiClock {
+            samples_per_pulse,
+            next_index: 0,
+            last_pos: None,
+            // 100 ms, about a hundred dispatch ticks. Set well above any stall
+            // worth noticing — a 100 ms gap in the dispatch loop would be an
+            // audible dropout with much larger problems than clock timing — so a
+            // loop merely running late still emits its pulses.
+            discontinuity: rate as u64 / 10,
+        }
     }
 
     /// The sample time of pulse `index`, from the start of the song.
@@ -215,12 +240,28 @@ impl MidiClock {
         self.samples_per_pulse
     }
 
-    /// Pulse indices due at or before `pos`, advancing past them.
+    /// The pulses due at `pos`, or a report that the transport jumped.
     ///
-    /// A range rather than a count so a caller can report *which* pulse it sent and
-    /// compare against [`pulse_sample`](Self::pulse_sample) — which is the whole
-    /// point when measuring jitter.
-    pub fn drain_due(&mut self, pos: u64) -> std::ops::Range<u64> {
+    /// This is the only way to drive the clock, deliberately. An earlier version
+    /// exposed the draining and the rebasing separately and left callers to notice
+    /// discontinuities from transport *events* — which was wrong, because
+    /// `RtEvent::Looped` reaches the control thread before the clock has published
+    /// a post-wrap anchor, so a rebase to 0 was followed by a tick at the old
+    /// position and emitted an entire song of pulses at once. Detecting the jump
+    /// from the position itself needs no assumption about event ordering, and
+    /// keeping it in here means no caller can get it wrong again.
+    pub fn advance(&mut self, pos: u64) -> Advance {
+        if let Some(prev) = self.last_pos.replace(pos) {
+            if pos < prev || pos - prev > self.discontinuity {
+                self.reset_to(pos);
+                return Advance::Discontinuity;
+            }
+        }
+        Advance::Pulses(self.drain_due(pos))
+    }
+
+    /// Pulse indices due at or before `pos`, advancing past them.
+    fn drain_due(&mut self, pos: u64) -> std::ops::Range<u64> {
         let start = self.next_index;
         while self.pulse_sample(self.next_index) <= pos {
             self.next_index += 1;
@@ -229,11 +270,7 @@ impl MidiClock {
     }
 
     /// Rebase to `pos`, emitting nothing for the pulses skipped over.
-    ///
-    /// For a seek, a loop wrap, or a section of the song being jumped past: the
-    /// position moved without time passing, and firing every intervening pulse in
-    /// one burst would be heard downstream as a tempo spike.
-    pub fn reset_to(&mut self, pos: u64) {
+    fn reset_to(&mut self, pos: u64) {
         self.next_index = 0;
         while self.pulse_sample(self.next_index) < pos {
             self.next_index += 1;
@@ -375,33 +412,55 @@ mod tests {
     }
 
     #[test]
-    fn draining_returns_each_pulse_exactly_once() {
+    fn advancing_returns_each_pulse_exactly_once() {
         let mut c = MidiClock::new(120.0, 48_000);
         // Pulse 0 is at sample 0, so it is due immediately.
-        assert_eq!(c.drain_due(0), 0..1);
-        assert_eq!(c.drain_due(999), 1..1, "nothing new until the next pulse time");
-        assert_eq!(c.drain_due(1000), 1..2);
-        // A long gap yields every pulse in it, in order, none repeated.
-        assert_eq!(c.drain_due(5000), 2..6);
-        assert_eq!(c.drain_due(5000), 6..6);
+        assert_eq!(c.advance(0), Advance::Pulses(0..1));
+        assert_eq!(c.advance(999), Advance::Pulses(1..1), "nothing until the next pulse time");
+        assert_eq!(c.advance(1000), Advance::Pulses(1..2));
+        // A gap yields every pulse in it, in order, none repeated.
+        assert_eq!(c.advance(5000), Advance::Pulses(2..6));
+        assert_eq!(c.advance(5000), Advance::Pulses(6..6));
     }
 
     /// A seek or a loop wrap moves the position without time passing. Firing every
     /// pulse in between would be heard downstream as a tempo spike, so a rebase
     /// emits nothing.
+    /// The failure seen on hardware: a loop wrap made the probe report an entire
+    /// song of pulses in one tick, at 43 seconds of "lateness". A backwards jump
+    /// must rebase and emit nothing.
     #[test]
-    fn resetting_skips_the_pulses_jumped_over() {
+    fn a_backwards_jump_is_a_discontinuity_not_a_burst() {
         let mut c = MidiClock::new(120.0, 48_000);
-        c.drain_due(10_000); // pulses 0..=10
-        c.reset_to(48_000);
-        // Nothing owed for the jump itself...
-        assert_eq!(c.drain_due(48_000), 48..49, "only the pulse AT the new position");
-        // ...and it carries on from there.
-        assert_eq!(c.drain_due(49_000), 49..50);
+        c.advance(10_000); // pulses 0..=10
+        assert_eq!(c.advance(0), Advance::Discontinuity, "a wrap emits nothing");
+        // ...and the train resumes from the top of the loop: pulse 0 sits exactly
+        // at the new position, so it is still owed and fires on the next tick.
+        assert_eq!(c.advance(1000), Advance::Pulses(0..2));
+    }
 
-        // Rebasing to 0 (the loop wrap case) starts the train again from pulse 0.
-        c.reset_to(0);
-        assert_eq!(c.drain_due(0), 0..1);
+    /// A forward seek is the same discontinuity in the other direction.
+    #[test]
+    fn a_large_forward_jump_is_a_discontinuity() {
+        let mut c = MidiClock::new(120.0, 48_000);
+        c.advance(0);
+        assert_eq!(c.advance(48_000 * 30), Advance::Discontinuity, "a seek emits nothing");
+        // Pulse 1440 lands exactly on the seek target, so it is owed, not skipped.
+        assert_eq!(c.advance(48_000 * 30 + 1000), Advance::Pulses(1440..1442));
+    }
+
+    /// But a loop merely running late is NOT a discontinuity — those pulses are
+    /// genuinely due, and swallowing them would hide the very thing the clock
+    /// exists to get right.
+    #[test]
+    fn a_stall_short_of_the_threshold_still_emits_its_pulses() {
+        let mut c = MidiClock::new(120.0, 48_000);
+        c.advance(0);
+        // 50ms later: under the 100ms threshold, so these pulses are late, not gone.
+        match c.advance(48_000 / 20) {
+            Advance::Pulses(r) => assert_eq!(r.end - r.start, 2, "a 50ms stall owes 2 pulses"),
+            Advance::Discontinuity => panic!("a 50ms stall is not a discontinuity"),
+        }
     }
 
     /// A song's tempo is validated `> 0`, but the control thread must not panic
@@ -415,8 +474,8 @@ mod tests {
             let mut c = MidiClock::new(bpm, 48_000);
             assert!(c.samples_per_pulse().is_finite(), "bpm {bpm} gave a non-finite interval");
             assert!(c.samples_per_pulse() >= 1.0, "bpm {bpm} gave a sub-sample interval");
-            let _ = c.drain_due(48_000);
-            c.reset_to(48_000);
+            let _ = c.advance(48_000);
+            let _ = c.advance(96_000);
         }
     }
 

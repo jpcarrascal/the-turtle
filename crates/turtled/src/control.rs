@@ -267,6 +267,9 @@ pub fn run(
     // The clock probe, when `--clock-probe` asked for it (§5). `None` in a show:
     // it logs, and logging from this SCHED_FIFO loop is a diagnostic, not a feature.
     let mut probe = clock_probe.then(|| crate::clock_probe::ClockProbe::new(mixer.bpm(), rate));
+    // MIDI clock master (§5), for whichever destinations set `clock = true`. Inert
+    // when none did, so there is no second code path for shows that want none.
+    let mut clock_out = crate::clock_out::ClockOut::new(&show, mixer.bpm(), rate);
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -502,7 +505,7 @@ pub fn run(
                         });
                     }
                     for cmd in rt_cmds {
-                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
                     }
                     // Select/Next/Prev arm a song without emitting any
                     // RtCommand (only `Action::Preload`), so this has to be
@@ -536,7 +539,7 @@ pub fn run(
                     });
                 }
                 for c in rt_cmds {
-                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
                 }
                 pump_preload(
                     &mut eng,
@@ -578,6 +581,7 @@ pub fn run(
                             if let Some(p) = probe.as_mut() {
                                 p.retempo(loaded.bpm);
                             }
+                            clock_out.retempo(loaded.bpm);
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -670,6 +674,7 @@ pub fn run(
                                 if let Some(p) = probe.as_mut() {
                                     p.retempo(held.bpm);
                                 }
+                                clock_out.retempo(held.bpm);
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -685,7 +690,7 @@ pub fn run(
                             });
                         }
                         for cmd in cmds {
-                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
                         }
                     }
                 }
@@ -712,6 +717,7 @@ pub fn run(
                         }
                     }
                 }
+                clock_out.tick(pos, &dest_offsets, &mut midi_out);
                 if let Some(p) = probe.as_mut() {
                     if let Some(line) = p.tick(pos) {
                         println!("{line}");
@@ -801,18 +807,25 @@ fn dispatch_rt(
     tx: &mut crate::engine::RtProducer,
     epoch: std::time::Instant,
     verbose: bool,
+    clock: &mut crate::clock_out::ClockOut,
+    midi: &mut impl crate::backend::MidiSink,
 ) {
     use crate::engine::RtCommand;
 
     match cmd {
         RtCommand::Start => {
             view.playing = true;
+            // Clock rides the transport (§5): Start here, pulses from the dispatch
+            // tick, Stop below. Sent from the same place the control thread already
+            // learns the transport moved, so the three cannot disagree.
+            clock.start(midi);
             if verbose {
                 println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }
         }
         RtCommand::Stop => {
             view.playing = false;
+            clock.stop(midi);
             if verbose {
                 println!("[stop] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }

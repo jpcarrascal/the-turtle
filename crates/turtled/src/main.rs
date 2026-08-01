@@ -37,6 +37,7 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod alsa_backend;
 mod clock;
+mod clock_out;
 mod clock_probe;
 mod control;
 mod control_map;

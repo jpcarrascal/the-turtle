@@ -21,6 +21,7 @@ except GPIO (§8.1), which is waiting on parts.
 |---|---|
 | Audio engine (§4) — preload to RAM, 4 stereo pairs, per-pair gain/mute | ✅ |
 | MIDI output (§5) — per-destination SMF, sample-locked, per-port latency offsets | ✅ |
+| MIDI clock master (§5.1) — 24 ppqn, opt-in per destination, ~1 ms measured jitter | ✅ |
 | Live DSP (§6) — per-pair filter, shared tempo-synced delay, linked master limiter | ✅ |
 | Transport + setlist (§8) — MIDI control, gapless auto-advance, background preload | ✅ |
 | Per-song looping (§14) — seamless, `loop = true` | ✅ |
