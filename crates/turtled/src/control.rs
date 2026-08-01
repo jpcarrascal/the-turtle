@@ -109,6 +109,10 @@ struct LoadedSong {
     /// Whether the incoming song loops (§14) — same reason as `frames`: it is a
     /// property of the song, so it has to travel with it across a switch.
     looping: bool,
+    /// The incoming song's nominal tempo, for the clock probe (§5). Per-song like
+    /// `frames` and `looping`, and for the same reason: a switch must change it or
+    /// the clock keeps running at the previous song's tempo.
+    bpm: f64,
 }
 
 /// The portable half of a background load: reuses the same loader the
@@ -124,6 +128,7 @@ fn load_song_payload(
     let schedulers = crate::play::load_schedulers(&p.show, &p.song_dir, rate);
     Ok(LoadedSong {
         looping: p.mixer.is_looping(),
+        bpm: p.mixer.bpm(),
         mixer: p.mixer,
         schedulers,
         frames: p.frames,
@@ -204,6 +209,7 @@ pub fn run(
     // signature cannot see the short `sched` path.
     tuning: crate::sched::Tuning,
     wait_devices: std::time::Duration,
+    clock_probe: bool,
 ) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::AtomicBool;
@@ -258,6 +264,9 @@ pub fn run(
     // both must change when a song does, or `turtle status` describes the
     // previous song.
     let mut looping = mixer.is_looping();
+    // The clock probe, when `--clock-probe` asked for it (§5). `None` in a show:
+    // it logs, and logging from this SCHED_FIFO loop is a diagnostic, not a feature.
+    let mut probe = clock_probe.then(|| crate::clock_probe::ClockProbe::new(mixer.bpm(), rate));
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -493,7 +502,7 @@ pub fn run(
                         });
                     }
                     for cmd in rt_cmds {
-                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut probe);
                     }
                     // Select/Next/Prev arm a song without emitting any
                     // RtCommand (only `Action::Preload`), so this has to be
@@ -527,7 +536,7 @@ pub fn run(
                     });
                 }
                 for c in rt_cmds {
-                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut probe);
                 }
                 pump_preload(
                     &mut eng,
@@ -566,6 +575,9 @@ pub fn run(
                             // moved out of `loaded` below.
                             duration_s = loaded.frames as f64 / rate as f64;
                             looping = loaded.looping;
+                            if let Some(p) = probe.as_mut() {
+                                p.retempo(loaded.bpm);
+                            }
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -637,6 +649,12 @@ pub fn run(
                         for sched in schedulers.iter_mut() {
                             sched.seek(0);
                         }
+                        // Same reasoning as the cursors: the position jumped back
+                        // without time passing, so the pulse train rebases rather
+                        // than firing every pulse it "missed" in one burst.
+                        if let Some(p) = probe.as_mut() {
+                            p.reset_to(0);
+                        }
                         // Anything sounding from the previous pass is released, so
                         // a note held across the seam does not hang.
                         if verbose {
@@ -655,6 +673,9 @@ pub fn run(
                             if let Some(held) = held_next.take() {
                                 duration_s = held.frames as f64 / rate as f64;
                                 looping = held.looping;
+                                if let Some(p) = probe.as_mut() {
+                                    p.retempo(held.bpm);
+                                }
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -670,7 +691,7 @@ pub fn run(
                             });
                         }
                         for cmd in cmds {
-                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose);
+                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut probe);
                         }
                     }
                 }
@@ -695,6 +716,11 @@ pub fn run(
                                 pos_adj as f64 / rate as f64
                             );
                         }
+                    }
+                }
+                if let Some(p) = probe.as_mut() {
+                    if let Some(line) = p.tick(pos) {
+                        println!("{line}");
                     }
                 }
                 pos
@@ -781,6 +807,7 @@ fn dispatch_rt(
     tx: &mut crate::engine::RtProducer,
     epoch: std::time::Instant,
     verbose: bool,
+    probe: &mut Option<crate::clock_probe::ClockProbe>,
 ) {
     use crate::engine::RtCommand;
 
@@ -810,6 +837,12 @@ fn dispatch_rt(
             view.position = pos;
             for sched in schedulers.iter_mut() {
                 sched.seek(pos);
+            }
+            // The pulse train rebases with the cursors. Without this the probe
+            // would go quiet after the first Stop: its next pulse index would sit
+            // far ahead of a rewound position and never come due again.
+            if let Some(p) = probe.as_mut() {
+                p.reset_to(pos);
             }
         }
         RtCommand::ToggleMute(pair) => {

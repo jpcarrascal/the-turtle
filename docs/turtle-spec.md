@@ -400,6 +400,19 @@ a preallocated log ring).
   implemented; importing loop start/end from Ableton and toggling loop on/off live
   from a MIDI binding remain open. "Switch off mid-loop" would mean "continue past
   the loop end the next time it is crossed", never a jump.
+- **MIDI clock master** (§5). Agreed shape: tempo-only — 24 ppqn `0xF8` pulses plus
+  `0xFA`/`0xFC` on start/stop, no Song Position Pointer, so downstream knows how fast
+  but not where. That choice makes a loop wrap need no handling at all, since there
+  is no position to correct. Opt-in per destination (`clock = true`), with the port's
+  `offset_ms` applying as it does to cues. Pulses only while playing.
+  `turtled --clock-probe` measures the jitter this would have without sending
+  anything: pulse times are derived from the transport position, so there is **no
+  drift**, but each pulse can be up to one dispatch tick (~1 ms) late, which is ~5%
+  of a pulse at 120 BPM. Gear that averages tempo sees the exact mean; gear that
+  retimes per pulse sees the spread. If the measurement says that is too much, clock
+  moves to a dedicated thread sleeping to each pulse deadline off the seqlock clock.
+  Tempo is nominal BPM per song, so a song with tempo changes would drift against its
+  own stems.
 - Crossfade segues (v1 is hard auto-advance only).
 - Touch-takeover blending of DSP params (v1 is live-only, no blend).
 - FLAC/`symphonia` stem support for smaller bundles.

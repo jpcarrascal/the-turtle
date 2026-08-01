@@ -378,6 +378,12 @@ impl Mixer {
         }
     }
 
+    /// The song's nominal tempo (§6/§5) — what the delay syncs to, and what MIDI
+    /// clock would run at.
+    pub fn bpm(&self) -> f64 {
+        self.song.bpm
+    }
+
     /// Whether the loaded song repeats instead of ending (§14).
     ///
     /// Read from the song rather than stored separately on the mixer, so a song
