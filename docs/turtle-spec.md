@@ -130,6 +130,13 @@ clock = true                   # 24 ppqn while playing
   minutes on a 2-second loop). The pulse train therefore runs on **musical time
   accumulated across wraps**, not on the raw position, so the total depends only on
   elapsed time and not on how often the song looped.
+- **The position is interpolated, so it jitters backwards** by a few samples when a
+  fresh anchor lands behind the extrapolation — the RT thread publishes one per audio
+  period. A backwards move is therefore classified three ways: most of a loop is a
+  wrap, more than 100 ms is a reposition, and less than that is noise, which
+  contributes no time *and* does not move the high-water mark. (Clamping noise to
+  zero but counting the recovery as forward motion re-introduces the same drift in
+  miniature.)
 - **A loop that is not a whole number of beats** keeps correct tempo but cannot keep
   a pattern *aligned* to the song's bar across a wrap — there is no position on the
   wire to realign with. Bar-align loops if downstream plays a pattern.

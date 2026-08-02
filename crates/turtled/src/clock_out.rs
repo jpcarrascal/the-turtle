@@ -60,8 +60,14 @@ pub struct ClockOut {
     /// two minutes on a 2-second loop, which is what a drum machine hears as
     /// steadily running fast.
     elapsed: u64,
-    /// Transport position at the previous tick, for measuring how far it moved.
-    prev_pos: Option<u64>,
+    /// Highest transport position seen in the current pass through the song.
+    ///
+    /// A high-water mark rather than "the previous position", because the
+    /// interpolated position jitters backwards by a few samples and merely ignoring
+    /// those steps is not enough: the recovery would then be counted as forward
+    /// motion, inflating musical time by the size of every blip. Measuring progress
+    /// beyond the high-water mark makes the total exactly the distance travelled.
+    high_water: Option<u64>,
 }
 
 impl ClockOut {
@@ -75,7 +81,7 @@ impl ClockOut {
             .filter(|(_, d)| d.clock)
             .map(|(port, _)| ClockPort { port, clock: MidiClock::new(bpm, rate) })
             .collect();
-        ClockOut { ports, bpm, rate, elapsed: 0, prev_pos: None }
+        ClockOut { ports, bpm, rate, elapsed: 0, high_water: None }
     }
 
     /// Whether any destination asked for clock.
@@ -109,7 +115,7 @@ impl ClockOut {
     fn restart(&mut self) {
         let (bpm, rate) = (self.bpm, self.rate);
         self.elapsed = 0;
-        self.prev_pos = None;
+        self.high_water = None;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
         }
@@ -143,18 +149,8 @@ impl ClockOut {
             return;
         }
         // Musical time only ever moves forward, even though the position does not.
-        let delta = match self.prev_pos {
-            // First tick of a run: no elapsed time to account for yet.
-            None => 0,
-            Some(prev) if pos >= prev => pos - prev,
-            // Backwards: a loop wrap. Time did not stop, so the increment is the
-            // rest of the loop plus however far into the new pass we are. Without
-            // `loop_frames` (a rewind, or a song that does not loop) the jump is a
-            // genuine reposition and contributes nothing.
-            Some(prev) if loop_frames > prev => (loop_frames - prev) + pos,
-            Some(_) => 0,
-        };
-        self.prev_pos = Some(pos);
+        let (delta, new_high) = self.step(pos, loop_frames);
+        self.high_water = Some(new_high);
         self.elapsed += delta;
 
         for p in &mut self.ports {
@@ -171,6 +167,47 @@ impl ClockOut {
                 }
             }
         }
+    }
+    /// One tick's worth of musical time, and the new high-water mark.
+    ///
+    /// Three ways the position can move backwards, and they mean different things:
+    ///
+    /// * **A loop wrap** — back by most of a loop. The music kept playing, so the
+    ///   increment is the rest of the loop plus the new position.
+    /// * **A reposition** — a large backwards move in a song that does not loop, or
+    ///   one too small to be a wrap. No musical time passed, and the clock carries
+    ///   on from wherever the transport now is.
+    /// * **Interpolation noise** — a few samples, because the position is
+    ///   extrapolated between anchors the RT thread publishes once per audio period
+    ///   and a fresh anchor can land behind the extrapolation. This must contribute
+    ///   nothing *and* leave the mark alone: clamping the step to zero but then
+    ///   counting the recovery as forward motion inflates musical time by the size
+    ///   of every blip, which is the same drift in miniature.
+    fn step(&self, pos: u64, loop_frames: u64) -> (u64, u64) {
+        let Some(high) = self.high_water else {
+            // First tick of a run: nothing elapsed yet.
+            return (0, pos);
+        };
+        if pos >= high {
+            return (pos - high, pos);
+        }
+        let backwards = high - pos;
+        if loop_frames > 0 && backwards > loop_frames / 2 {
+            // `saturating_sub`: the extrapolation can be a little past the loop end
+            // at the moment the wrap is spotted.
+            (loop_frames.saturating_sub(high) + pos, pos)
+        } else if backwards > self.noise_floor() {
+            (0, pos)
+        } else {
+            (0, high)
+        }
+    }
+
+    /// A backwards move smaller than this is interpolation noise, not a reposition:
+    /// 100 ms, far larger than the few samples an anchor update can shift the
+    /// extrapolation, and far smaller than any real seek.
+    fn noise_floor(&self) -> u64 {
+        self.rate as u64 / 10
     }
 }
 
@@ -387,6 +424,48 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         };
         let (a, b) = (count(&midi_loop), count(&midi_straight));
         assert!((a - b).abs() <= 1, "looping sent {a} pulses, straight-through {b}");
+    }
+
+    /// The position is interpolated between anchors the RT thread publishes once
+    /// per audio period, so it steps back by a few samples now and then — most
+    /// often while the clock settles at the start of playback.
+    ///
+    /// Treating those as loop wraps added a whole loop of musical time each. The
+    /// pulses are not simply doubled, because `MidiClock` recognises the resulting
+    /// huge forward jump as a seek and rebases — so what a synced device hears is
+    /// the train repeatedly losing and re-finding its phase, which is exactly the
+    /// "scrambles for a second, then locks" reported from hardware. This asserts
+    /// against elapsed musical time, which catches both shapes.
+    #[test]
+    fn a_few_samples_backwards_is_noise_not_a_wrap() {
+        let rate = 48_000u64;
+        let bpm = 88.0;
+        let loop_frames = 2 * rate;
+        let mut c = ClockOut::new(&show(), bpm, rate as u32);
+        let mut midi = RecordingMidi::default();
+        c.start(&mut midi);
+
+        // Ten seconds of forward motion, well short of the 2-second loop's wrap
+        // (the position never actually wraps here), with a 20-sample backwards
+        // blip every 100 ticks.
+        let run_secs = 10u64;
+        let ticks = run_secs * rate / 48;
+        let mut pos = 0u64;
+        for t in 0..ticks {
+            c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
+            if t % 100 == 99 {
+                c.tick(pos - 20, loop_frames, &[0.0, 0.0], &mut midi);
+            }
+            pos += 48;
+        }
+
+        let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count() as f64;
+        let ideal = run_secs as f64 * bpm / 60.0 * 24.0;
+        assert!(
+            (pulses - ideal).abs() <= 1.0,
+            "{pulses} pulses over {run_secs}s, expected {ideal}: backwards blips \
+             must not add musical time"
+        );
     }
 
 }
