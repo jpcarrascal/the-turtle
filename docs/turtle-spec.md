@@ -161,6 +161,10 @@ clock = true                   # 24 ppqn while playing
 - **Tempo is the song's nominal BPM** (§14). A song whose project changes tempo will
   hold one tempo while its stems do not.
 
+A pulse is never sent twice: a small backwards step in interpolated time holds
+phase rather than rebasing, since rebasing could move the next pulse index behind
+one already emitted. Only a jump larger than 100 ms is treated as a reposition.
+
 Pulse times are **derived** from the transport position, never accumulated: pulse
 *n* is at `round(n × samples_per_pulse)`. Accumulating a rounded interval would drift
 about a quarter-second per hour at an awkward tempo. So the clock has no drift, and
