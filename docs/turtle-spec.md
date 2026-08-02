@@ -137,9 +137,24 @@ clock = true                   # 24 ppqn while playing
   contributes no time *and* does not move the high-water mark. (Clamping noise to
   zero but counting the recovery as forward motion re-introduces the same drift in
   miniature.)
-- **A loop that is not a whole number of beats** keeps correct tempo but cannot keep
-  a pattern *aligned* to the song's bar across a wrap — there is no position on the
-  wire to realign with. Bar-align loops if downstream plays a pattern.
+- **Alignment across a wrap needs `clock_restart`.** Clock carries tempo but no
+  position, so downstream cannot learn that the song jumped back to the top: its
+  pattern stays in tempo and walks away from the audio by a fixed amount every wrap.
+  A destination may ask for `0xFA` Start to be re-sent at each wrap, which re-phases
+  its pulse train to the loop's downbeat:
+
+  ```toml
+  [[destinations]]
+  name = "groovebox"
+  port = "CME:2"
+  clock = true
+  clock_restart = true         # Start again at the top of every loop
+  ```
+
+  Off by default, and only meaningful with `clock = true` (rejected otherwise). A
+  device that retriggers audibly on Start is better left free-running — for those,
+  aligning means giving the loop a length the downstream pattern divides, or Song
+  Position Pointer (§14).
 - **Opt-in per destination**, so a port carrying only lighting cues is not made to
   parse 48 bytes a second it will ignore. Each port's `offset_ms` applies to its
   clock exactly as to its cues, so a latency trim means one thing rather than two.

@@ -38,6 +38,12 @@ struct ClockPort {
     /// Index into the MIDI sink's ports, matching `show.destinations` order.
     port: usize,
     clock: MidiClock,
+    /// Re-send Start at each loop wrap (§5.1).
+    restart: bool,
+    /// Musical time at which this port's pulse train last began, so a restarting
+    /// port can be re-phased to the top of the loop while other ports carry on
+    /// uninterrupted.
+    origin: u64,
 }
 
 /// Drives MIDI clock for every destination with `clock = true`.
@@ -86,7 +92,12 @@ impl ClockOut {
             .iter()
             .enumerate()
             .filter(|(_, d)| d.clock)
-            .map(|(port, _)| ClockPort { port, clock: MidiClock::new(bpm, rate) })
+            .map(|(port, d)| ClockPort {
+                port,
+                clock: MidiClock::new(bpm, rate),
+                restart: d.clock_restart,
+                origin: 0,
+            })
             .collect();
         ClockOut { ports, bpm, rate, elapsed: 0, high_water: None, pulses_this_loop: 0 }
     }
@@ -126,6 +137,7 @@ impl ClockOut {
         self.pulses_this_loop = 0;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
+            p.origin = 0;
         }
     }
 
@@ -171,11 +183,32 @@ impl ClockOut {
         self.high_water = Some(new_high);
         self.elapsed += delta;
 
+        // A wrap re-phases the ports that asked for it: Start says "back to the top",
+        // which is exactly what the transport just did. Sent before the pulses below
+        // so the first pulse of the new pass follows it rather than preceding it.
+        //
+        // `elapsed - pos` is where the new pass began: `pos` is how far into it we
+        // already are by the time the wrap is noticed, a tick at most.
+        if wrapped {
+            let origin = self.elapsed.saturating_sub(pos);
+            let (bpm, rate) = (self.bpm, self.rate);
+            for p in &mut self.ports {
+                if p.restart {
+                    p.clock = MidiClock::new(bpm, rate);
+                    p.origin = origin;
+                    midi.send(p.port, &[START]);
+                }
+            }
+        }
+
         let first_port = self.ports[0].port;
         let mut counted = 0u32;
         for p in &mut self.ports {
             // `None` = still inside a positive offset at the start; nothing due.
-            let Some(adj) = crate::play::dispatch_pos(self.elapsed, offsets[p.port], self.rate)
+            // Measured from this port's own origin, which only a restarting port
+            // ever moves — everyone else runs from the start of the song.
+            let since_origin = self.elapsed.saturating_sub(p.origin);
+            let Some(adj) = crate::play::dispatch_pos(since_origin, offsets[p.port], self.rate)
             else {
                 continue;
             };
@@ -334,6 +367,12 @@ name = "pedals"
 port = "hw:2"
 clock = true
 
+[[destinations]]
+name = "groovebox"
+port = "hw:3"
+clock = true
+clock_restart = true
+
 [control]
 input_port = "hw:1"
 select_channel = 1
@@ -358,7 +397,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(c.is_enabled());
 
         c.start(&mut midi);
-        let _ = c.tick(1000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(1000, 0, &[0.0, 0.0, 0.0], &mut midi);
 
         assert!(midi.sent(0).is_empty(), "the non-clock port must be silent");
         let pedals = midi.sent(1);
@@ -376,7 +415,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(!c.is_enabled());
 
         c.start(&mut midi);
-        let _ = c.tick(48_000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(48_000, 0, &[0.0, 0.0, 0.0], &mut midi);
         c.stop(&mut midi);
         assert!(midi.sent(0).is_empty() && midi.sent(1).is_empty(), "nothing should be sent");
     }
@@ -389,7 +428,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         // Tick every 48 samples (1 ms), through one beat.
         for tick in 0..=500u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count();
         assert_eq!(pulses, 25, "pulse 0 plus 24 more across one beat");
@@ -402,14 +441,14 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..2000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let before = midi.sent(1).len();
         // The song wraps back to the top.
-        let _ = c.tick(0, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(0, 0, &[0.0, 0.0, 0.0], &mut midi);
         assert_eq!(midi.sent(1).len(), before, "a wrap must send nothing");
         // And the train continues afterwards.
-        let _ = c.tick(1000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(1000, 0, &[0.0, 0.0, 0.0], &mut midi);
         assert!(midi.sent(1).len() > before, "pulses resume after the wrap");
     }
 
@@ -420,12 +459,12 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
     fn start_restarts_the_pulse_train() {
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
-        let _ = c.tick(10_000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(10_000, 0, &[0.0, 0.0, 0.0], &mut midi);
 
         c.start(&mut midi);
         let after_start = midi.sent(1).len();
         // Position 0 is pulse 0's time, so it is due immediately after a restart.
-        let _ = c.tick(0, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(0, 0, &[0.0, 0.0, 0.0], &mut midi);
         assert_eq!(
             midi.sent(1).len(),
             after_start + 1,
@@ -441,13 +480,13 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..1000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         c.retempo(60.0);
         let before = midi.sent(1).len();
         // At 60 BPM a pulse is 2000 samples, so one second owes 24 pulses + pulse 0.
         for tick in 0..=1000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).len() - before;
         assert_eq!(pulses, 25, "half the pulses of the old tempo over the same span");
@@ -472,7 +511,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut pos = 0u64;
         c.start(&mut midi);
         for _ in 0..(run_secs * rate / 48) {
-            let _ = c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             pos = (pos + 48) % loop_frames;
         }
 
@@ -497,14 +536,14 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         c.start(&mut midi_loop);
         let mut pos = 0u64;
         for _ in 0..(30 * rate / 48) {
-            let _ = c.tick(pos, 2 * rate, &[0.0, 0.0], &mut midi_loop);
+            let _ = c.tick(pos, 2 * rate, &[0.0, 0.0, 0.0], &mut midi_loop);
             pos = (pos + 48) % (2 * rate);
         }
 
         let mut c = ClockOut::new(&show(), 88.0, rate as u32);
         c.start(&mut midi_straight);
         for tick in 0..(30 * rate / 48) {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi_straight);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi_straight);
         }
 
         let count = |m: &RecordingMidi| {
@@ -540,9 +579,9 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let ticks = run_secs * rate / 48;
         let mut pos = 0u64;
         for t in 0..ticks {
-            let _ = c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             if t % 100 == 99 {
-                let _ = c.tick(pos - 20, loop_frames, &[0.0, 0.0], &mut midi);
+                let _ = c.tick(pos - 20, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             }
             pos += 48;
         }
@@ -605,7 +644,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut audits = Vec::new();
         // Two full loops.
         for _ in 0..(2 * loop_frames / 48) {
-            if let Some(line) = c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi) {
+            if let Some(line) = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi) {
                 audits.push(line);
             }
             pos = (pos + 48) % loop_frames;
@@ -624,6 +663,82 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
                 "a 64-beat loop owes 1536 pulses, audit says {sent}: {line}"
             );
         }
+    }
+
+    /// The point of `clock_restart`: a device playing a pattern is told to return
+    /// to the top when the song does, because clock carries no position and it has
+    /// no other way to learn the transport jumped.
+    #[test]
+    fn a_wrap_restarts_only_the_ports_that_asked() {
+        let rate = 48_000u64;
+        let loop_frames = 2 * rate;
+        let mut c = ClockOut::new(&show(), 120.0, rate as u32);
+        let mut midi = RecordingMidi::default();
+        c.start(&mut midi);
+
+        let mut pos = 0u64;
+        for _ in 0..(3 * loop_frames / 48) {
+            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
+            pos = (pos + 48) % loop_frames;
+        }
+
+        let starts = |port: usize| {
+            midi.sent(port).iter().filter(|m| m.as_slice() == [START]).count()
+        };
+        // Port 2 opted in: one Start at the transport start, plus one per wrap.
+        assert!(starts(2) >= 3, "expected a Start per wrap, got {}", starts(2));
+        // Port 1 takes clock but not restarts: only the transport's own Start.
+        assert_eq!(starts(1), 1, "a plain clock port must not be restarted");
+        assert_eq!(starts(0), 0, "a port with no clock gets nothing");
+    }
+
+    /// A restart re-phases that port's train to the top of the loop, which is the
+    /// whole point: Start means "the downbeat is now". If the train kept its old
+    /// phase, the first pulse after Start would arrive up to a full pulse period
+    /// late — 20.8 ms at 120 BPM — and the device would place its downbeat there.
+    ///
+    /// Counting pulses per pass does NOT test this: a free-running train delivers
+    /// the same number either way. The distinguishing property is that the downbeat
+    /// pulse falls in the *same tick* as the Start.
+    #[test]
+    fn a_restarted_port_is_rephased_to_the_loop_top() {
+        let rate = 48_000u64;
+        // Deliberately not a whole number of pulses, so a free-running train would
+        // be at an arbitrary phase when the wrap comes.
+        let loop_frames = rate + 137;
+        let mut c = ClockOut::new(&show(), 120.0, rate as u32);
+        let mut midi = RecordingMidi::default();
+        c.start(&mut midi);
+
+        let mut pos = 0u64;
+        let mut restarts = 0;
+        for _ in 0..(4 * loop_frames / 48) {
+            let before = midi.sent(2).len();
+            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
+            let batch = midi.sent(2).split_off(before);
+            if batch.iter().any(|m| m.as_slice() == [START]) {
+                restarts += 1;
+                assert!(
+                    batch.iter().any(|m| m.as_slice() == [CLOCK]),
+                    "the downbeat pulse must accompany the Start, got {batch:?}"
+                );
+            }
+            pos = (pos + 48) % loop_frames;
+        }
+        assert!(restarts >= 3, "expected a restart per wrap, saw {restarts}");
+    }
+
+    /// A song that does not loop must never see an extra Start — there is no wrap.
+    #[test]
+    fn a_non_looping_song_is_never_restarted() {
+        let mut c = ClockOut::new(&show(), 120.0, 48_000);
+        let mut midi = RecordingMidi::default();
+        c.start(&mut midi);
+        for tick in 0..2000u64 {
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+        }
+        let starts = midi.sent(2).iter().filter(|m| m.as_slice() == [START]).count();
+        assert_eq!(starts, 1, "only the transport's own Start");
     }
 
 }

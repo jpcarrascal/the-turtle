@@ -430,6 +430,7 @@ fn check_midi_with_resolution(show: &turtle_core::Show) -> Vec<Check> {
                     port: addr,
                     offset_ms: d.offset_ms,
                     clock: d.clock,
+                    clock_restart: d.clock_restart,
                 });
             }
             Err(e) => checks.push(Check::fail(
