@@ -138,10 +138,22 @@ what varies is only each pulse's phase — bounded by one dispatch tick.
 
 Measured on the Pi before this was built (`turtled --clock-probe`, which reports
 pulse lateness without sending anything): peak-to-peak 1.0–1.2 ms against a 28.4 ms
-pulse, mean lateness a stable half-tick over 4800 pulses. Gear that averages tempo
-over a window therefore sees the exact tempo; gear that retimes per pulse sees ~4%.
-Had that been worse, the fallback was a dedicated thread sleeping to each pulse
-deadline off the transport clock.
+pulse, mean lateness a stable half-tick over 4800 pulses.
+
+That measures when the dispatch loop *notices* a pulse, which is not the same as
+when the byte reaches the wire. Three further terms sit downstream of it:
+
+| Term | Size | Fixable? |
+|---|---|---|
+| Dispatch-loop quantisation | 0–1 ms | Only by a dedicated clock thread |
+| Serialisation behind cues on the same port | 0–2 ms | Yes — clock is written **before** cues, and a port with no cues has none of it |
+| USB frame scheduling | 0–1 ms | No, not from userspace; inherent to USB MIDI |
+| The clock byte itself on DIN | 0.32 ms | No, and it is constant, so it is an offset not jitter |
+
+Clock is therefore written before cued events in each tick: one byte of delay on a
+one-off cue is a far better trade than a millisecond of delay on the reference
+everything downstream follows. For the tightest sync, give the synced device a port
+that carries no cues.
 
 ---
 
