@@ -49,6 +49,19 @@ pub struct ClockOut {
     ports: Vec<ClockPort>,
     bpm: f64,
     rate: u32,
+    /// Musical time since the transport started, in samples, accumulated **across
+    /// loop wraps**.
+    ///
+    /// The pulse train runs on this rather than on the raw transport position,
+    /// because the position is not monotonic: it jumps back at every wrap. Deriving
+    /// pulses from it restarted the train at pulse 0 each iteration, and since a
+    /// loop is rarely a whole number of pulses, each iteration emitted a fractional
+    /// pulse too many. That accumulates — measured in simulation at 1.5 beats over
+    /// two minutes on a 2-second loop, which is what a drum machine hears as
+    /// steadily running fast.
+    elapsed: u64,
+    /// Transport position at the previous tick, for measuring how far it moved.
+    prev_pos: Option<u64>,
 }
 
 impl ClockOut {
@@ -62,7 +75,7 @@ impl ClockOut {
             .filter(|(_, d)| d.clock)
             .map(|(port, _)| ClockPort { port, clock: MidiClock::new(bpm, rate) })
             .collect();
-        ClockOut { ports, bpm, rate }
+        ClockOut { ports, bpm, rate, elapsed: 0, prev_pos: None }
     }
 
     /// Whether any destination asked for clock.
@@ -77,9 +90,7 @@ impl ClockOut {
     /// song's index would treat that as a wrap on the first tick.
     pub fn retempo(&mut self, bpm: f64) {
         self.bpm = bpm;
-        for p in &mut self.ports {
-            p.clock = MidiClock::new(bpm, self.rate);
-        }
+        self.restart();
     }
 
     /// Send `0xFA` Start. Called when the transport starts, before any pulse.
@@ -88,11 +99,19 @@ impl ClockOut {
     /// takes Start as "reset to the top" would otherwise be handed pulses whose
     /// phase came from wherever the previous run stopped.
     pub fn start(&mut self, midi: &mut impl MidiSink) {
-        let bpm = self.bpm;
-        let rate = self.rate;
+        self.restart();
+        for p in &mut self.ports {
+            midi.send(p.port, &[START]);
+        }
+    }
+
+    /// Rewind musical time and rebuild every port's train.
+    fn restart(&mut self) {
+        let (bpm, rate) = (self.bpm, self.rate);
+        self.elapsed = 0;
+        self.prev_pos = None;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
-            midi.send(p.port, &[START]);
         }
     }
 
@@ -108,23 +127,45 @@ impl ClockOut {
         }
     }
 
-    /// Emit whatever pulses are due at `pos`, per port, applying each port's
-    /// dispatch offset exactly as cued events do.
+    /// Emit whatever pulses are due, per port, applying each port's dispatch offset
+    /// exactly as cued events do.
+    ///
+    /// `loop_frames` is the length the transport wraps at, or 0 when the song does
+    /// not loop. It is needed to know how much musical time a backwards jump
+    /// covered: the position went from near `loop_frames` to near 0, and the music
+    /// in between really did play.
     ///
     /// `offsets` is indexed by port, in `show.destinations` order — the same slice
     /// the scheduler uses, so a port's latency trim cannot mean one thing for its
     /// cues and another for its clock.
-    pub fn tick(&mut self, pos: u64, offsets: &[f64], midi: &mut impl MidiSink) {
+    pub fn tick(&mut self, pos: u64, loop_frames: u64, offsets: &[f64], midi: &mut impl MidiSink) {
+        if self.ports.is_empty() {
+            return;
+        }
+        // Musical time only ever moves forward, even though the position does not.
+        let delta = match self.prev_pos {
+            // First tick of a run: no elapsed time to account for yet.
+            None => 0,
+            Some(prev) if pos >= prev => pos - prev,
+            // Backwards: a loop wrap. Time did not stop, so the increment is the
+            // rest of the loop plus however far into the new pass we are. Without
+            // `loop_frames` (a rewind, or a song that does not loop) the jump is a
+            // genuine reposition and contributes nothing.
+            Some(prev) if loop_frames > prev => (loop_frames - prev) + pos,
+            Some(_) => 0,
+        };
+        self.prev_pos = Some(pos);
+        self.elapsed += delta;
+
         for p in &mut self.ports {
-            // `None` = still inside the offset at the start of a song; nothing due.
-            let Some(pos_adj) = crate::play::dispatch_pos(pos, offsets[p.port], self.rate)
+            // `None` = still inside a positive offset at the start; nothing due.
+            let Some(adj) = crate::play::dispatch_pos(self.elapsed, offsets[p.port], self.rate)
             else {
                 continue;
             };
-            // A wrap, rewind or seek rebases without emitting: no time passed, so
-            // those pulses were never due. Firing them would read downstream as a
-            // burst of tempo, which is worse than the momentary gap.
-            if let Advance::Pulses(due) = p.clock.advance(pos_adj) {
+            // `elapsed` is monotonic, so `advance` sees a discontinuity only on a
+            // genuine restart — never on a wrap, which is the entire point.
+            if let Advance::Pulses(due) = p.clock.advance(adj) {
                 for _ in due {
                     midi.send(p.port, &[CLOCK]);
                 }
@@ -192,7 +233,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(c.is_enabled());
 
         c.start(&mut midi);
-        c.tick(1000, &[0.0, 0.0], &mut midi);
+        c.tick(1000, 0, &[0.0, 0.0], &mut midi);
 
         assert!(midi.sent(0).is_empty(), "the non-clock port must be silent");
         let pedals = midi.sent(1);
@@ -210,7 +251,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(!c.is_enabled());
 
         c.start(&mut midi);
-        c.tick(48_000, &[0.0, 0.0], &mut midi);
+        c.tick(48_000, 0, &[0.0, 0.0], &mut midi);
         c.stop(&mut midi);
         assert!(midi.sent(0).is_empty() && midi.sent(1).is_empty(), "nothing should be sent");
     }
@@ -223,7 +264,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         // Tick every 48 samples (1 ms), through one beat.
         for tick in 0..=500u64 {
-            c.tick(tick * 48, &[0.0, 0.0], &mut midi);
+            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count();
         assert_eq!(pulses, 25, "pulse 0 plus 24 more across one beat");
@@ -236,14 +277,14 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..2000u64 {
-            c.tick(tick * 48, &[0.0, 0.0], &mut midi);
+            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         let before = midi.sent(1).len();
         // The song wraps back to the top.
-        c.tick(0, &[0.0, 0.0], &mut midi);
+        c.tick(0, 0, &[0.0, 0.0], &mut midi);
         assert_eq!(midi.sent(1).len(), before, "a wrap must send nothing");
         // And the train continues afterwards.
-        c.tick(1000, &[0.0, 0.0], &mut midi);
+        c.tick(1000, 0, &[0.0, 0.0], &mut midi);
         assert!(midi.sent(1).len() > before, "pulses resume after the wrap");
     }
 
@@ -254,12 +295,12 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
     fn start_restarts_the_pulse_train() {
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
-        c.tick(10_000, &[0.0, 0.0], &mut midi);
+        c.tick(10_000, 0, &[0.0, 0.0], &mut midi);
 
         c.start(&mut midi);
         let after_start = midi.sent(1).len();
         // Position 0 is pulse 0's time, so it is due immediately after a restart.
-        c.tick(0, &[0.0, 0.0], &mut midi);
+        c.tick(0, 0, &[0.0, 0.0], &mut midi);
         assert_eq!(
             midi.sent(1).len(),
             after_start + 1,
@@ -275,15 +316,77 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..1000u64 {
-            c.tick(tick * 48, &[0.0, 0.0], &mut midi);
+            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         c.retempo(60.0);
         let before = midi.sent(1).len();
         // At 60 BPM a pulse is 2000 samples, so one second owes 24 pulses + pulse 0.
         for tick in 0..=1000u64 {
-            c.tick(tick * 48, &[0.0, 0.0], &mut midi);
+            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).len() - before;
         assert_eq!(pulses, 25, "half the pulses of the old tempo over the same span");
     }
+    /// The drift found on hardware: a drum machine synced to a looping song ran
+    /// steadily fast, almost a beat out after two minutes.
+    ///
+    /// A loop is rarely a whole number of pulses, so restarting the train at pulse
+    /// 0 on every wrap emitted a fractional pulse too many each iteration — and it
+    /// accumulates. Simulated at these numbers it was +36 pulses over two minutes,
+    /// 1.5 beats. Running the train on accumulated musical time instead makes the
+    /// count depend only on elapsed time, not on how often the song wrapped.
+    #[test]
+    fn a_short_loop_does_not_accumulate_pulses() {
+        let rate = 48_000u64;
+        let bpm = 88.0;
+        let mut c = ClockOut::new(&show(), bpm, rate as u32);
+        let mut midi = RecordingMidi::default();
+
+        let loop_frames = 2 * rate; // a 2-second loop: 59 wraps in two minutes
+        let run_secs = 120u64;
+        let mut pos = 0u64;
+        c.start(&mut midi);
+        for _ in 0..(run_secs * rate / 48) {
+            c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
+            pos = (pos + 48) % loop_frames;
+        }
+
+        let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count() as f64;
+        let ideal = run_secs as f64 * bpm / 60.0 * 24.0;
+        let drift_beats = (pulses - ideal) / 24.0;
+        assert!(
+            drift_beats.abs() < 0.05,
+            "drifted {drift_beats:.2} beats over {run_secs}s ({pulses} pulses vs {ideal} ideal)"
+        );
+    }
+
+    /// The same song played straight through must give the same count — the point
+    /// is that the pulse total depends on elapsed time and nothing else.
+    #[test]
+    fn looping_and_not_looping_emit_the_same_pulse_count() {
+        let rate = 48_000u64;
+        let mut midi_loop = RecordingMidi::default();
+        let mut midi_straight = RecordingMidi::default();
+
+        let mut c = ClockOut::new(&show(), 88.0, rate as u32);
+        c.start(&mut midi_loop);
+        let mut pos = 0u64;
+        for _ in 0..(30 * rate / 48) {
+            c.tick(pos, 2 * rate, &[0.0, 0.0], &mut midi_loop);
+            pos = (pos + 48) % (2 * rate);
+        }
+
+        let mut c = ClockOut::new(&show(), 88.0, rate as u32);
+        c.start(&mut midi_straight);
+        for tick in 0..(30 * rate / 48) {
+            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi_straight);
+        }
+
+        let count = |m: &RecordingMidi| {
+            m.sent(1).iter().filter(|b| b.as_slice() == [CLOCK]).count() as i64
+        };
+        let (a, b) = (count(&midi_loop), count(&midi_straight));
+        assert!((a - b).abs() <= 1, "looping sent {a} pulses, straight-through {b}");
+    }
+
 }
