@@ -252,6 +252,18 @@ impl MidiClock {
     /// keeping it in here means no caller can get it wrong again.
     pub fn advance(&mut self, pos: u64) -> Advance {
         if let Some(prev) = self.last_pos.replace(pos) {
+            let backwards = prev.saturating_sub(pos);
+            // A small step backwards is not a reposition. Even a monotonic frame
+            // count is *interpolated* between anchors, so the value can dip by a few
+            // samples when a fresh anchor lands. Rebasing on that would move the next
+            // pulse index behind a pulse already sent, and send it a second time —
+            // one duplicate every few minutes, which is a slow gain against the
+            // audio. Holding phase costs nothing: the pulses are still owed at their
+            // own times, and the next forward tick emits them.
+            if backwards > 0 && backwards <= self.discontinuity {
+                self.last_pos = Some(prev);
+                return Advance::Pulses(self.next_index..self.next_index);
+            }
             if pos < prev || pos - prev > self.discontinuity {
                 self.reset_to(pos);
                 return Advance::Discontinuity;
@@ -477,6 +489,35 @@ mod tests {
             let _ = c.advance(48_000);
             let _ = c.advance(96_000);
         }
+    }
+
+    /// A pulse must never be sent twice. Interpolated time can dip by a few samples
+    /// when a fresh anchor lands, and rebasing on that moved the next index behind a
+    /// pulse already emitted — one duplicate every few minutes, seen on hardware as
+    /// an occasional extra pulse in an otherwise exact loop audit.
+    #[test]
+    fn a_small_backwards_step_never_repeats_a_pulse() {
+        let mut c = MidiClock::new(120.0, 48_000); // 1000 samples per pulse
+        let mut emitted = Vec::new();
+        let mut take = |a: Advance| {
+            if let Advance::Pulses(r) = a {
+                emitted.extend(r);
+            }
+        };
+
+        take(c.advance(0));
+        take(c.advance(1_000));
+        take(c.advance(2_000));
+        // Time dips back below the last pulse, then recovers.
+        take(c.advance(1_980));
+        take(c.advance(2_010));
+        take(c.advance(3_000));
+
+        let mut sorted = emitted.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(emitted, sorted, "pulses must be emitted once each, in order: {emitted:?}");
+        assert_eq!(emitted, vec![0, 1, 2, 3], "and every pulse exactly once");
     }
 
 }

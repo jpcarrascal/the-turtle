@@ -15,6 +15,16 @@ use crate::mixer::Mixer;
 /// play/pause flag; the sample position lives in the [`Mixer`] (§3.1).
 pub struct RtAudio {
     playing: bool,
+    /// Frames rendered since the daemon started, for the monotonic musical clock
+    /// (§5.1). Advances only while playing, and is **never reset**.
+    ///
+    /// Deliberately not rewound on Start. It is read by the control thread, which
+    /// reacts to Start at a different moment than this thread does — so resetting it
+    /// here meant the control thread briefly read the previous run's total, sent
+    /// pulses at that phase, then saw the value collapse backwards. Two apparent
+    /// discontinuities per Start, landing wherever the race fell. The transport's
+    /// own zero is recorded by the clock instead, which involves no shared state.
+    rendered: u64,
     /// Whether `EndReached` has already been reported for the current run
     /// (since `Start`/`Seek`), so a finished-but-not-yet-stopped mixer
     /// doesn't spam the event queue every period while the control thread's
@@ -31,6 +41,7 @@ impl Default for RtAudio {
     fn default() -> Self {
         RtAudio {
             playing: false,
+            rendered: 0,
             reported_end: false,
             last_pos: 0,
         }
@@ -106,6 +117,8 @@ impl RtAudio {
         let pos = mixer.position();
         if self.playing {
             mixer.render(out);
+            // Counted here rather than derived from `pos`, which wraps.
+            self.rendered += (out.len() / 2) as u64;
         } else {
             // Stopped is not silent: the delay keeps recirculating so its tail rings
             // out instead of being cut off mid-echo (§6). The transport does not
@@ -114,6 +127,11 @@ impl RtAudio {
             mixer.render_tail(out);
         }
         pos
+    }
+
+    /// Frames rendered since the daemon started — musical time, monotonic (§5.1).
+    pub fn rendered(&self) -> u64 {
+        self.rendered
     }
 
     pub fn is_playing(&self) -> bool {
@@ -171,7 +189,7 @@ pub fn run_audio(
 
         let now_ns = epoch.elapsed().as_nanos() as u64;
         let pos = rt.step(mixer, &mut buf);
-        clock.publish(pos, now_ns);
+        clock.publish(pos, rt.rendered(), now_ns);
 
         if rt.check_loop(mixer) {
             let _ = events.push(crate::engine::RtEvent::Looped);

@@ -270,6 +270,16 @@ pub fn run(
     // MIDI clock master (§5), for whichever destinations set `clock = true`. Inert
     // when none did, so there is no second code path for shows that want none.
     let mut clock_out = crate::clock_out::ClockOut::new(&show, mixer.bpm(), rate);
+    // Say up front whether the declared tempo agrees with the loop (§5.1). Printed
+    // whether or not clock is enabled: the same mismatch also puts the tempo-synced
+    // delay on a different grid from the stems.
+    if let Some(msg) = crate::clock_out::tempo_check(
+        mixer.bpm(),
+        if mixer.is_looping() { frames } else { 0 },
+        rate,
+    ) {
+        println!("{msg}");
+    }
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -505,7 +515,7 @@ pub fn run(
                         });
                     }
                     for cmd in rt_cmds {
-                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
+                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out, clock.rendered_now());
                     }
                     // Select/Next/Prev arm a song without emitting any
                     // RtCommand (only `Action::Preload`), so this has to be
@@ -539,7 +549,7 @@ pub fn run(
                     });
                 }
                 for c in rt_cmds {
-                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
+                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out, clock.rendered_now());
                 }
                 pump_preload(
                     &mut eng,
@@ -581,7 +591,14 @@ pub fn run(
                             if let Some(p) = probe.as_mut() {
                                 p.retempo(loaded.bpm);
                             }
-                            clock_out.retempo(loaded.bpm);
+                            clock_out.retempo(loaded.bpm, clock.rendered_now());
+                            if let Some(msg) = crate::clock_out::tempo_check(
+                                loaded.bpm,
+                                if loaded.looping { loaded.frames } else { 0 },
+                                rate,
+                            ) {
+                                println!("{msg}");
+                            }
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;
@@ -674,7 +691,7 @@ pub fn run(
                                 if let Some(p) = probe.as_mut() {
                                     p.retempo(held.bpm);
                                 }
-                                clock_out.retempo(held.bpm);
+                                clock_out.retempo(held.bpm, clock.rendered_now());
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -690,7 +707,7 @@ pub fn run(
                             });
                         }
                         for cmd in cmds {
-                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
+                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out, clock.rendered_now());
                         }
                     }
                 }
@@ -701,6 +718,27 @@ pub fn run(
             let position = if view.playing {
                 let wall_s = epoch.elapsed().as_secs_f64();
                 let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
+                // Clock first, cues second, and the order is load-bearing (§5.1).
+                //
+                // A DIN wire carries 31,250 baud — 320 us a byte — so a 3-byte
+                // note-on ahead of a clock pulse puts that pulse ~1 ms late, and
+                // cues land on beats, which is precisely where a synced drum
+                // machine is most exposed. Delaying a cue by the clock's single
+                // byte costs 320 us on a one-off event; delaying the clock costs
+                // the timing reference everything downstream is following.
+                // `loop_frames` lets the clock account for the musical time a wrap
+                // covered; 0 for a song that does not loop, where a backwards jump
+                // is a genuine reposition rather than the music continuing.
+                let loop_frames = if looping { (duration_s * rate as f64) as u64 } else { 0 };
+                // Musical time comes straight from the RT thread's monotonic frame
+                // count (§5.1). The clock needs nothing else: it computes the loop
+                // boundary from the run's origin rather than watching for it.
+                let elapsed = clock.elapsed(epoch.elapsed().as_nanos() as u64);
+                if let Some(audit) =
+                    clock_out.tick(elapsed, loop_frames, &mut midi_out)
+                {
+                    println!("{audit}");
+                }
                 for (port, sched) in schedulers.iter_mut().enumerate() {
                     // `None` = within the offset of the start; nothing due yet.
                     let Some(pos_adj) = dispatch_pos(pos, dest_offsets[port], rate) else { continue };
@@ -717,7 +755,6 @@ pub fn run(
                         }
                     }
                 }
-                clock_out.tick(pos, &dest_offsets, &mut midi_out);
                 if let Some(p) = probe.as_mut() {
                     if let Some(line) = p.tick(pos) {
                         println!("{line}");
@@ -809,6 +846,8 @@ fn dispatch_rt(
     verbose: bool,
     clock: &mut crate::clock_out::ClockOut,
     midi: &mut impl crate::backend::MidiSink,
+    // Frames rendered as of now: where this run of the transport begins (§5.1).
+    rendered: u64,
 ) {
     use crate::engine::RtCommand;
 
@@ -818,7 +857,9 @@ fn dispatch_rt(
             // Clock rides the transport (§5): Start here, pulses from the dispatch
             // tick, Stop below. Sent from the same place the control thread already
             // learns the transport moved, so the three cannot disagree.
-            clock.start(midi);
+            // Start is recorded here but sent from the dispatch tick, when the
+            // downbeat is due in each port's own timeline (§5.1).
+            clock.start(rendered);
             if verbose {
                 println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }

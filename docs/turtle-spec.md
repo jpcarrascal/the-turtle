@@ -121,8 +121,46 @@ clock = true                   # 24 ppqn while playing
 
 - **Tempo only.** 24 `0xF8` pulses per quarter note while playing, `0xFA` on start,
   `0xFC` on stop. No Song Position Pointer: downstream learns how fast, not where.
-  That is what makes a **loop wrap need no handling** — there is no position to
-  correct, so a wrap is just a discontinuity the pulse train rebases across.
+- **A loop wrap does need handling**, contrary to the first version of this section.
+  Without position on the wire, a device tracks the song by *counting pulses*, so the
+  count per unit of time is what must stay right — and the transport position jumps
+  back at each wrap.
+- **The clock runs on a monotonic frame count published by the RT thread**, not on
+  the transport position (§3.1). The position answers "where in the song are we",
+  which is what cues need; musical time needs "how much music has played". Deriving
+  the second from the first was tried and does not work: the position is
+  *interpolated*, so it overshoots the loop end before the wrap is noticed, and that
+  overshoot is lost. Successive attempts — a high-water mark, a wrap threshold, a
+  noise floor — each reduced the error without removing it. It was invisible at most
+  tempos and appeared as a whole missing pulse per loop at 120 BPM, where the loop is
+  an exact multiple of the pulse period. Publishing the frame count costs one atomic
+  store per period and makes the pulse total exact at every tempo.
+- **Alignment across a wrap needs `clock_restart`.** Clock carries tempo but no
+  position, so downstream cannot learn that the song jumped back to the top: its
+  pattern stays in tempo and walks away from the audio by a fixed amount every wrap.
+  A destination may ask for `0xFA` Start to be re-sent at each wrap, which re-phases
+  its pulse train to the loop's downbeat:
+
+  ```toml
+  [[destinations]]
+  name = "groovebox"
+  port = "CME:2"
+  clock = true
+  clock_restart = true         # Start again at the top of every loop
+  ```
+
+  **Try without it first.** It exists to reposition a device that cannot otherwise
+  learn where the song is — one whose pattern length does not divide the loop, or
+  one armed mid-set. With an exact pulse train a device that resets once at Start
+  stays aligned indefinitely: verified on hardware over an hour, where the port
+  *without* `clock_restart` held perfectly and the port with it did not. Restarting
+  re-places the downbeat wherever the dispatch tick lands, so it adds timing error
+  to a device that did not need it.
+
+  Off by default, and only meaningful with `clock = true` (rejected otherwise). A
+  device that retriggers audibly on Start is better left free-running — for those,
+  aligning means giving the loop a length the downstream pattern divides, or Song
+  Position Pointer (§14).
 - **Opt-in per destination**, so a port carrying only lighting cues is not made to
   parse 48 bytes a second it will ignore. Each port's `offset_ms` applies to its
   clock exactly as to its cues, so a latency trim means one thing rather than two.
@@ -131,6 +169,10 @@ clock = true                   # 24 ppqn while playing
 - **Tempo is the song's nominal BPM** (§14). A song whose project changes tempo will
   hold one tempo while its stems do not.
 
+A pulse is never sent twice: a small backwards step in interpolated time holds
+phase rather than rebasing, since rebasing could move the next pulse index behind
+one already emitted. Only a jump larger than 100 ms is treated as a reposition.
+
 Pulse times are **derived** from the transport position, never accumulated: pulse
 *n* is at `round(n × samples_per_pulse)`. Accumulating a rounded interval would drift
 about a quarter-second per hour at an awkward tempo. So the clock has no drift, and
@@ -138,10 +180,22 @@ what varies is only each pulse's phase — bounded by one dispatch tick.
 
 Measured on the Pi before this was built (`turtled --clock-probe`, which reports
 pulse lateness without sending anything): peak-to-peak 1.0–1.2 ms against a 28.4 ms
-pulse, mean lateness a stable half-tick over 4800 pulses. Gear that averages tempo
-over a window therefore sees the exact tempo; gear that retimes per pulse sees ~4%.
-Had that been worse, the fallback was a dedicated thread sleeping to each pulse
-deadline off the transport clock.
+pulse, mean lateness a stable half-tick over 4800 pulses.
+
+That measures when the dispatch loop *notices* a pulse, which is not the same as
+when the byte reaches the wire. Three further terms sit downstream of it:
+
+| Term | Size | Fixable? |
+|---|---|---|
+| Dispatch-loop quantisation | 0–1 ms | Only by a dedicated clock thread |
+| Serialisation behind cues on the same port | 0–2 ms | Yes — clock is written **before** cues, and a port with no cues has none of it |
+| USB frame scheduling | 0–1 ms | No, not from userspace; inherent to USB MIDI |
+| The clock byte itself on DIN | 0.32 ms | No, and it is constant, so it is an offset not jitter |
+
+Clock is therefore written before cued events in each tick: one byte of delay on a
+one-off cue is a far better trade than a millisecond of delay on the reference
+everything downstream follows. For the tightest sync, give the synced device a port
+that carries no cues.
 
 ---
 

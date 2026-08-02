@@ -205,6 +205,15 @@ pub struct Destination {
     /// Signed millisecond offset applied at dispatch; compensates mean latency.
     #[serde(default)]
     pub offset_ms: f64,
+    /// Re-send `0xFA` Start at each loop wrap, so a device playing a pattern
+    /// returns to the top when the song does (§5.1).
+    ///
+    /// Clock carries tempo but no position, so downstream has no way to learn that
+    /// the song jumped back. Without this its pattern stays in tempo but walks away
+    /// from the audio, by a fixed amount every wrap. Off by default: a device that
+    /// retriggers audibly on Start is better left free-running.
+    #[serde(default)]
+    pub clock_restart: bool,
     /// Send MIDI clock to this port while playing (§5).
     ///
     /// Opt-in per destination rather than everywhere, so a port carrying only
@@ -411,6 +420,17 @@ impl Show {
         self.control.next.check("control.next", &mut p);
         self.control.prev.check("control.prev", &mut p);
         self.control.panic.check("control.panic", &mut p);
+        for d in &self.destinations {
+            // Restarting the pulse train means nothing on a port that never gets a
+            // pulse, and silently ignoring it would leave a show file claiming
+            // behaviour it does not have.
+            if d.clock_restart && !d.clock {
+                p.push(format!(
+                    "destination \"{}\": clock_restart needs clock = true",
+                    d.name
+                ));
+            }
+        }
         self.control.mute.check("control.mute", &mut p);
         for (key, b) in &self.control.dsp {
             b.check(key, &mut p);
