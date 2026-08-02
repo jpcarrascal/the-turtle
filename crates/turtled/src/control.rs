@@ -701,6 +701,15 @@ pub fn run(
             let position = if view.playing {
                 let wall_s = epoch.elapsed().as_secs_f64();
                 let pos = clock.interpolate(epoch.elapsed().as_nanos() as u64);
+                // Clock first, cues second, and the order is load-bearing (§5.1).
+                //
+                // A DIN wire carries 31,250 baud — 320 us a byte — so a 3-byte
+                // note-on ahead of a clock pulse puts that pulse ~1 ms late, and
+                // cues land on beats, which is precisely where a synced drum
+                // machine is most exposed. Delaying a cue by the clock's single
+                // byte costs 320 us on a one-off event; delaying the clock costs
+                // the timing reference everything downstream is following.
+                clock_out.tick(pos, &dest_offsets, &mut midi_out);
                 for (port, sched) in schedulers.iter_mut().enumerate() {
                     // `None` = within the offset of the start; nothing due yet.
                     let Some(pos_adj) = dispatch_pos(pos, dest_offsets[port], rate) else { continue };
@@ -717,7 +726,6 @@ pub fn run(
                         }
                     }
                 }
-                clock_out.tick(pos, &dest_offsets, &mut midi_out);
                 if let Some(p) = probe.as_mut() {
                     if let Some(line) = p.tick(pos) {
                         println!("{line}");
