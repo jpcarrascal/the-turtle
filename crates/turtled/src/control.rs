@@ -735,7 +735,7 @@ pub fn run(
                 // boundary from the run's origin rather than watching for it.
                 let elapsed = clock.elapsed(epoch.elapsed().as_nanos() as u64);
                 if let Some(audit) =
-                    clock_out.tick(elapsed, loop_frames, &dest_offsets, &mut midi_out)
+                    clock_out.tick(elapsed, loop_frames, &mut midi_out)
                 {
                     println!("{audit}");
                 }
@@ -857,7 +857,9 @@ fn dispatch_rt(
             // Clock rides the transport (§5): Start here, pulses from the dispatch
             // tick, Stop below. Sent from the same place the control thread already
             // learns the transport moved, so the three cannot disagree.
-            clock.start(rendered, midi);
+            // Start is recorded here but sent from the dispatch tick, when the
+            // downbeat is due in each port's own timeline (§5.1).
+            clock.start(rendered);
             if verbose {
                 println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }
