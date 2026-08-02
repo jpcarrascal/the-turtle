@@ -97,9 +97,9 @@ impl ClockOut {
     /// A song switch must change the tempo *and* restart the pulse train — the new
     /// song's position starts from 0, and a clock still counting from the previous
     /// song's index would treat that as a wrap on the first tick.
-    pub fn retempo(&mut self, bpm: f64) {
+    pub fn retempo(&mut self, bpm: f64, origin: u64) {
         self.bpm = bpm;
-        self.restart();
+        self.restart(origin);
     }
 
     /// Send `0xFA` Start. Called when the transport starts, before any pulse.
@@ -107,21 +107,22 @@ impl ClockOut {
     /// The pulse train is rebuilt here rather than merely rewound: a device that
     /// takes Start as "reset to the top" would otherwise be handed pulses whose
     /// phase came from wherever the previous run stopped.
-    pub fn start(&mut self, midi: &mut impl MidiSink) {
-        self.restart();
+    pub fn start(&mut self, origin: u64, midi: &mut impl MidiSink) {
+        self.restart(origin);
         for p in &mut self.ports {
             midi.send(p.port, &[START]);
         }
     }
 
-    /// Rewind musical time and rebuild every port's train.
-    fn restart(&mut self) {
+    /// Rebuild every port's train, phased from `origin` — the frame count at which
+    /// this run began.
+    fn restart(&mut self, origin: u64) {
         let (bpm, rate) = (self.bpm, self.rate);
         self.prev_pos = None;
         self.pulses_this_loop = 0;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
-            p.origin = 0;
+            p.origin = origin;
         }
     }
 
@@ -344,7 +345,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         assert!(c.is_enabled());
 
-        c.start(&mut midi);
+        c.start(0, &mut midi);
         let _ = c.tick(1000, 1000, 0, &[0.0, 0.0, 0.0], &mut midi);
 
         assert!(midi.sent(0).is_empty(), "the non-clock port must be silent");
@@ -362,7 +363,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         assert!(!c.is_enabled());
 
-        c.start(&mut midi);
+        c.start(0, &mut midi);
         let _ = c.tick(48_000, 48_000, 0, &[0.0, 0.0, 0.0], &mut midi);
         c.stop(&mut midi);
         assert!(midi.sent(0).is_empty() && midi.sent(1).is_empty(), "nothing should be sent");
@@ -409,7 +410,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         let _ = c.tick(10_000, 10_000, 0, &[0.0, 0.0, 0.0], &mut midi);
 
-        c.start(&mut midi);
+        c.start(0, &mut midi);
         let after_start = midi.sent(1).len();
         // Position 0 is pulse 0's time, so it is due immediately after a restart.
         let _ = c.tick(0, 0, 0, &[0.0, 0.0, 0.0], &mut midi);
@@ -430,7 +431,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         for tick in 0..1000u64 {
             let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
-        c.retempo(60.0);
+        c.retempo(60.0, 0);
         let before = midi.sent(1).len();
         // At 60 BPM a pulse is 2000 samples, so one second owes 24 pulses + pulse 0.
         for tick in 0..=1000u64 {
@@ -458,7 +459,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let run_secs = 120u64;
         let mut pos = 0u64;
         let mut elapsed = 0u64;
-        c.start(&mut midi);
+        c.start(0, &mut midi);
         for _ in 0..(run_secs * rate / 48) {
             let _ = c.tick(elapsed, pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             pos = (pos + 48) % loop_frames;
@@ -483,7 +484,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi_straight = RecordingMidi::default();
 
         let mut c = ClockOut::new(&show(), 88.0, rate as u32);
-        c.start(&mut midi_loop);
+        c.start(0, &mut midi_loop);
         let mut pos = 0u64;
         let mut elapsed = 0u64;
         for _ in 0..(30 * rate / 48) {
@@ -493,7 +494,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         }
 
         let mut c = ClockOut::new(&show(), 88.0, rate as u32);
-        c.start(&mut midi_straight);
+        c.start(0, &mut midi_straight);
         for tick in 0..(30 * rate / 48) {
             let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi_straight);
         }
@@ -519,7 +520,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let bpm = 120.0;
         let mut c = ClockOut::new(&show(), bpm, rate as u32);
         let mut midi = RecordingMidi::default();
-        c.start(&mut midi);
+        c.start(0, &mut midi);
 
         let run_secs = 10u64;
         let ticks = run_secs * rate / 48;
@@ -550,7 +551,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let loop_frames = (64.0 * 60.0 / bpm * rate as f64) as u64;
         let mut c = ClockOut::new(&show(), bpm, rate as u32);
         let mut midi = RecordingMidi::default();
-        c.start(&mut midi);
+        c.start(0, &mut midi);
 
         let mut pos = 0u64;
         let mut elapsed = 0u64;
@@ -588,7 +589,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let loop_frames = 2 * rate;
         let mut c = ClockOut::new(&show(), 120.0, rate as u32);
         let mut midi = RecordingMidi::default();
-        c.start(&mut midi);
+        c.start(0, &mut midi);
 
         let mut pos = 0u64;
         let mut elapsed = 0u64;
@@ -624,7 +625,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let loop_frames = rate + 137;
         let mut c = ClockOut::new(&show(), 120.0, rate as u32);
         let mut midi = RecordingMidi::default();
-        c.start(&mut midi);
+        c.start(0, &mut midi);
 
         let mut pos = 0u64;
         let mut elapsed = 0u64;
@@ -651,7 +652,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
     fn a_non_looping_song_is_never_restarted() {
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
-        c.start(&mut midi);
+        c.start(0, &mut midi);
         for tick in 0..2000u64 {
             let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
@@ -674,7 +675,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
             let owed = (beats * 24) as i64;
             let mut c = ClockOut::new(&show(), bpm, rate as u32);
             let mut midi = RecordingMidi::default();
-            c.start(&mut midi);
+            c.start(0, &mut midi);
 
             let mut pos = 0u64;
             let mut elapsed = 0u64;
@@ -701,6 +702,43 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
                 );
             }
         }
+    }
+
+    /// The regression this exists for: a Start after the transport has already been
+    /// playing must phase the train from *now*, not from zero.
+    ///
+    /// The frame count is monotonic for the life of the daemon, so by the second
+    /// Start it is large. A train rebuilt at origin 0 sees that as an enormous
+    /// forward jump and emits every pulse in between — thousands at once — which is
+    /// what a groovebox hears as engaging with a massive, unpredictable offset.
+    #[test]
+    fn a_start_after_playing_does_not_emit_a_burst() {
+        let rate = 48_000u64;
+        let mut c = ClockOut::new(&show(), 120.0, rate as u32);
+        let mut midi = RecordingMidi::default();
+
+        // Two minutes of frames have already been rendered this session.
+        let origin = 120 * rate;
+        c.start(origin, &mut midi);
+
+        let before = midi.sent(1).len();
+        let _ = c.tick(origin + 48, 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let batch = midi.sent(1).split_off(before);
+        assert_eq!(
+            batch.len(),
+            1,
+            "the first tick after Start owes exactly the downbeat pulse, got {}",
+            batch.len()
+        );
+        assert_eq!(batch[0].as_slice(), [CLOCK]);
+
+        // And the train then runs at the right rate from there.
+        for t in 1..(10 * rate / 48) {
+            let _ = c.tick(origin + t * 48, t * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+        }
+        let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count() as f64;
+        let ideal = 10.0 * 120.0 / 60.0 * 24.0;
+        assert!((pulses - ideal).abs() <= 1.0, "{pulses} pulses in 10s, expected {ideal}");
     }
 
 }

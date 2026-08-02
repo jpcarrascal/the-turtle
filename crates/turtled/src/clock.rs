@@ -140,6 +140,17 @@ impl TransportClock {
         pos + (dt_ns * self.sample_rate as u128 / 1_000_000_000) as u64
     }
 
+    /// The published frame count with no interpolation — musical time exactly as of
+    /// the last anchor.
+    ///
+    /// For recording where a run began: at Start no music has played yet, so the
+    /// interpolated form would fold in up to one period of wall time that the
+    /// transport never rendered.
+    pub fn rendered_now(&self) -> u64 {
+        let (_, rendered, _) = self.snapshot_all();
+        rendered
+    }
+
     /// Musical time since the transport started, in frames, interpolated to
     /// `now_ns`. Monotonic across loop wraps — this is what MIDI clock runs on.
     pub fn elapsed(&self, now_ns: u64) -> u64 {

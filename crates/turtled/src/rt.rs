@@ -15,8 +15,15 @@ use crate::mixer::Mixer;
 /// play/pause flag; the sample position lives in the [`Mixer`] (§3.1).
 pub struct RtAudio {
     playing: bool,
-    /// Frames rendered since the transport started, for the monotonic musical
-    /// clock (§5.1). Reset by Start, and not advanced while stopped.
+    /// Frames rendered since the daemon started, for the monotonic musical clock
+    /// (§5.1). Advances only while playing, and is **never reset**.
+    ///
+    /// Deliberately not rewound on Start. It is read by the control thread, which
+    /// reacts to Start at a different moment than this thread does — so resetting it
+    /// here meant the control thread briefly read the previous run's total, sent
+    /// pulses at that phase, then saw the value collapse backwards. Two apparent
+    /// discontinuities per Start, landing wherever the race fell. The transport's
+    /// own zero is recorded by the clock instead, which involves no shared state.
     rendered: u64,
     /// Whether `EndReached` has already been reported for the current run
     /// (since `Start`/`Seek`), so a finished-but-not-yet-stopped mixer
@@ -53,9 +60,6 @@ impl RtAudio {
         match cmd {
             RtCommand::Start => {
                 self.playing = true;
-                // Musical time restarts with the transport, matching the pulse
-                // train that `ClockOut::start` rebuilds at the same moment.
-                self.rendered = 0;
                 self.reported_end = false;
                 // Re-baseline: Start follows a Seek(0) on the rewind path, and a
                 // stale high watermark would read as a loop wrap on the next tick.
@@ -125,7 +129,7 @@ impl RtAudio {
         pos
     }
 
-    /// Frames rendered since the last Start — musical time, monotonic (§5.1).
+    /// Frames rendered since the daemon started — musical time, monotonic (§5.1).
     pub fn rendered(&self) -> u64 {
         self.rendered
     }

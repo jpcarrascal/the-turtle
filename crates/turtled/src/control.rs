@@ -515,7 +515,7 @@ pub fn run(
                         });
                     }
                     for cmd in rt_cmds {
-                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
+                        dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out, clock.rendered_now());
                     }
                     // Select/Next/Prev arm a song without emitting any
                     // RtCommand (only `Action::Preload`), so this has to be
@@ -549,7 +549,7 @@ pub fn run(
                     });
                 }
                 for c in rt_cmds {
-                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
+                    dispatch_rt(c, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out, clock.rendered_now());
                 }
                 pump_preload(
                     &mut eng,
@@ -591,7 +591,7 @@ pub fn run(
                             if let Some(p) = probe.as_mut() {
                                 p.retempo(loaded.bpm);
                             }
-                            clock_out.retempo(loaded.bpm);
+                            clock_out.retempo(loaded.bpm, clock.rendered_now());
                             if let Some(msg) = crate::clock_out::tempo_check(
                                 loaded.bpm,
                                 if loaded.looping { loaded.frames } else { 0 },
@@ -691,7 +691,7 @@ pub fn run(
                                 if let Some(p) = probe.as_mut() {
                                     p.retempo(held.bpm);
                                 }
-                                clock_out.retempo(held.bpm);
+                                clock_out.retempo(held.bpm, clock.rendered_now());
                                 // The song armed next has just become current.
                                 current_song = armed_next_song.take();
                                 let _ = song_tx.push(held.mixer);
@@ -707,7 +707,7 @@ pub fn run(
                             });
                         }
                         for cmd in cmds {
-                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out);
+                            dispatch_rt(cmd, &mut view, &mut schedulers, &mut tx, epoch, verbose, &mut clock_out, &mut midi_out, clock.rendered_now());
                         }
                     }
                 }
@@ -845,6 +845,8 @@ fn dispatch_rt(
     verbose: bool,
     clock: &mut crate::clock_out::ClockOut,
     midi: &mut impl crate::backend::MidiSink,
+    // Frames rendered as of now: where this run of the transport begins (§5.1).
+    rendered: u64,
 ) {
     use crate::engine::RtCommand;
 
@@ -854,7 +856,7 @@ fn dispatch_rt(
             // Clock rides the transport (§5): Start here, pulses from the dispatch
             // tick, Stop below. Sent from the same place the control thread already
             // learns the transport moved, so the three cannot disagree.
-            clock.start(midi);
+            clock.start(rendered, midi);
             if verbose {
                 println!("[start] wall={:.3}s", epoch.elapsed().as_secs_f64());
             }
