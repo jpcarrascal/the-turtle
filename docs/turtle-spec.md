@@ -149,6 +149,14 @@ clock = true                   # 24 ppqn while playing
   clock_restart = true         # Start again at the top of every loop
   ```
 
+  **Try without it first.** It exists to reposition a device that cannot otherwise
+  learn where the song is — one whose pattern length does not divide the loop, or
+  one armed mid-set. With an exact pulse train a device that resets once at Start
+  stays aligned indefinitely: verified on hardware over an hour, where the port
+  *without* `clock_restart` held perfectly and the port with it did not. Restarting
+  re-places the downbeat wherever the dispatch tick lands, so it adds timing error
+  to a device that did not need it.
+
   Off by default, and only meaningful with `clock = true` (rejected otherwise). A
   device that retriggers audibly on Start is better left free-running — for those,
   aligning means giving the loop a length the downstream pattern divides, or Song

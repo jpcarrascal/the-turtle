@@ -69,6 +69,14 @@ pub struct ClockOut {
     ports: Vec<ClockPort>,
     bpm: f64,
     rate: u32,
+    /// Running total of per-loop deviations since the transport started.
+    ///
+    /// The per-loop figure alone is ambiguous and has misled twice: a loop is rarely
+    /// a whole number of pulses, so the pulse nearest the boundary lands in one
+    /// window or the next depending on tick phase, showing as `+1` followed by `-1`.
+    /// That is a pulse *moving* between windows, not one created — and only the
+    /// running total distinguishes it from real drift, which accumulates.
+    cumulative: i64,
     /// Pulses emitted since the last loop wrap, for the per-loop audit.
     ///
     /// A loop is a known number of beats, so it owes a known number of pulses. This
@@ -97,7 +105,7 @@ impl ClockOut {
                 origin: 0,
             })
             .collect();
-        ClockOut { ports, bpm, rate, pulses_this_loop: 0 }
+        ClockOut { ports, bpm, rate, pulses_this_loop: 0, cumulative: 0 }
     }
 
     /// Whether any destination asked for clock.
@@ -129,6 +137,7 @@ impl ClockOut {
     fn restart(&mut self, origin: u64) {
         let (bpm, rate) = (self.bpm, self.rate);
         self.pulses_this_loop = 0;
+        self.cumulative = 0;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
             p.origin = origin;
@@ -237,9 +246,16 @@ impl ClockOut {
                 // reported one pulse too many every loop.
                 if p.port == first_port {
                     let sent = std::mem::replace(&mut self.pulses_this_loop, 0);
+                    let delta = sent as f64 - owed;
+                    // Rounded before accumulating: the per-loop figure is a whole
+                    // number of pulses against a fractional owing, so summing the
+                    // raw difference would drift by the fraction rather than
+                    // reporting whether the *pulses* did.
+                    self.cumulative += delta.round() as i64;
                     audit = Some(format!(
-                        "[clock] loop audit: sent {sent} pulses, loop owes {owed:.2} ({:+.2})",
-                        sent as f64 - owed
+                        "[clock] loop audit: sent {sent} pulses, loop owes {owed:.2} \
+                         ({delta:+.2}, cumulative {:+})",
+                        self.cumulative
                     ));
                 }
             }
@@ -1014,6 +1030,43 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
                  beat after seven rounds"
             );
         }
+    }
+
+    /// The per-loop figure alternates +1 / -1 when the loop is not a whole number of
+    /// pulses, because the pulse nearest the boundary lands in one window or the
+    /// next. That is not drift, and the running total is what says so — it returns
+    /// to zero, where real drift would climb.
+    #[test]
+    fn the_audit_reports_a_running_total_that_stays_flat() {
+        let rate = 48_000u64;
+        let bpm = 88.0;
+        // 64 beats at 88 BPM: 1535.99967 pulses, so the boundary pulse alternates.
+        let loop_frames = 2_094_545u64;
+        let mut c = ClockOut::new(&show(), bpm, rate as u32);
+        let mut midi = RecordingMidi::default();
+        c.start(0);
+
+        let mut elapsed = 0u64;
+        let mut totals = Vec::new();
+        while elapsed < 30 * loop_frames {
+            if let Some(line) = c.tick(elapsed, loop_frames, &mut midi) {
+                let cum: i64 = line
+                    .split("cumulative ")
+                    .nth(1)
+                    .and_then(|s| s.trim_end_matches(')').parse().ok())
+                    .expect("audit reports a running total");
+                totals.push(cum);
+            }
+            elapsed += 48;
+        }
+
+        assert!(totals.len() >= 20, "expected many loops, got {}", totals.len());
+        // Individual loops may be off by one; the total must not walk away.
+        assert!(
+            totals.iter().all(|t| t.abs() <= 1),
+            "the running total must stay flat, got {totals:?}"
+        );
+        assert_eq!(*totals.last().unwrap(), 0, "and end where it started");
     }
 
 }
