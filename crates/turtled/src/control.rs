@@ -731,10 +731,11 @@ pub fn run(
                 // is a genuine reposition rather than the music continuing.
                 let loop_frames = if looping { (duration_s * rate as f64) as u64 } else { 0 };
                 // Musical time comes straight from the RT thread's monotonic frame
-                // count (§5.1); `pos` is passed only so a wrap can be noticed.
+                // count (§5.1). The clock needs nothing else: it computes the loop
+                // boundary from the run's origin rather than watching for it.
                 let elapsed = clock.elapsed(epoch.elapsed().as_nanos() as u64);
                 if let Some(audit) =
-                    clock_out.tick(elapsed, pos, loop_frames, &dest_offsets, &mut midi_out)
+                    clock_out.tick(elapsed, loop_frames, &dest_offsets, &mut midi_out)
                 {
                     println!("{audit}");
                 }
