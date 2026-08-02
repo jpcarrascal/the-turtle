@@ -270,6 +270,16 @@ pub fn run(
     // MIDI clock master (§5), for whichever destinations set `clock = true`. Inert
     // when none did, so there is no second code path for shows that want none.
     let mut clock_out = crate::clock_out::ClockOut::new(&show, mixer.bpm(), rate);
+    // Say up front whether the declared tempo agrees with the loop (§5.1). Printed
+    // whether or not clock is enabled: the same mismatch also puts the tempo-synced
+    // delay on a different grid from the stems.
+    if let Some(msg) = crate::clock_out::tempo_check(
+        mixer.bpm(),
+        if mixer.is_looping() { frames } else { 0 },
+        rate,
+    ) {
+        println!("{msg}");
+    }
 
     // Wait for the device rather than exiting: at boot USB enumeration races the
     // service, and on a restart the outgoing process may still hold it (§12).
@@ -582,6 +592,13 @@ pub fn run(
                                 p.retempo(loaded.bpm);
                             }
                             clock_out.retempo(loaded.bpm);
+                            if let Some(msg) = crate::clock_out::tempo_check(
+                                loaded.bpm,
+                                if loaded.looping { loaded.frames } else { 0 },
+                                rate,
+                            ) {
+                                println!("{msg}");
+                            }
                             current_song = Some(song.clone());
                             let _ = song_tx.push(loaded.mixer);
                             schedulers = loaded.schedulers;

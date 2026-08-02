@@ -211,6 +211,53 @@ impl ClockOut {
     }
 }
 
+/// Does the song's declared tempo agree with the length of its loop (§5.1)?
+///
+/// # Why this check exists
+///
+/// Clock pulses run at `song.toml`'s `bpm`, while the audio runs at whatever tempo
+/// its stems were actually rendered at. If those disagree, everything synced to the
+/// clock diverges from the audio linearly and forever — a 0.5% error is a whole beat
+/// every two minutes — and no amount of care inside the clock can fix it, because
+/// the clock is faithfully reproducing a wrong number.
+///
+/// A looping song makes the real tempo checkable: a loop is virtually always a whole
+/// number of beats, so `beats = loop_seconds x bpm / 60` should come out very close
+/// to an integer. If it does not, the loop implies a different tempo, and that is
+/// almost certainly the true one.
+///
+/// Returns `None` when there is nothing to check — no loop, or a loop so short that
+/// rounding to the nearest beat says little.
+pub fn tempo_check(bpm: f64, loop_frames: u64, rate: u32) -> Option<String> {
+    if loop_frames == 0 || bpm <= 0.0 || !bpm.is_finite() {
+        return None;
+    }
+    let secs = loop_frames as f64 / rate as f64;
+    let beats = secs * bpm / 60.0;
+    if beats < 2.0 {
+        return None;
+    }
+    let nearest = beats.round();
+    // The implied tempo if the loop really is `nearest` beats long.
+    let implied = nearest * 60.0 / secs;
+    let err_pct = (implied - bpm) / bpm * 100.0;
+    // A beat every two minutes is 0.5%, which is glaring; a tenth of that is
+    // inaudible over a set. 0.05% is the line between "worth saying" and "noise".
+    if err_pct.abs() < 0.05 {
+        return Some(format!(
+            "[clock] {bpm:.3} BPM; loop {secs:.3}s = {nearest:.0} beats — tempo agrees"
+        ));
+    }
+    let drift_s_per_min = (err_pct / 100.0).abs() * 60.0;
+    let beats_per_min = drift_s_per_min * bpm / 60.0;
+    Some(format!(
+        "[clock] WARNING: {bpm:.3} BPM disagrees with the loop. {secs:.3}s = {beats:.3} beats \
+         at {bpm:.3}, but {nearest:.0} beats implies {implied:.3} BPM ({err_pct:+.3}%). \
+         Anything synced to clock will drift ~{beats_per_min:.2} beats per minute against the \
+         audio. Fix `bpm` in song.toml."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +513,38 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
             "{pulses} pulses over {run_secs}s, expected {ideal}: backwards blips \
              must not add musical time"
         );
+    }
+
+    /// A loop that is a whole number of beats at the declared tempo is the healthy
+    /// case and must not warn.
+    #[test]
+    fn a_loop_that_matches_the_tempo_reports_agreement() {
+        // 64 beats at 88 BPM = 43.636s.
+        let frames = (64.0 * 60.0 / 88.0 * 48_000.0) as u64;
+        let msg = tempo_check(88.0, frames, 48_000).expect("a looping song is checkable");
+        assert!(msg.contains("tempo agrees"), "{msg}");
+        assert!(msg.contains("64 beats"), "{msg}");
+    }
+
+    /// The failure this exists to catch: the stems are at one tempo and song.toml
+    /// declares another, so everything synced to clock diverges linearly.
+    #[test]
+    fn a_tempo_that_disagrees_with_the_loop_warns_with_the_implied_value() {
+        // The loop is really 64 beats at 87.5 BPM, but song.toml claims 88.
+        let frames = (64.0 * 60.0 / 87.5 * 48_000.0) as u64;
+        let msg = tempo_check(88.0, frames, 48_000).expect("checkable");
+        assert!(msg.contains("WARNING"), "{msg}");
+        assert!(msg.contains("87.5"), "the implied tempo must be named: {msg}");
+        // 88 vs 87.5 is 0.57%, which is about half a beat a minute at this tempo.
+        assert!(msg.contains("0.5") || msg.contains("0.6"), "drift rate should be stated: {msg}");
+    }
+
+    /// Nothing to check without a loop, and nothing meaningful for a loop too short
+    /// to round to a beat with confidence.
+    #[test]
+    fn an_unloopable_or_tiny_song_is_not_checked() {
+        assert!(tempo_check(88.0, 0, 48_000).is_none(), "no loop, nothing to compare");
+        assert!(tempo_check(88.0, 4_800, 48_000).is_none(), "0.1s is under two beats");
     }
 
 }
