@@ -60,6 +60,13 @@ pub struct ClockOut {
     /// two minutes on a 2-second loop, which is what a drum machine hears as
     /// steadily running fast.
     elapsed: u64,
+    /// Pulses emitted since the last loop wrap, for the per-loop audit.
+    ///
+    /// A loop is a known number of beats, so it owes a known number of pulses. This
+    /// is the only measurement that separates "our clock is wrong" from "the synced
+    /// device is not actually following it" — and without it the two are
+    /// indistinguishable by ear, which cost two wrong diagnoses.
+    pulses_this_loop: u32,
     /// Highest transport position seen in the current pass through the song.
     ///
     /// A high-water mark rather than "the previous position", because the
@@ -81,7 +88,7 @@ impl ClockOut {
             .filter(|(_, d)| d.clock)
             .map(|(port, _)| ClockPort { port, clock: MidiClock::new(bpm, rate) })
             .collect();
-        ClockOut { ports, bpm, rate, elapsed: 0, high_water: None }
+        ClockOut { ports, bpm, rate, elapsed: 0, high_water: None, pulses_this_loop: 0 }
     }
 
     /// Whether any destination asked for clock.
@@ -116,6 +123,7 @@ impl ClockOut {
         let (bpm, rate) = (self.bpm, self.rate);
         self.elapsed = 0;
         self.high_water = None;
+        self.pulses_this_loop = 0;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
         }
@@ -144,15 +152,27 @@ impl ClockOut {
     /// `offsets` is indexed by port, in `show.destinations` order — the same slice
     /// the scheduler uses, so a port's latency trim cannot mean one thing for its
     /// cues and another for its clock.
-    pub fn tick(&mut self, pos: u64, loop_frames: u64, offsets: &[f64], midi: &mut impl MidiSink) {
+    ///
+    /// Returns an audit line at each loop wrap: how many pulses the loop actually
+    /// emitted against how many its length owes.
+    pub fn tick(
+        &mut self,
+        pos: u64,
+        loop_frames: u64,
+        offsets: &[f64],
+        midi: &mut impl MidiSink,
+    ) -> Option<String> {
         if self.ports.is_empty() {
-            return;
+            return None;
         }
         // Musical time only ever moves forward, even though the position does not.
         let (delta, new_high) = self.step(pos, loop_frames);
+        let wrapped = self.high_water.is_some_and(|high| new_high < high && delta > 0);
         self.high_water = Some(new_high);
         self.elapsed += delta;
 
+        let first_port = self.ports[0].port;
+        let mut counted = 0u32;
         for p in &mut self.ports {
             // `None` = still inside a positive offset at the start; nothing due.
             let Some(adj) = crate::play::dispatch_pos(self.elapsed, offsets[p.port], self.rate)
@@ -164,9 +184,30 @@ impl ClockOut {
             if let Advance::Pulses(due) = p.clock.advance(adj) {
                 for _ in due {
                     midi.send(p.port, &[CLOCK]);
+                    // Counted once, not once per port: every port runs the same
+                    // train, so one count describes them all.
+                    if p.port == first_port {
+                        counted += 1;
+                    }
                 }
             }
         }
+
+        self.pulses_this_loop += counted;
+
+        wrapped.then(|| {
+            let owed = loop_frames as f64 / self.samples_per_pulse();
+            let sent = std::mem::replace(&mut self.pulses_this_loop, 0);
+            format!(
+                "[clock] loop audit: sent {sent} pulses, loop owes {owed:.2} ({:+.2})",
+                sent as f64 - owed
+            )
+        })
+    }
+
+    /// Samples between pulses at the current tempo.
+    fn samples_per_pulse(&self) -> f64 {
+        60.0 * self.rate as f64 / (self.bpm * 24.0)
     }
     /// One tick's worth of musical time, and the new high-water mark.
     ///
@@ -317,7 +358,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(c.is_enabled());
 
         c.start(&mut midi);
-        c.tick(1000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(1000, 0, &[0.0, 0.0], &mut midi);
 
         assert!(midi.sent(0).is_empty(), "the non-clock port must be silent");
         let pedals = midi.sent(1);
@@ -335,7 +376,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(!c.is_enabled());
 
         c.start(&mut midi);
-        c.tick(48_000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(48_000, 0, &[0.0, 0.0], &mut midi);
         c.stop(&mut midi);
         assert!(midi.sent(0).is_empty() && midi.sent(1).is_empty(), "nothing should be sent");
     }
@@ -348,7 +389,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         // Tick every 48 samples (1 ms), through one beat.
         for tick in 0..=500u64 {
-            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count();
         assert_eq!(pulses, 25, "pulse 0 plus 24 more across one beat");
@@ -361,14 +402,14 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..2000u64 {
-            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         let before = midi.sent(1).len();
         // The song wraps back to the top.
-        c.tick(0, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(0, 0, &[0.0, 0.0], &mut midi);
         assert_eq!(midi.sent(1).len(), before, "a wrap must send nothing");
         // And the train continues afterwards.
-        c.tick(1000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(1000, 0, &[0.0, 0.0], &mut midi);
         assert!(midi.sent(1).len() > before, "pulses resume after the wrap");
     }
 
@@ -379,12 +420,12 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
     fn start_restarts_the_pulse_train() {
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
-        c.tick(10_000, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(10_000, 0, &[0.0, 0.0], &mut midi);
 
         c.start(&mut midi);
         let after_start = midi.sent(1).len();
         // Position 0 is pulse 0's time, so it is due immediately after a restart.
-        c.tick(0, 0, &[0.0, 0.0], &mut midi);
+        let _ = c.tick(0, 0, &[0.0, 0.0], &mut midi);
         assert_eq!(
             midi.sent(1).len(),
             after_start + 1,
@@ -400,13 +441,13 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..1000u64 {
-            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         c.retempo(60.0);
         let before = midi.sent(1).len();
         // At 60 BPM a pulse is 2000 samples, so one second owes 24 pulses + pulse 0.
         for tick in 0..=1000u64 {
-            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).len() - before;
         assert_eq!(pulses, 25, "half the pulses of the old tempo over the same span");
@@ -431,7 +472,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut pos = 0u64;
         c.start(&mut midi);
         for _ in 0..(run_secs * rate / 48) {
-            c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
             pos = (pos + 48) % loop_frames;
         }
 
@@ -456,14 +497,14 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         c.start(&mut midi_loop);
         let mut pos = 0u64;
         for _ in 0..(30 * rate / 48) {
-            c.tick(pos, 2 * rate, &[0.0, 0.0], &mut midi_loop);
+            let _ = c.tick(pos, 2 * rate, &[0.0, 0.0], &mut midi_loop);
             pos = (pos + 48) % (2 * rate);
         }
 
         let mut c = ClockOut::new(&show(), 88.0, rate as u32);
         c.start(&mut midi_straight);
         for tick in 0..(30 * rate / 48) {
-            c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi_straight);
+            let _ = c.tick(tick * 48, 0, &[0.0, 0.0], &mut midi_straight);
         }
 
         let count = |m: &RecordingMidi| {
@@ -499,9 +540,9 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let ticks = run_secs * rate / 48;
         let mut pos = 0u64;
         for t in 0..ticks {
-            c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
+            let _ = c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi);
             if t % 100 == 99 {
-                c.tick(pos - 20, loop_frames, &[0.0, 0.0], &mut midi);
+                let _ = c.tick(pos - 20, loop_frames, &[0.0, 0.0], &mut midi);
             }
             pos += 48;
         }
@@ -545,6 +586,44 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
     fn an_unloopable_or_tiny_song_is_not_checked() {
         assert!(tempo_check(88.0, 0, 48_000).is_none(), "no loop, nothing to compare");
         assert!(tempo_check(88.0, 4_800, 48_000).is_none(), "0.1s is under two beats");
+    }
+
+    /// The audit is the measurement that separates "our clock is wrong" from "the
+    /// synced device is not following it". A loop of a whole number of beats owes a
+    /// whole number of pulses, so the line must read within a pulse of that.
+    #[test]
+    fn the_loop_audit_counts_the_pulses_the_loop_owes() {
+        let rate = 48_000u64;
+        let bpm = 88.0;
+        // 64 beats at 88 BPM: 1536 pulses per loop.
+        let loop_frames = (64.0 * 60.0 / bpm * rate as f64) as u64;
+        let mut c = ClockOut::new(&show(), bpm, rate as u32);
+        let mut midi = RecordingMidi::default();
+        c.start(&mut midi);
+
+        let mut pos = 0u64;
+        let mut audits = Vec::new();
+        // Two full loops.
+        for _ in 0..(2 * loop_frames / 48) {
+            if let Some(line) = c.tick(pos, loop_frames, &[0.0, 0.0], &mut midi) {
+                audits.push(line);
+            }
+            pos = (pos + 48) % loop_frames;
+        }
+
+        assert!(!audits.is_empty(), "a wrap should have produced an audit line");
+        for line in &audits {
+            let sent: i64 = line
+                .split("sent ")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.parse().ok())
+                .expect("audit should name a pulse count");
+            assert!(
+                (sent - 1536).abs() <= 1,
+                "a 64-beat loop owes 1536 pulses, audit says {sent}: {line}"
+            );
+        }
     }
 
 }
