@@ -176,8 +176,8 @@ impl ClockOut {
         }
         let (bpm, rate) = (self.bpm, self.rate);
         let first_port = self.ports[0].port;
-        let mut counted = 0u32;
-        let mut wrapped = false;
+        let owed = loop_frames as f64 / self.samples_per_pulse();
+        let mut audit = None;
 
         for p in &mut self.ports {
             // This port's own timeline: musical time shifted by its dispatch offset,
@@ -192,33 +192,62 @@ impl ClockOut {
 
             // Has this port's pass ended? Computed from its origin, not observed:
             // the transport position is interpolated and its backwards jump is not
-            // visible until up to an audio period after the audio wrapped.
-            if p.restart && loop_frames > 0 && now >= p.next_boundary {
+            // visible until up to an audio period after the audio wrapped. Tracked
+            // for every port, not just restarting ones, so the audit is available
+            // whichever kind the first clock port happens to be.
+            if loop_frames > 0 && now >= p.next_boundary {
                 let at = p.next_boundary;
-                // Finish the outgoing pass first. A pulse whose time falls between
-                // the last tick and the boundary is still owed, and rebuilding the
-                // train without emitting it drops it. Up to the sample *before* the
-                // boundary: the pulse landing exactly on it belongs to the new pass.
-                let final_since = at.saturating_sub(p.origin).saturating_sub(1);
-                if let Advance::Pulses(due) = p.clock.advance(final_since) {
-                    for _ in due {
-                        midi.send(p.port, &[CLOCK]);
-                        if p.port == first_port {
-                            counted += 1;
+                if p.restart {
+                    // Finish the outgoing pass first. A pulse whose time falls
+                    // between the last tick and the boundary is still owed, and
+                    // rebuilding the train without emitting it drops it. Up to the
+                    // sample *before* the boundary: the pulse landing exactly on it
+                    // belongs to the new pass.
+                    // Stop short of the pulse the new pass will supply as its
+                    // downbeat. A loop is rarely an exact multiple of the pulse
+                    // period, so the last pulse of the pass can sit *inside* the
+                    // boundary — flushing it and then restarting emits two pulses a
+                    // sample apart, one extra every loop. At 88 BPM that is 1/24 of
+                    // a beat per pass, about a third of a beat after seven rounds.
+                    let boundary_index =
+                        (loop_frames as f64 / (60.0 * rate as f64 / (bpm * 24.0))).round() as u64;
+                    let last_of_pass = p.clock.pulse_sample(boundary_index);
+                    let final_since = at
+                        .saturating_sub(p.origin)
+                        .min(last_of_pass)
+                        .saturating_sub(1);
+                    if let Advance::Pulses(due) = p.clock.advance(final_since) {
+                        for _ in due {
+                            midi.send(p.port, &[CLOCK]);
+                            if p.port == first_port {
+                                self.pulses_this_loop += 1;
+                            }
                         }
                     }
+                    // Phased from the boundary itself, so the downbeat lands where
+                    // the loop began however late in the tick we ran.
+                    p.clock = MidiClock::new(bpm, rate);
+                    p.origin = at;
+                    midi.send(p.port, &[START]);
                 }
-                // Phased from the boundary itself, so the downbeat lands where the
-                // loop began however late in the tick we ran.
-                p.clock = MidiClock::new(bpm, rate);
-                p.origin = at;
                 p.next_boundary = at + loop_frames;
-                midi.send(p.port, &[START]);
-                wrapped = true;
-            } else if p.pending_start && now >= p.origin {
-                // The transport's own Start, held until the downbeat is due in this
-                // port's timeline so it arrives with the first pulse rather than an
-                // offset ahead of it.
+
+                // Taken here, before the pulse loop below — that loop emits the
+                // *new* pass's downbeat, and billing it to the pass that just ended
+                // reported one pulse too many every loop.
+                if p.port == first_port {
+                    let sent = std::mem::replace(&mut self.pulses_this_loop, 0);
+                    audit = Some(format!(
+                        "[clock] loop audit: sent {sent} pulses, loop owes {owed:.2} ({:+.2})",
+                        sent as f64 - owed
+                    ));
+                }
+            }
+
+            // The transport's own Start, held until the downbeat is due in this
+            // port's timeline so it arrives with the first pulse rather than an
+            // offset ahead of it.
+            if p.pending_start && now >= p.origin {
                 midi.send(p.port, &[START]);
                 p.pending_start = false;
             }
@@ -230,21 +259,14 @@ impl ClockOut {
                     // Counted once, not once per port: every port runs the same
                     // train, so one count describes them all.
                     if p.port == first_port {
-                        counted += 1;
+                        self.pulses_this_loop += 1;
                     }
                 }
             }
-        }
-        self.pulses_this_loop += counted;
 
-        wrapped.then(|| {
-            let owed = loop_frames as f64 / self.samples_per_pulse();
-            let sent = std::mem::replace(&mut self.pulses_this_loop, 0);
-            format!(
-                "[clock] loop audit: sent {sent} pulses, loop owes {owed:.2} ({:+.2})",
-                sent as f64 - owed
-            )
-        })
+
+        }
+        audit
     }
 
     /// Samples between pulses at the current tempo.
@@ -526,16 +548,11 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!((a - b).abs() <= 1, "looping sent {a} pulses, straight-through {b}");
     }
 
-    /// Pulse timing must depend on musical time alone, so the interpolated
-    /// position jittering backwards cannot disturb it.
-    ///
-    /// This used to be a real hazard: musical time was reconstructed by watching
-    /// `pos` move, and a few samples backwards was indistinguishable from a wrap.
-    /// Now `pos` is used only to notice a wrap, and small moves either way are
-    /// ignored — so this test feeds a deliberately noisy position and asserts the
-    /// pulse count is exactly what elapsed time owes.
+    /// Pulse timing depends on musical time alone. The clock is no longer given the
+    /// transport position at all — that is now structural rather than defended, so
+    /// what remains to check is that the pulse count matches elapsed time exactly.
     #[test]
-    fn position_jitter_cannot_disturb_the_pulse_train() {
+    fn pulses_follow_elapsed_time_exactly() {
         let rate = 48_000u64;
         let bpm = 120.0;
         let mut c = ClockOut::new(&show(), bpm, rate as u32);
@@ -543,13 +560,8 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         c.start(0);
 
         let run_secs = 10u64;
-        let ticks = run_secs * rate / 48;
-        for t in 0..ticks {
-            let elapsed = t * 48;
-            // The position wobbles around musical time, sometimes backwards, and
-            // never wraps (no loop here).
-            let pos = if t % 100 == 99 { elapsed.saturating_sub(20) } else { elapsed };
-            let _ = c.tick(elapsed, 0, &mut midi);
+        for t in 0..(run_secs * rate / 48) {
+            let _ = c.tick(t * 48, 0, &mut midi);
         }
 
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count() as f64;
@@ -963,6 +975,45 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert_eq!(batch.len(), 2, "Start and the downbeat together, got {batch:?}");
         assert_eq!(batch[0].as_slice(), [START]);
         assert_eq!(batch[1].as_slice(), [CLOCK]);
+    }
+
+    /// The drift reported at 88 BPM: a loop that is not an exact multiple of the
+    /// pulse period made a restarting port emit ONE extra pulse per pass.
+    ///
+    /// The last pulse of the pass sits just inside the boundary, so flushing it and
+    /// then restarting put two pulses a sample apart. One pulse per 43.6 s is 1/24
+    /// of a beat, about a third of a beat after seven rounds — audibly out of sync,
+    /// while the tempo looks correct on any single pass.
+    #[test]
+    fn a_restarting_port_emits_no_extra_pulse_at_an_awkward_loop_length() {
+        let rate = 48_000u64;
+        let bpm = 88.0;
+        let spp = 60.0 * rate as f64 / (bpm * 24.0); // 1363.63... samples
+        // 64 beats at 88 BPM is 2,094,545.45 samples: the boundary falls between
+        // pulses however the file length is rounded, so test both sides of it.
+        for loop_frames in [2_094_545u64, 2_094_546, 2_094_544] {
+            let owed = (loop_frames as f64 / spp).round() as i64;
+            let passes = 8u64;
+
+            let mut c = ClockOut::new(&show(), bpm, rate as u32);
+            let mut midi = RecordingMidi::default();
+            c.start(0);
+
+            let mut elapsed = 0u64;
+            while elapsed < passes * loop_frames {
+                let _ = c.tick(elapsed, loop_frames, &mut midi);
+                elapsed += 48;
+            }
+
+            let pulses = midi.sent(2).iter().filter(|m| m.as_slice() == [CLOCK]).count() as i64;
+            let ideal = passes as i64 * owed;
+            assert!(
+                (pulses - ideal).abs() <= 1,
+                "loop {loop_frames}: {pulses} pulses over {passes} passes, expected \
+                 {ideal} ({owed} per pass) — an extra pulse per loop is a third of a \
+                 beat after seven rounds"
+            );
+        }
     }
 
 }
