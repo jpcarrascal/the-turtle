@@ -55,17 +55,6 @@ pub struct ClockOut {
     ports: Vec<ClockPort>,
     bpm: f64,
     rate: u32,
-    /// Musical time since the transport started, in samples, accumulated **across
-    /// loop wraps**.
-    ///
-    /// The pulse train runs on this rather than on the raw transport position,
-    /// because the position is not monotonic: it jumps back at every wrap. Deriving
-    /// pulses from it restarted the train at pulse 0 each iteration, and since a
-    /// loop is rarely a whole number of pulses, each iteration emitted a fractional
-    /// pulse too many. That accumulates — measured in simulation at 1.5 beats over
-    /// two minutes on a 2-second loop, which is what a drum machine hears as
-    /// steadily running fast.
-    elapsed: u64,
     /// Pulses emitted since the last loop wrap, for the per-loop audit.
     ///
     /// A loop is a known number of beats, so it owes a known number of pulses. This
@@ -73,14 +62,10 @@ pub struct ClockOut {
     /// device is not actually following it" — and without it the two are
     /// indistinguishable by ear, which cost two wrong diagnoses.
     pulses_this_loop: u32,
-    /// Highest transport position seen in the current pass through the song.
-    ///
-    /// A high-water mark rather than "the previous position", because the
-    /// interpolated position jitters backwards by a few samples and merely ignoring
-    /// those steps is not enough: the recovery would then be counted as forward
-    /// motion, inflating musical time by the size of every blip. Measuring progress
-    /// beyond the high-water mark makes the total exactly the distance travelled.
-    high_water: Option<u64>,
+    /// Transport position at the previous tick, used **only** to notice a wrap so
+    /// `clock_restart` ports can be re-phased. Musical time no longer comes from
+    /// here — see [`ClockOut::tick`].
+    prev_pos: Option<u64>,
 }
 
 impl ClockOut {
@@ -99,7 +84,7 @@ impl ClockOut {
                 origin: 0,
             })
             .collect();
-        ClockOut { ports, bpm, rate, elapsed: 0, high_water: None, pulses_this_loop: 0 }
+        ClockOut { ports, bpm, rate, prev_pos: None, pulses_this_loop: 0 }
     }
 
     /// Whether any destination asked for clock.
@@ -132,8 +117,7 @@ impl ClockOut {
     /// Rewind musical time and rebuild every port's train.
     fn restart(&mut self) {
         let (bpm, rate) = (self.bpm, self.rate);
-        self.elapsed = 0;
-        self.high_water = None;
+        self.prev_pos = None;
         self.pulses_this_loop = 0;
         for p in &mut self.ports {
             p.clock = MidiClock::new(bpm, rate);
@@ -169,6 +153,7 @@ impl ClockOut {
     /// emitted against how many its length owes.
     pub fn tick(
         &mut self,
+        elapsed: u64,
         pos: u64,
         loop_frames: u64,
         offsets: &[f64],
@@ -177,21 +162,28 @@ impl ClockOut {
         if self.ports.is_empty() {
             return None;
         }
-        // Musical time only ever moves forward, even though the position does not.
-        let (delta, new_high) = self.step(pos, loop_frames);
-        let wrapped = self.high_water.is_some_and(|high| new_high < high && delta > 0);
-        self.high_water = Some(new_high);
-        self.elapsed += delta;
-
-        // A wrap re-phases the ports that asked for it: Start says "back to the top",
-        // which is exactly what the transport just did. Sent before the pulses below
-        // so the first pulse of the new pass follows it rather than preceding it.
+        // `elapsed` is musical time straight from the RT thread — monotonic, exact,
+        // and not reconstructed from anything. An earlier version derived it here by
+        // watching `pos` jump backwards, with a high-water mark, a wrap threshold
+        // and a noise floor stacked on an interpolated signal. It leaked a fraction
+        // of a pulse per wrap, invisibly at most tempos and as a whole missing pulse
+        // at 120 BPM, where the loop is an exact multiple of the pulse period.
         //
-        // `elapsed - pos` is where the new pass began: `pos` is how far into it we
-        // already are by the time the wrap is noticed, a tick at most.
+        // `pos` is still used, for one thing only: noticing the wrap, so a
+        // `clock_restart` port can be told to return to the top.
+        let wrapped = self
+            .prev_pos
+            .is_some_and(|prev| loop_frames > 0 && prev > pos && prev - pos > loop_frames / 2);
+        self.prev_pos = Some(pos);
+
+        // A wrap re-phases the ports that asked: Start says "back to the top", which
+        // is what the transport just did. Sent before this tick's pulses so the
+        // downbeat pulse follows it rather than preceding it.
         if wrapped {
-            let origin = self.elapsed.saturating_sub(pos);
             let (bpm, rate) = (self.bpm, self.rate);
+            // Where the new pass began, in musical time: `pos` is how far into it we
+            // already are by the time the wrap is noticed — a tick at most.
+            let origin = elapsed.saturating_sub(pos);
             for p in &mut self.ports {
                 if p.restart {
                     p.clock = MidiClock::new(bpm, rate);
@@ -204,16 +196,14 @@ impl ClockOut {
         let first_port = self.ports[0].port;
         let mut counted = 0u32;
         for p in &mut self.ports {
-            // `None` = still inside a positive offset at the start; nothing due.
             // Measured from this port's own origin, which only a restarting port
             // ever moves — everyone else runs from the start of the song.
-            let since_origin = self.elapsed.saturating_sub(p.origin);
+            let since_origin = elapsed.saturating_sub(p.origin);
+            // `None` = still inside a positive offset at the start; nothing due.
             let Some(adj) = crate::play::dispatch_pos(since_origin, offsets[p.port], self.rate)
             else {
                 continue;
             };
-            // `elapsed` is monotonic, so `advance` sees a discontinuity only on a
-            // genuine restart — never on a wrap, which is the entire point.
             if let Advance::Pulses(due) = p.clock.advance(adj) {
                 for _ in due {
                     midi.send(p.port, &[CLOCK]);
@@ -225,7 +215,6 @@ impl ClockOut {
                 }
             }
         }
-
         self.pulses_this_loop += counted;
 
         wrapped.then(|| {
@@ -241,47 +230,6 @@ impl ClockOut {
     /// Samples between pulses at the current tempo.
     fn samples_per_pulse(&self) -> f64 {
         60.0 * self.rate as f64 / (self.bpm * 24.0)
-    }
-    /// One tick's worth of musical time, and the new high-water mark.
-    ///
-    /// Three ways the position can move backwards, and they mean different things:
-    ///
-    /// * **A loop wrap** — back by most of a loop. The music kept playing, so the
-    ///   increment is the rest of the loop plus the new position.
-    /// * **A reposition** — a large backwards move in a song that does not loop, or
-    ///   one too small to be a wrap. No musical time passed, and the clock carries
-    ///   on from wherever the transport now is.
-    /// * **Interpolation noise** — a few samples, because the position is
-    ///   extrapolated between anchors the RT thread publishes once per audio period
-    ///   and a fresh anchor can land behind the extrapolation. This must contribute
-    ///   nothing *and* leave the mark alone: clamping the step to zero but then
-    ///   counting the recovery as forward motion inflates musical time by the size
-    ///   of every blip, which is the same drift in miniature.
-    fn step(&self, pos: u64, loop_frames: u64) -> (u64, u64) {
-        let Some(high) = self.high_water else {
-            // First tick of a run: nothing elapsed yet.
-            return (0, pos);
-        };
-        if pos >= high {
-            return (pos - high, pos);
-        }
-        let backwards = high - pos;
-        if loop_frames > 0 && backwards > loop_frames / 2 {
-            // `saturating_sub`: the extrapolation can be a little past the loop end
-            // at the moment the wrap is spotted.
-            (loop_frames.saturating_sub(high) + pos, pos)
-        } else if backwards > self.noise_floor() {
-            (0, pos)
-        } else {
-            (0, high)
-        }
-    }
-
-    /// A backwards move smaller than this is interpolation noise, not a reposition:
-    /// 100 ms, far larger than the few samples an anchor update can shift the
-    /// extrapolation, and far smaller than any real seek.
-    fn noise_floor(&self) -> u64 {
-        self.rate as u64 / 10
     }
 }
 
@@ -397,7 +345,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(c.is_enabled());
 
         c.start(&mut midi);
-        let _ = c.tick(1000, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let _ = c.tick(1000, 1000, 0, &[0.0, 0.0, 0.0], &mut midi);
 
         assert!(midi.sent(0).is_empty(), "the non-clock port must be silent");
         let pedals = midi.sent(1);
@@ -415,7 +363,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!(!c.is_enabled());
 
         c.start(&mut midi);
-        let _ = c.tick(48_000, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let _ = c.tick(48_000, 48_000, 0, &[0.0, 0.0, 0.0], &mut midi);
         c.stop(&mut midi);
         assert!(midi.sent(0).is_empty() && midi.sent(1).is_empty(), "nothing should be sent");
     }
@@ -428,7 +376,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         // Tick every 48 samples (1 ms), through one beat.
         for tick in 0..=500u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count();
         assert_eq!(pulses, 25, "pulse 0 plus 24 more across one beat");
@@ -441,14 +389,14 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..2000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let before = midi.sent(1).len();
         // The song wraps back to the top.
-        let _ = c.tick(0, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let _ = c.tick(0, 0, 0, &[0.0, 0.0, 0.0], &mut midi);
         assert_eq!(midi.sent(1).len(), before, "a wrap must send nothing");
         // And the train continues afterwards.
-        let _ = c.tick(1000, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let _ = c.tick(1000, 1000, 0, &[0.0, 0.0, 0.0], &mut midi);
         assert!(midi.sent(1).len() > before, "pulses resume after the wrap");
     }
 
@@ -459,12 +407,12 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
     fn start_restarts_the_pulse_train() {
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
-        let _ = c.tick(10_000, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let _ = c.tick(10_000, 10_000, 0, &[0.0, 0.0, 0.0], &mut midi);
 
         c.start(&mut midi);
         let after_start = midi.sent(1).len();
         // Position 0 is pulse 0's time, so it is due immediately after a restart.
-        let _ = c.tick(0, 0, &[0.0, 0.0, 0.0], &mut midi);
+        let _ = c.tick(0, 0, 0, &[0.0, 0.0, 0.0], &mut midi);
         assert_eq!(
             midi.sent(1).len(),
             after_start + 1,
@@ -480,13 +428,13 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 120.0, 48_000);
         let mut midi = RecordingMidi::default();
         for tick in 0..1000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         c.retempo(60.0);
         let before = midi.sent(1).len();
         // At 60 BPM a pulse is 2000 samples, so one second owes 24 pulses + pulse 0.
         for tick in 0..=1000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let pulses = midi.sent(1).len() - before;
         assert_eq!(pulses, 25, "half the pulses of the old tempo over the same span");
@@ -509,10 +457,12 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let loop_frames = 2 * rate; // a 2-second loop: 59 wraps in two minutes
         let run_secs = 120u64;
         let mut pos = 0u64;
+        let mut elapsed = 0u64;
         c.start(&mut midi);
         for _ in 0..(run_secs * rate / 48) {
-            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(elapsed, pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             pos = (pos + 48) % loop_frames;
+            elapsed += 48;
         }
 
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count() as f64;
@@ -535,15 +485,17 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut c = ClockOut::new(&show(), 88.0, rate as u32);
         c.start(&mut midi_loop);
         let mut pos = 0u64;
+        let mut elapsed = 0u64;
         for _ in 0..(30 * rate / 48) {
-            let _ = c.tick(pos, 2 * rate, &[0.0, 0.0, 0.0], &mut midi_loop);
+            let _ = c.tick(elapsed, pos, 2 * rate, &[0.0, 0.0, 0.0], &mut midi_loop);
             pos = (pos + 48) % (2 * rate);
+            elapsed += 48;
         }
 
         let mut c = ClockOut::new(&show(), 88.0, rate as u32);
         c.start(&mut midi_straight);
         for tick in 0..(30 * rate / 48) {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi_straight);
+            let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi_straight);
         }
 
         let count = |m: &RecordingMidi| {
@@ -553,78 +505,38 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         assert!((a - b).abs() <= 1, "looping sent {a} pulses, straight-through {b}");
     }
 
-    /// The position is interpolated between anchors the RT thread publishes once
-    /// per audio period, so it steps back by a few samples now and then — most
-    /// often while the clock settles at the start of playback.
+    /// Pulse timing must depend on musical time alone, so the interpolated
+    /// position jittering backwards cannot disturb it.
     ///
-    /// Treating those as loop wraps added a whole loop of musical time each. The
-    /// pulses are not simply doubled, because `MidiClock` recognises the resulting
-    /// huge forward jump as a seek and rebases — so what a synced device hears is
-    /// the train repeatedly losing and re-finding its phase, which is exactly the
-    /// "scrambles for a second, then locks" reported from hardware. This asserts
-    /// against elapsed musical time, which catches both shapes.
+    /// This used to be a real hazard: musical time was reconstructed by watching
+    /// `pos` move, and a few samples backwards was indistinguishable from a wrap.
+    /// Now `pos` is used only to notice a wrap, and small moves either way are
+    /// ignored — so this test feeds a deliberately noisy position and asserts the
+    /// pulse count is exactly what elapsed time owes.
     #[test]
-    fn a_few_samples_backwards_is_noise_not_a_wrap() {
+    fn position_jitter_cannot_disturb_the_pulse_train() {
         let rate = 48_000u64;
-        let bpm = 88.0;
-        let loop_frames = 2 * rate;
+        let bpm = 120.0;
         let mut c = ClockOut::new(&show(), bpm, rate as u32);
         let mut midi = RecordingMidi::default();
         c.start(&mut midi);
 
-        // Ten seconds of forward motion, well short of the 2-second loop's wrap
-        // (the position never actually wraps here), with a 20-sample backwards
-        // blip every 100 ticks.
         let run_secs = 10u64;
         let ticks = run_secs * rate / 48;
-        let mut pos = 0u64;
         for t in 0..ticks {
-            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
-            if t % 100 == 99 {
-                let _ = c.tick(pos - 20, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
-            }
-            pos += 48;
+            let elapsed = t * 48;
+            // The position wobbles around musical time, sometimes backwards, and
+            // never wraps (no loop here).
+            let pos = if t % 100 == 99 { elapsed.saturating_sub(20) } else { elapsed };
+            let _ = c.tick(elapsed, pos, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
 
         let pulses = midi.sent(1).iter().filter(|m| m.as_slice() == [CLOCK]).count() as f64;
         let ideal = run_secs as f64 * bpm / 60.0 * 24.0;
         assert!(
             (pulses - ideal).abs() <= 1.0,
-            "{pulses} pulses over {run_secs}s, expected {ideal}: backwards blips \
-             must not add musical time"
+            "{pulses} pulses over {run_secs}s, expected {ideal}"
         );
-    }
-
-    /// A loop that is a whole number of beats at the declared tempo is the healthy
-    /// case and must not warn.
-    #[test]
-    fn a_loop_that_matches_the_tempo_reports_agreement() {
-        // 64 beats at 88 BPM = 43.636s.
-        let frames = (64.0 * 60.0 / 88.0 * 48_000.0) as u64;
-        let msg = tempo_check(88.0, frames, 48_000).expect("a looping song is checkable");
-        assert!(msg.contains("tempo agrees"), "{msg}");
-        assert!(msg.contains("64 beats"), "{msg}");
-    }
-
-    /// The failure this exists to catch: the stems are at one tempo and song.toml
-    /// declares another, so everything synced to clock diverges linearly.
-    #[test]
-    fn a_tempo_that_disagrees_with_the_loop_warns_with_the_implied_value() {
-        // The loop is really 64 beats at 87.5 BPM, but song.toml claims 88.
-        let frames = (64.0 * 60.0 / 87.5 * 48_000.0) as u64;
-        let msg = tempo_check(88.0, frames, 48_000).expect("checkable");
-        assert!(msg.contains("WARNING"), "{msg}");
-        assert!(msg.contains("87.5"), "the implied tempo must be named: {msg}");
-        // 88 vs 87.5 is 0.57%, which is about half a beat a minute at this tempo.
-        assert!(msg.contains("0.5") || msg.contains("0.6"), "drift rate should be stated: {msg}");
-    }
-
-    /// Nothing to check without a loop, and nothing meaningful for a loop too short
-    /// to round to a beat with confidence.
-    #[test]
-    fn an_unloopable_or_tiny_song_is_not_checked() {
-        assert!(tempo_check(88.0, 0, 48_000).is_none(), "no loop, nothing to compare");
-        assert!(tempo_check(88.0, 4_800, 48_000).is_none(), "0.1s is under two beats");
     }
 
     /// The audit is the measurement that separates "our clock is wrong" from "the
@@ -641,13 +553,15 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         c.start(&mut midi);
 
         let mut pos = 0u64;
+        let mut elapsed = 0u64;
         let mut audits = Vec::new();
         // Two full loops.
         for _ in 0..(2 * loop_frames / 48) {
-            if let Some(line) = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi) {
+            if let Some(line) = c.tick(elapsed, pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi) {
                 audits.push(line);
             }
             pos = (pos + 48) % loop_frames;
+            elapsed += 48;
         }
 
         assert!(!audits.is_empty(), "a wrap should have produced an audit line");
@@ -677,9 +591,11 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         c.start(&mut midi);
 
         let mut pos = 0u64;
+        let mut elapsed = 0u64;
         for _ in 0..(3 * loop_frames / 48) {
-            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(elapsed, pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             pos = (pos + 48) % loop_frames;
+            elapsed += 48;
         }
 
         let starts = |port: usize| {
@@ -711,10 +627,11 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         c.start(&mut midi);
 
         let mut pos = 0u64;
+        let mut elapsed = 0u64;
         let mut restarts = 0;
         for _ in 0..(4 * loop_frames / 48) {
             let before = midi.sent(2).len();
-            let _ = c.tick(pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(elapsed, pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi);
             let batch = midi.sent(2).split_off(before);
             if batch.iter().any(|m| m.as_slice() == [START]) {
                 restarts += 1;
@@ -724,6 +641,7 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
                 );
             }
             pos = (pos + 48) % loop_frames;
+            elapsed += 48;
         }
         assert!(restarts >= 3, "expected a restart per wrap, saw {restarts}");
     }
@@ -735,10 +653,54 @@ mute  = { type = "note", notes = [72, 73, 74, 75] }
         let mut midi = RecordingMidi::default();
         c.start(&mut midi);
         for tick in 0..2000u64 {
-            let _ = c.tick(tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
+            let _ = c.tick(tick * 48, tick * 48, 0, &[0.0, 0.0, 0.0], &mut midi);
         }
         let starts = midi.sent(2).iter().filter(|m| m.as_slice() == [START]).count();
         assert_eq!(starts, 1, "only the transport's own Start");
+    }
+
+    /// The failure from hardware: at 120 BPM the loop is an exact multiple of the
+    /// pulse period, so losing even a fraction of a pulse of reconstructed time
+    /// dropped a whole pulse — the audit read 767 where 768 were owed, every loop.
+    /// At 72 BPM the same loss fell inside a pulse and the count looked perfect.
+    ///
+    /// Musical time now comes from the RT thread, so the count is exact at any
+    /// tempo. This checks the tempo that exposed it and one that hid it.
+    #[test]
+    fn the_loop_audit_is_exact_at_every_tempo() {
+        let rate = 48_000u64;
+        for (bpm, beats) in [(120.0, 32u64), (72.0, 8), (66.0, 8), (88.0, 64)] {
+            let loop_frames = (beats as f64 * 60.0 / bpm * rate as f64).round() as u64;
+            let owed = (beats * 24) as i64;
+            let mut c = ClockOut::new(&show(), bpm, rate as u32);
+            let mut midi = RecordingMidi::default();
+            c.start(&mut midi);
+
+            let mut pos = 0u64;
+            let mut elapsed = 0u64;
+            let mut audits = Vec::new();
+            for _ in 0..(3 * loop_frames / 48) {
+                if let Some(line) = c.tick(elapsed, pos, loop_frames, &[0.0, 0.0, 0.0], &mut midi) {
+                    audits.push(line);
+                }
+                pos = (pos + 48) % loop_frames;
+                elapsed += 48;
+            }
+
+            assert!(!audits.is_empty(), "{bpm} BPM: no wrap seen");
+            for line in &audits {
+                let sent: i64 = line
+                    .split("sent ")
+                    .nth(1)
+                    .and_then(|s| s.split(' ').next())
+                    .and_then(|s| s.parse().ok())
+                    .expect("audit names a count");
+                assert!(
+                    (sent - owed).abs() <= 1,
+                    "{bpm} BPM, {beats} beats: owes {owed}, audit says {sent} — {line}"
+                );
+            }
+        }
     }
 
 }

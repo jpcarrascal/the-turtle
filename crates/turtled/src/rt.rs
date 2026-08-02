@@ -15,6 +15,9 @@ use crate::mixer::Mixer;
 /// play/pause flag; the sample position lives in the [`Mixer`] (§3.1).
 pub struct RtAudio {
     playing: bool,
+    /// Frames rendered since the transport started, for the monotonic musical
+    /// clock (§5.1). Reset by Start, and not advanced while stopped.
+    rendered: u64,
     /// Whether `EndReached` has already been reported for the current run
     /// (since `Start`/`Seek`), so a finished-but-not-yet-stopped mixer
     /// doesn't spam the event queue every period while the control thread's
@@ -31,6 +34,7 @@ impl Default for RtAudio {
     fn default() -> Self {
         RtAudio {
             playing: false,
+            rendered: 0,
             reported_end: false,
             last_pos: 0,
         }
@@ -49,6 +53,9 @@ impl RtAudio {
         match cmd {
             RtCommand::Start => {
                 self.playing = true;
+                // Musical time restarts with the transport, matching the pulse
+                // train that `ClockOut::start` rebuilds at the same moment.
+                self.rendered = 0;
                 self.reported_end = false;
                 // Re-baseline: Start follows a Seek(0) on the rewind path, and a
                 // stale high watermark would read as a loop wrap on the next tick.
@@ -106,6 +113,8 @@ impl RtAudio {
         let pos = mixer.position();
         if self.playing {
             mixer.render(out);
+            // Counted here rather than derived from `pos`, which wraps.
+            self.rendered += (out.len() / 2) as u64;
         } else {
             // Stopped is not silent: the delay keeps recirculating so its tail rings
             // out instead of being cut off mid-echo (§6). The transport does not
@@ -114,6 +123,11 @@ impl RtAudio {
             mixer.render_tail(out);
         }
         pos
+    }
+
+    /// Frames rendered since the last Start — musical time, monotonic (§5.1).
+    pub fn rendered(&self) -> u64 {
+        self.rendered
     }
 
     pub fn is_playing(&self) -> bool {
@@ -171,7 +185,7 @@ pub fn run_audio(
 
         let now_ns = epoch.elapsed().as_nanos() as u64;
         let pos = rt.step(mixer, &mut buf);
-        clock.publish(pos, now_ns);
+        clock.publish(pos, rt.rendered(), now_ns);
 
         if rt.check_loop(mixer) {
             let _ = events.push(crate::engine::RtEvent::Looped);

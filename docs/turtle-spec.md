@@ -122,21 +122,19 @@ clock = true                   # 24 ppqn while playing
 - **Tempo only.** 24 `0xF8` pulses per quarter note while playing, `0xFA` on start,
   `0xFC` on stop. No Song Position Pointer: downstream learns how fast, not where.
 - **A loop wrap does need handling**, contrary to the first version of this section.
-  Without position on the wire, a device tracks the song by *counting pulses* — so
-  the count per unit of time is what must stay right. The transport position jumps
-  back at each wrap, and deriving pulses from it restarted the train at pulse 0
-  every iteration; since a loop is rarely a whole number of pulses, each iteration
-  emitted a fractional pulse too many, and it accumulated (≈1.5 beats fast over two
-  minutes on a 2-second loop). The pulse train therefore runs on **musical time
-  accumulated across wraps**, not on the raw position, so the total depends only on
-  elapsed time and not on how often the song looped.
-- **The position is interpolated, so it jitters backwards** by a few samples when a
-  fresh anchor lands behind the extrapolation — the RT thread publishes one per audio
-  period. A backwards move is therefore classified three ways: most of a loop is a
-  wrap, more than 100 ms is a reposition, and less than that is noise, which
-  contributes no time *and* does not move the high-water mark. (Clamping noise to
-  zero but counting the recovery as forward motion re-introduces the same drift in
-  miniature.)
+  Without position on the wire, a device tracks the song by *counting pulses*, so the
+  count per unit of time is what must stay right — and the transport position jumps
+  back at each wrap.
+- **The clock runs on a monotonic frame count published by the RT thread**, not on
+  the transport position (§3.1). The position answers "where in the song are we",
+  which is what cues need; musical time needs "how much music has played". Deriving
+  the second from the first was tried and does not work: the position is
+  *interpolated*, so it overshoots the loop end before the wrap is noticed, and that
+  overshoot is lost. Successive attempts — a high-water mark, a wrap threshold, a
+  noise floor — each reduced the error without removing it. It was invisible at most
+  tempos and appeared as a whole missing pulse per loop at 120 BPM, where the loop is
+  an exact multiple of the pulse period. Publishing the frame count costs one atomic
+  store per period and makes the pulse total exact at every tempo.
 - **Alignment across a wrap needs `clock_restart`.** Clock carries tempo but no
   position, so downstream cannot learn that the song jumped back to the top: its
   pattern stays in tempo and walks away from the audio by a fixed amount every wrap.

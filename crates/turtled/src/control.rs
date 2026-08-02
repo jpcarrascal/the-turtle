@@ -730,7 +730,12 @@ pub fn run(
                 // covered; 0 for a song that does not loop, where a backwards jump
                 // is a genuine reposition rather than the music continuing.
                 let loop_frames = if looping { (duration_s * rate as f64) as u64 } else { 0 };
-                if let Some(audit) = clock_out.tick(pos, loop_frames, &dest_offsets, &mut midi_out) {
+                // Musical time comes straight from the RT thread's monotonic frame
+                // count (§5.1); `pos` is passed only so a wrap can be noticed.
+                let elapsed = clock.elapsed(epoch.elapsed().as_nanos() as u64);
+                if let Some(audit) =
+                    clock_out.tick(elapsed, pos, loop_frames, &dest_offsets, &mut midi_out)
+                {
                     println!("{audit}");
                 }
                 for (port, sched) in schedulers.iter_mut().enumerate() {

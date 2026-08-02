@@ -41,6 +41,16 @@ pub struct TransportClock {
     /// in progress. Incremented twice per publish, so it is even at rest.
     seq: AtomicU64,
     sample_pos: AtomicU64,
+    /// Frames rendered since the transport started — the same instant as
+    /// `sample_pos`, but **monotonic**: it never wraps at a loop point (§5.1).
+    ///
+    /// `sample_pos` answers "where in the song are we", which is what MIDI cues
+    /// need. Musical time needs "how much music has played", and reconstructing
+    /// that by watching `sample_pos` jump backwards cannot be made exact — the
+    /// position is interpolated, so it overshoots the loop end before a wrap is
+    /// noticed, and the overshoot is lost. Publishing both costs one more atomic
+    /// store per period and removes the reconstruction entirely.
+    rendered: AtomicU64,
     anchor_ns: AtomicU64,
     sample_rate: u32,
 }
@@ -50,6 +60,7 @@ impl TransportClock {
         TransportClock {
             seq: AtomicU64::new(0),
             sample_pos: AtomicU64::new(0),
+            rendered: AtomicU64::new(0),
             anchor_ns: AtomicU64::new(0),
             sample_rate,
         }
@@ -61,7 +72,7 @@ impl TransportClock {
     /// what makes it safe on the RT path. Single-writer by design — the audio
     /// thread is the only caller, and two concurrent writers would corrupt the
     /// counter's parity.
-    pub fn publish(&self, sample_pos: u64, monotonic_ns: u64) {
+    pub fn publish(&self, sample_pos: u64, rendered: u64, monotonic_ns: u64) {
         // Relaxed is enough to read our own counter: this thread is the only
         // writer, so no other thread can have changed it.
         let s = self.seq.load(Ordering::Relaxed);
@@ -75,6 +86,7 @@ impl TransportClock {
         fence(Ordering::Release);
 
         self.sample_pos.store(sample_pos, Ordering::Relaxed);
+        self.rendered.store(rendered, Ordering::Relaxed);
         self.anchor_ns.store(monotonic_ns, Ordering::Relaxed);
 
         // Release: everything above is visible to any thread that observes this
@@ -92,6 +104,12 @@ impl TransportClock {
     /// any value it could return would be either torn or stale — reintroducing
     /// the bug this exists to prevent.
     pub fn snapshot(&self) -> (u64, u64) {
+        let (pos, _, anchor) = self.snapshot_all();
+        (pos, anchor)
+    }
+
+    /// The full anchor: `(sample_pos, rendered, anchor_ns)`.
+    pub fn snapshot_all(&self) -> (u64, u64, u64) {
         loop {
             let s1 = self.seq.load(Ordering::Acquire);
             // Odd: a write is in flight. Don't even read the data.
@@ -101,13 +119,14 @@ impl TransportClock {
             }
 
             let pos = self.sample_pos.load(Ordering::Relaxed);
+            let rendered = self.rendered.load(Ordering::Relaxed);
             let anchor = self.anchor_ns.load(Ordering::Relaxed);
 
             // Order the data loads *before* re-reading the counter, so a write
             // that landed during them cannot be missed.
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == s1 {
-                return (pos, anchor);
+                return (pos, rendered, anchor);
             }
             // The counter moved: a publish overlapped this read. Try again.
             std::hint::spin_loop();
@@ -119,6 +138,14 @@ impl TransportClock {
         let (pos, anchor) = self.snapshot();
         let dt_ns = now_ns.saturating_sub(anchor) as u128;
         pos + (dt_ns * self.sample_rate as u128 / 1_000_000_000) as u64
+    }
+
+    /// Musical time since the transport started, in frames, interpolated to
+    /// `now_ns`. Monotonic across loop wraps — this is what MIDI clock runs on.
+    pub fn elapsed(&self, now_ns: u64) -> u64 {
+        let (_, rendered, anchor) = self.snapshot_all();
+        let dt_ns = now_ns.saturating_sub(anchor) as u128;
+        rendered + (dt_ns * self.sample_rate as u128 / 1_000_000_000) as u64
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -133,7 +160,7 @@ mod tests {
     #[test]
     fn interpolates_forward_from_anchor() {
         let clk = TransportClock::new(48_000);
-        clk.publish(1_000, 5_000_000_000);
+        clk.publish(1_000, 1_000, 5_000_000_000);
         // Exactly at the anchor: the published position.
         assert_eq!(clk.interpolate(5_000_000_000), 1_000);
         // One second later: +48000 samples.
@@ -145,7 +172,7 @@ mod tests {
     #[test]
     fn clamps_time_before_anchor() {
         let clk = TransportClock::new(48_000);
-        clk.publish(1_000, 5_000_000_000);
+        clk.publish(1_000, 1_000, 5_000_000_000);
         // A now_ns before the anchor must not underflow.
         assert_eq!(clk.interpolate(4_000_000_000), 1_000);
     }
@@ -155,12 +182,12 @@ mod tests {
     fn the_sequence_counter_returns_to_even_after_a_publish() {
         let clk = TransportClock::new(48_000);
         assert!(clk.seq.load(Ordering::Relaxed).is_multiple_of(2), "starts even");
-        clk.publish(1, 2);
+        clk.publish(1, 1, 2);
         assert!(
             clk.seq.load(Ordering::Relaxed).is_multiple_of(2),
             "even after publish"
         );
-        clk.publish(3, 4);
+        clk.publish(3, 3, 4);
         assert_eq!(clk.seq.load(Ordering::Relaxed), 4, "two increments per publish");
     }
 
@@ -198,7 +225,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut i = 1u64;
                 while !stop.load(Ordering::Relaxed) {
-                    clock.publish(i, i * 1000);
+                    clock.publish(i, i, i * 1000);
                     i = i.wrapping_add(1);
                 }
             })
@@ -222,4 +249,23 @@ mod tests {
         // Guard against the test silently passing by never actually racing.
         assert!(reads > 10_000, "only {reads} reads; the probe was too weak to prove anything");
     }
+    /// Musical time must not wrap when the song does — that is the whole reason it
+    /// is published separately from `sample_pos`.
+    #[test]
+    fn elapsed_is_monotonic_where_the_position_wraps() {
+        let clk = TransportClock::new(48_000);
+        // End of a loop, then the wrap: the position goes back to near zero while
+        // musical time carries on.
+        clk.publish(767_000, 767_000, 1_000_000_000);
+        assert_eq!(clk.interpolate(1_000_000_000), 767_000);
+        assert_eq!(clk.elapsed(1_000_000_000), 767_000);
+
+        clk.publish(1_000, 769_000, 2_000_000_000);
+        assert_eq!(clk.interpolate(2_000_000_000), 1_000, "position wrapped");
+        assert_eq!(clk.elapsed(2_000_000_000), 769_000, "musical time did not");
+
+        // And it interpolates from the monotonic anchor, not the wrapped one.
+        assert_eq!(clk.elapsed(2_000_500_000), 769_024);
+    }
+
 }
