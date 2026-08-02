@@ -709,7 +709,11 @@ pub fn run(
                 // machine is most exposed. Delaying a cue by the clock's single
                 // byte costs 320 us on a one-off event; delaying the clock costs
                 // the timing reference everything downstream is following.
-                clock_out.tick(pos, &dest_offsets, &mut midi_out);
+                // `loop_frames` lets the clock account for the musical time a wrap
+                // covered; 0 for a song that does not loop, where a backwards jump
+                // is a genuine reposition rather than the music continuing.
+                let loop_frames = if looping { (duration_s * rate as f64) as u64 } else { 0 };
+                clock_out.tick(pos, loop_frames, &dest_offsets, &mut midi_out);
                 for (port, sched) in schedulers.iter_mut().enumerate() {
                     // `None` = within the offset of the start; nothing due yet.
                     let Some(pos_adj) = dispatch_pos(pos, dest_offsets[port], rate) else { continue };

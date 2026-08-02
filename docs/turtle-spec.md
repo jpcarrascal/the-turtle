@@ -121,8 +121,18 @@ clock = true                   # 24 ppqn while playing
 
 - **Tempo only.** 24 `0xF8` pulses per quarter note while playing, `0xFA` on start,
   `0xFC` on stop. No Song Position Pointer: downstream learns how fast, not where.
-  That is what makes a **loop wrap need no handling** — there is no position to
-  correct, so a wrap is just a discontinuity the pulse train rebases across.
+- **A loop wrap does need handling**, contrary to the first version of this section.
+  Without position on the wire, a device tracks the song by *counting pulses* — so
+  the count per unit of time is what must stay right. The transport position jumps
+  back at each wrap, and deriving pulses from it restarted the train at pulse 0
+  every iteration; since a loop is rarely a whole number of pulses, each iteration
+  emitted a fractional pulse too many, and it accumulated (≈1.5 beats fast over two
+  minutes on a 2-second loop). The pulse train therefore runs on **musical time
+  accumulated across wraps**, not on the raw position, so the total depends only on
+  elapsed time and not on how often the song looped.
+- **A loop that is not a whole number of beats** keeps correct tempo but cannot keep
+  a pattern *aligned* to the song's bar across a wrap — there is no position on the
+  wire to realign with. Bar-align loops if downstream plays a pattern.
 - **Opt-in per destination**, so a port carrying only lighting cues is not made to
   parse 48 bytes a second it will ignore. Each port's `offset_ms` applies to its
   clock exactly as to its cues, so a latency trim means one thing rather than two.
